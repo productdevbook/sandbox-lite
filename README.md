@@ -204,17 +204,18 @@ and `SANDBOX_LITE_CHATS_PER_TENANT` are read as defaults for those flags, and
 endpoint (default `https://api.anthropic.com`). With a
 preview secret set, `/api/tenants` returns each tenant's `preview_token`;
 `?sl_token=<token>` is accepted on every request, so the token alone opens a
-preview. A top-level navigation is redirected to the clean URL and given the
-`sl_t` cookie; a framed one is served where it is and keeps the token, because
-a browser drops the `SameSite=Lax` cookie on a cross-site frame. The shell
-carries the token on the `/__sl/**` requests it makes, and a request that can
-carry neither — `/favicon.svg` written by hand, an import nothing rewrites — is
-accepted on `Sec-Fetch-Site: same-origin`, which only a document already on
-that host produces. Tokens are per-tenant, so a customer's link does not open
-another customer's preview. `--cookie-samesite none` still exists for an editor
-on another registrable domain that would rather have the cookie, and marks it
-`Secure`, so those previews must be served over HTTPS; framing a preview no
-longer needs it.
+preview, and every response that carries one also sets the `sl_t` cookie. A
+top-level navigation is redirected to the clean URL; a framed one is served
+where it is, keeping the token, because a redirect would drop it from the URL
+before the page had it. With a preview secret the cookie defaults to
+`SameSite=None; Secure` — the only form a browser stores for a cross-site frame
+— which browsers accept over HTTPS and on loopback (`localhost`, `127.0.0.1`
+and `*.localhost`); pass `--cookie-samesite lax` if the previews are same-site
+with the editor. The cookie is what carries the `/favicon.svg` a layout writes
+by hand and the imports inside a compiled module, which no URL rewriting
+reaches. A request with neither a valid token nor the cookie answers `403`,
+always: no request header decides access. Tokens are per-tenant, so a
+customer's link does not open another customer's preview.
 
 In production put the daemon behind a wildcard DNS record (`*.preview.example.com`),
 pass `--domain preview.example.com`, set both secrets, and keep `/` and `/api`

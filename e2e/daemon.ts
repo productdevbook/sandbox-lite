@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import { createServer, type AddressInfo } from 'node:net';
 import path from 'node:path';
 
@@ -71,6 +72,18 @@ export class Daemon {
     await Promise.race([exited, sleep(2000)]);
     if (this.child.exitCode === null) this.child.kill('SIGKILL');
   }
+}
+
+/// A client with no cookie jar and full control of its headers, which a browser deliberately is not.
+export function rawGet(port: number, host: string, path: string, headers: Record<string, string> = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'GET', headers: { host, ...headers } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 export async function startDaemon(extra: string[] = []): Promise<Daemon> {
