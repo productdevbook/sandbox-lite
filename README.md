@@ -177,6 +177,7 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 --domain NAME        tenants are served at http://<id>.NAME:PORT/ (default localhost)
 --bases DIR          directory whose sub-directories are base projects
 --base NAME=PATH     add one base project (repeatable)
+--watch-bases N      re-read a base project when its files change, polled every N seconds (default: off)
 --data-dir DIR       where tenant edits are persisted (default ./data)
 --no-persist         keep edits in memory only
 --cdn URL            where bare npm imports resolve in the browser (default https://esm.sh)
@@ -253,6 +254,8 @@ Editor host (`localhost`):
 |---|---|---|
 | GET | `/metrics` | Prometheus text format: gauges, cache and request counters, compile-latency histograms |
 | GET | `/api/stats` | RSS, tenant count, cache stats, what the chats directory holds, screenshots in flight, module requests and compile totals |
+| GET/POST | `/api/bases` | list / add `{name, path}`; the path must be inside `--bases` when that flag is set |
+| POST | `/api/bases/{name}/reload` | re-read the base from disk and re-point every tenant on it |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
 | DELETE | `/api/tenants/{id}` | remove tenant and its edits |
 | POST | `/api/tenants/{id}/import` | tar.gz body → overlay; `?replace=1` drops the edits it does not carry |
@@ -312,6 +315,39 @@ Tenant host (`<id>.<domain>`):
 | `/__sl/events` | same SSE stream as the API; the page swaps CSS or reloads itself on it |
 | anything under `public/` | served directly |
 
+## Updating a base project
+
+Base projects are read into memory at startup, so a theme fix on disk does not
+reach the tenants built on it by itself. Two ways to make it:
+
+```sh
+curl -fsS -X POST localhost:4321/api/bases/starter/reload
+# {"name":"starter","files":24,"bytes":38104,"root":"/srv/themes/starter","tenants":["acme","bakery"]}
+
+sandbox-lite --bases /srv/themes --watch-bases 5   # or poll for it
+```
+
+Either one re-walks the base directory, swaps the result in, and re-points
+every tenant on that base — each of which gets a version bump and one `update`
+event, so open previews reload. A tenant's own edits are untouched: the overlay
+still wins over the base copy of a file it has edited, and an edit over a file
+the reload deleted stays visible. The transform cache needs no invalidation,
+being keyed by content: a changed file simply hashes to a new key.
+
+`--watch-bases N` polls each base root every N seconds, comparing the name,
+size and mtime of every file `Base::load` would take — one walk per base per
+interval, no inotify, no new dependency. A rewrite that keeps both the size and
+the mtime is not noticed; the reload endpoint is the escape hatch for that.
+
+`POST /api/bases {"name","path"}` adds a base to a running daemon. With
+`--bases` set the path must resolve inside that directory; without it, any
+readable directory on the host will do — the API token is the only gate, so
+this is an operator surface. See `SECURITY.md`.
+
+Bases and reloads are per process. Running more than one daemon behind a load
+balancer with a shared `--data-dir` — what each node does and does not see, and
+the two configurations that work — is [`docs/multi-node.md`](docs/multi-node.md).
+
 ## How a page renders
 
 1. `GET http://acme.localhost:4321/blog/hello-world` → the daemon answers with a
@@ -369,6 +405,7 @@ examples/vue           a TypeScript Vue SFC compiled in the browser and hydrated
 examples/svelte        the same for a Svelte 5 component
 scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
+docs/multi-node.md     two daemons behind a load balancer over one --data-dir: what each node sees, and the routing that works
 e2e/                   Playwright suite for the browser side: every example page, endpoints, live reload, hydration, the error overlay
 ```
 

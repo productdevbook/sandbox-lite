@@ -117,7 +117,8 @@ pub fn app(state: State) -> Router {
         .route("/health", get(api::health))
         .route("/metrics", get(api::metrics))
         .route("/api/stats", get(api::stats))
-        .route("/api/bases", get(api::bases))
+        .route("/api/bases", get(api::bases).post(api::add_base))
+        .route("/api/bases/{name}/reload", post(api::reload_base))
         .route("/api/tenants", get(api::tenants).post(api::create_tenant))
         .route("/api/tenants/{id}", delete(api::delete_tenant))
         .route("/api/tenants/{id}/import", post(archive::import))
@@ -299,6 +300,7 @@ pub fn mime(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -307,15 +309,15 @@ mod tests {
     use axum::http::{HeaderName, Request, StatusCode};
     use tower::ServiceExt;
 
-    use super::{AppState, SameSite, app, chats, constant_time_eq, preview_token, tenant_from_host};
+    use super::{AppState, SameSite, State, app, chats, constant_time_eq, preview_token, tenant_from_host};
     use crate::metrics::Metrics;
     use crate::store::Store;
     use crate::transform::{Config, Engine};
 
-    fn baseless_app(api_token: Option<&str>, preview_secret: Option<&str>) -> axum::Router {
+    fn state_for(store: Store, api_token: Option<&str>, preview_secret: Option<&str>) -> State {
         let metrics = Arc::new(Metrics::default());
-        app(Arc::new(AppState {
-            store: Store::new(None, u64::MAX),
+        Arc::new(AppState {
+            store,
             engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
             metrics,
             chats: chats::Chats::default(),
@@ -330,7 +332,11 @@ mod tests {
             chrome: None,
             shots: super::ai::Shots::default(),
             started: Instant::now(),
-        }))
+        })
+    }
+
+    fn baseless_app(api_token: Option<&str>, preview_secret: Option<&str>) -> axum::Router {
+        app(state_for(Store::new(None, u64::MAX), api_token, preview_secret))
     }
 
     async fn get(app: &axum::Router, uri: &str, bearer: Option<&str>) -> (StatusCode, String) {
@@ -342,6 +348,45 @@ mod tests {
         let status = res.status();
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn post(app: &axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder().method("POST").uri(uri).header("content-type", "application/json");
+        let res = app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn bases_are_added_and_reloaded_over_the_api() {
+        let root = std::env::temp_dir().join(format!("sandbox-lite-api-bases-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let page = root.join("bases/theme/src/pages/index.astro");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(&page, "<h1>one</h1>\n").unwrap();
+        let store = Store::new(None, 1 << 20).with_bases_dir(Some(root.join("bases")));
+        let state = state_for(store, None, None);
+        let app = app(state.clone());
+        let add = |path: PathBuf| format!(r#"{{"name":"theme","path":{}}}"#, serde_json::to_string(&path).unwrap());
+
+        assert_eq!(post(&app, "/api/bases", &add(root.join("outside"))).await.0, StatusCode::BAD_REQUEST);
+        let (status, body) = post(&app, "/api/bases", &add(root.join("bases/theme"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains(r#""files":1"#), "{body}");
+        assert_eq!(post(&app, "/api/bases", &add(root.join("bases/theme"))).await.0, StatusCode::CONFLICT);
+
+        let t = state.store.create_tenant("acme", "theme").unwrap();
+        let version = t.version();
+        std::fs::write(&page, "<h1>two</h1>\n").unwrap();
+        let (status, body) = post(&app, "/api/bases/theme/reload", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""tenants":["acme"]"#), "{body}");
+        assert_eq!(t.read_text("src/pages/index.astro").as_deref(), Some("<h1>two</h1>\n"));
+        assert!(t.version() > version);
+        assert_eq!(post(&app, "/api/bases/nope/reload", "").await.0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

@@ -88,7 +88,8 @@ content collections in src/content, styles in src/styles, static files in public
 Work in small, complete steps: read the files you will change first, write whole files back, then call check_site and fix every error it reports. \
 Do not invent npm packages; only plain Astro components, TypeScript and CSS are available. \
 Answer in the customer's language, briefly, and describe what you changed.",
-        t.id, t.base.name
+        t.id,
+        t.base().name
     )
 }
 

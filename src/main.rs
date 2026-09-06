@@ -18,6 +18,7 @@ struct Args {
     data_dir: Option<PathBuf>,
     bases: Vec<(String, PathBuf)>,
     bases_dir: Option<PathBuf>,
+    watch_bases: u64,
     domain: String,
     cdn: String,
     cache_mb: usize,
@@ -37,7 +38,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --max-source-kb N    largest .astro/.ts/.js/.mdx/.scss file the compilers accept, in KiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --max-compiles N     compiles that may run at once; one that waits too long for a slot is refused with 503 (default: one per core)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)\n  --chrome-jobs N      screenshots that may run at once; a call that waits longer than 10s is told the tool is busy (default {})\n  --chat-window N      turns of a conversation replayed to the model in full; older ones are folded into a stored summary (default {})\n  --chats-per-tenant N conversations a tenant may keep; saving past it drops the least recently updated (default {})\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure. With --preview-secret the\n                       default is none, because a framed preview is cross-site and a browser\n                       drops a Lax cookie there; otherwise lax\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET, SANDBOX_LITE_TENANT_QUOTA_MB, SANDBOX_LITE_MAX_COMPILES, SANDBOX_LITE_CHROME, SANDBOX_LITE_CHROME_JOBS, SANDBOX_LITE_CHAT_WINDOW and SANDBOX_LITE_CHATS_PER_TENANT are read as defaults for those flags; SANDBOX_LITE_ANTHROPIC_BASE points the chat at another Messages API endpoint (default https://api.anthropic.com).",
+        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --watch-bases N      re-read every base project when its files change, polled every N seconds (default: off)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --max-source-kb N    largest .astro/.ts/.js/.mdx/.scss file the compilers accept, in KiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --max-compiles N     compiles that may run at once; one that waits too long for a slot is refused with 503 (default: one per core)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)\n  --chrome-jobs N      screenshots that may run at once; a call that waits longer than 10s is told the tool is busy (default {})\n  --chat-window N      turns of a conversation replayed to the model in full; older ones are folded into a stored summary (default {})\n  --chats-per-tenant N conversations a tenant may keep; saving past it drops the least recently updated (default {})\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure. With --preview-secret the\n                       default is none, because a framed preview is cross-site and a browser\n                       drops a Lax cookie there; otherwise lax\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET, SANDBOX_LITE_TENANT_QUOTA_MB, SANDBOX_LITE_MAX_COMPILES, SANDBOX_LITE_CHROME, SANDBOX_LITE_CHROME_JOBS, SANDBOX_LITE_CHAT_WINDOW and SANDBOX_LITE_CHATS_PER_TENANT are read as defaults for those flags; SANDBOX_LITE_ANTHROPIC_BASE points the chat at another Messages API endpoint (default https://api.anthropic.com).",
         env!("CARGO_PKG_VERSION"),
         http::ai::DEFAULT_CHROME_JOBS,
         http::chats::DEFAULT_WINDOW_TURNS,
@@ -56,6 +57,7 @@ fn parse_args() -> Args {
         data_dir: Some(PathBuf::from("data")),
         bases: Vec::new(),
         bases_dir: None,
+        watch_bases: 0,
         domain: "localhost".into(),
         cdn: "https://esm.sh".into(),
         cache_mb: 64,
@@ -85,6 +87,7 @@ fn parse_args() -> Args {
             "--listen" => args.listen = value(),
             "--domain" => args.domain = value().to_ascii_lowercase(),
             "--bases" => args.bases_dir = Some(PathBuf::from(value())),
+            "--watch-bases" => args.watch_bases = value().parse().unwrap_or_else(|_| usage()),
             "--base" => {
                 let v = value();
                 let Some((name, path)) = v.split_once('=') else { usage() };
@@ -133,7 +136,8 @@ async fn main() {
         check_command(&argv[1..]);
     }
     let args = parse_args();
-    let store = store::Store::new(args.data_dir.clone(), args.tenant_quota_mb.saturating_mul(1 << 20));
+    let store =
+        store::Store::new(args.data_dir.clone(), args.tenant_quota_mb.saturating_mul(1 << 20)).with_bases_dir(args.bases_dir.clone());
     let mut bases = args.bases.clone();
     if let Some(dir) = &args.bases_dir {
         match std::fs::read_dir(dir) {
@@ -221,8 +225,34 @@ async fn main() {
         if state.api_token.is_some() { "required" } else { "off" },
         if state.preview_secret.is_some() { "required" } else { "off" }
     );
+    if args.watch_bases > 0 {
+        eprintln!("  watch:   base projects re-read when they change, polled every {}s", args.watch_bases);
+        spawn_base_watcher(state.clone(), Duration::from_secs(args.watch_bases));
+    }
     let app = http::app(state);
     http::serve(listener, app, shutdown_signal()).await;
+}
+
+/// Polls every base root on an interval and reloads the ones whose files changed. One walk per
+/// base per tick, on the blocking pool: the walk stats every file the base holds.
+fn spawn_base_watcher(state: Arc<http::AppState>, period: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || state.store.reload_changed_bases()).await {
+                Ok(names) => {
+                    for name in names {
+                        eprintln!("watch: reloaded base {name}");
+                    }
+                }
+                Err(e) => eprintln!("watch: {e}"),
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

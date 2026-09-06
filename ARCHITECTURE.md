@@ -21,7 +21,8 @@ one per request from the `Host` header (lowercased, port stripped):
   (`preview::page`) for everything else. `require_preview_token` wraps all of
   it.
 - Any other host goes to the **editor/API router**: `/` (the editor page),
-  `/health`, `/metrics`, `/api/stats`, `/api/bases`, `/api/tenants`,
+  `/health`, `/metrics`, `/api/stats`, `/api/bases`,
+  `/api/bases/{name}/reload`, `/api/tenants`,
   `/api/tenants/{id}`, `/api/t/{id}/files`, `/api/t/{id}/file/{*path}`,
   `/api/t/{id}/events`, `/api/t/{id}/check`, `/api/t/{id}/chat`, with a 64 MiB
   body limit. `require_api_token` wraps all of it.
@@ -30,18 +31,21 @@ one per request from the `Host` header (lowercased, port stripped):
 
 ## Store: bases, overlays, versions (`src/store.rs`)
 
-A **base** is a project directory read once at startup (`Base::load`): every
-regular file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`,
-`.netlify`, `.output`. Files up to 256 KiB are held in memory
-(`FileData::Mem`); larger ones stay on disk and are re-read on each access
-(`FileData::Disk`). Bases come from every sub-directory of `--bases` (default
-`./examples` when it exists) and from each `--base NAME=PATH`.
+A **base** is a project directory read at startup (`Base::load`): every regular
+file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`, `.netlify`,
+`.output`. Files up to 256 KiB are held in memory (`FileData::Mem`); larger ones
+stay on disk and are re-read on each access (`FileData::Disk`). Bases come from
+every sub-directory of `--bases` (default `./examples` when it exists), from
+each `--base NAME=PATH`, and from `POST /api/bases` at run time. `Base::load`
+also records a `stamp`: a hash of the name, size and mtime of every file it
+took, in path order, which is what the watcher compares.
 
-A **tenant** is an `Arc<Base>` plus an overlay,
-`BTreeMap<String, Option<FileData>>`: `Some` is a file the tenant added or
-changed, `None` is a tombstone hiding a base file. `Tenant::data` consults the
-overlay first, so a tombstone makes the base file disappear; `Tenant::list`
-merges both views and flags overlay entries as `modified`. Two tenants on the
+A **tenant** is an `Arc<Base>` — behind an `RwLock` so a reload can swap it —
+plus an overlay, `BTreeMap<String, Option<FileData>>`: `Some` is a file the
+tenant added or changed, `None` is a tombstone hiding a base file.
+`Tenant::data` consults the overlay first, so a tombstone makes the base file
+disappear; `Tenant::list` merges both views and flags overlay entries as
+`modified`. Two tenants on the
 same base share the base's memory; a tenant costs its overlay.
 
 Each tenant has a **version**, a `u64` of milliseconds since the epoch at
@@ -69,7 +73,26 @@ With a `--data-dir`, the overlay is persisted as
 and `<data-dir>/<id>/deleted.json` (the tombstones). Every write goes to disk;
 files over 256 KiB are then kept only there. `Store::restore` rebuilds tenants
 at startup with a fresh version and skips any whose base is not loaded.
-`--no-persist` keeps everything in memory.
+`Store::tenant` falls back to the same read on a miss, so a tenant another
+daemon created under a shared `--data-dir` is restored the first time this one
+is asked for it; a tenant already in memory is never re-read, which is the
+limit `docs/multi-node.md` sets out. `--no-persist` keeps everything in memory.
+
+### Reloading a base
+
+`Store::reload_base` re-reads a base from its own root, swaps the new
+`Arc<Base>` into the store, and points every tenant on it at the same `Arc`
+(`Tenant::set_base`, a `RwLock<Arc<Base>>`). Each of those tenants is bumped and
+gets one `update` event, so open previews reload; overlays are untouched, so an
+edited file still wins over the new base copy. The transform cache needs no
+invalidation, being content-addressed: a changed file hashes to a new key.
+
+`POST /api/bases/{name}/reload` calls it on the blocking pool.
+`--watch-bases N` runs `Store::reload_changed_bases` every N seconds, also on
+the blocking pool: one `stamp(root)` walk per base, and a reload only where the
+stamp moved. The walk is the same function `Base::load` uses, so it skips
+exactly what a load skips. A rewrite that changes neither the size nor the
+mtime is invisible to it.
 
 ### Export and import (`src/http/archive.rs`)
 
