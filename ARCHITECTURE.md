@@ -38,8 +38,12 @@ A **base** is a project directory read at startup (`Base::load`): every regular
 file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`, `.netlify`,
 `.output`. Files up to 256 KiB are held in memory (`FileData::Mem`); larger ones
 stay on disk and are re-read on each access (`FileData::Disk`). Bases come from
-every sub-directory of `--bases` (default `./examples` when it exists), from
-each `--base NAME=PATH`, and from `POST /api/bases` at run time. `Base::load`
+every sub-directory of `--bases` (default `./examples` when it exists) that is
+a directory in its own right — `Store::bases_in_dir` reads the entry's own
+type, so a symbolic link is skipped rather than followed — from each
+`--base NAME=PATH`, and from `POST /api/bases` at run time. All three put the
+root through `Store::base_root` first, so with `--bases` set a root outside it
+is refused whichever way it arrives. `Base::load`
 also records a `stamp`: a hash of the name, size and mtime of every file it
 took, in path order, which is what the watcher compares.
 
@@ -71,6 +75,14 @@ resulting overlay under one lock — the removals, the tombstones and every file
 Its event carries an empty path, which the editor reads as "the whole tree
 changed" and the preview treats like any other update.
 
+All three writers (`write`, `write_many`, `delete`) do their disk work through
+`Staged`, which records every step before it happens and moves a file it
+replaces or removes aside instead of deleting it. The overlay is swapped only
+once every step has succeeded, so a failure anywhere puts the directory back
+and memory and disk cannot end up describing different tenants. The one case
+that cannot be undone — the undo itself failing — is `WriteError::Torn`, which
+names the paths that are neither way instead of reporting a clean refusal.
+
 With a `--data-dir`, the overlay is persisted as
 `<data-dir>/<id>/tenant.json` (`{"base": name}`), `<data-dir>/<id>/files/<path>`
 and `<data-dir>/<id>/deleted.json` (the tombstones). Every write goes to disk;
@@ -80,6 +92,15 @@ at startup with a fresh version and skips any whose base is not loaded.
 daemon created under a shared `--data-dir` is restored the first time this one
 is asked for it; a tenant already in memory is never re-read, which is the
 limit `docs/multi-node.md` sets out. `--no-persist` keeps everything in memory.
+
+Because that fallback makes the data directory as much a source of tenants as
+the map, the two operations that decide whether a tenant exists consult both:
+`Store::remove_tenant` drops the map entry and removes `<data-dir>/<id>`,
+answering "no such tenant" only when neither holds it, and `create_tenant`
+refuses an id whose directory is already there even when it cannot build a
+tenant from it — its base may not be loaded on this node. `Store::tenants` is
+the exception, and stays a list of what this daemon has loaded: it answers
+`/api/tenants`, `/api/stats` and `/metrics`, none of which act on a tenant.
 
 ### Reloading a base
 
@@ -109,9 +130,13 @@ its open handle rather than read into memory.
 `POST /api/tenants/{id}/import` reads one back. Entries that are not regular
 files are skipped (directories, pax headers) or refused (links, devices); an
 entry name must be tenant-relative — a leading `/`, a `..` segment, a backslash
-or a NUL byte is refused, while `./` and `//` are normalised away; the sizes are
-summed from the tar headers and the import is refused with `413` before any
-body is decompressed once they pass the quota. `.sandbox-lite/deleted.json` is
+or a NUL byte is refused, while `./` and `//` are normalised away; every entry's
+declared size counts against the quota, skipped ones included, and the import is
+refused with `413` before that body is decompressed once the running total
+passes it. A counting reader around the decompressor caps the whole stream as
+well — the quota plus 16 MiB of framing, and never more than a thousand times
+the compressed body — which is what bounds what `tar` reads and never shows as
+an entry (a GNU long name, a pax payload). `.sandbox-lite/deleted.json` is
 applied as tombstones instead of being written, so an overlay export imported
 into a tenant on the same base reproduces the source overlay exactly.
 `?replace=1` also drops the edits the archive does not carry — an edit over a

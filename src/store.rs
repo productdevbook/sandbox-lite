@@ -187,8 +187,17 @@ impl UpdateKind {
 
 #[derive(Debug)]
 pub enum WriteError {
-    Quota { quota: u64, after: u64 },
+    Quota {
+        quota: u64,
+        after: u64,
+    },
     Io(io::Error),
+    /// A write that failed and could not be put back. The named paths are neither what they were nor
+    /// what the write asked for, so the caller is told that rather than that nothing landed.
+    Torn {
+        cause: io::Error,
+        paths: Vec<String>,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -198,6 +207,12 @@ impl fmt::Display for WriteError {
                 write!(f, "tenant quota exceeded: edited files would total {after} bytes, the quota is {quota} bytes (--tenant-quota-mb)")
             }
             WriteError::Io(e) => fmt::Display::fmt(e, f),
+            WriteError::Torn { cause, paths } => write!(
+                f,
+                "{cause}; undoing the write failed too, so {} on disk are now neither what they were nor what the write asked for: {}",
+                paths.len(),
+                paths.join(", ")
+            ),
         }
     }
 }
@@ -320,12 +335,15 @@ impl Tenant {
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
         }
-        let data = self.store_on_disk(path, bytes)?;
-        let was_tombstone = matches!(overlay.insert(path.to_string(), Some(data)), Some(None));
+        let was_tombstone = matches!(overlay.get(path), Some(None));
+        let mut staged = Staged::new(self.dir.as_deref());
+        let data = match stage_write(&mut staged, &overlay, path, bytes, was_tombstone) {
+            Ok(data) => data,
+            Err(cause) => return Err(staged.undo(cause)),
+        };
+        overlay.insert(path.to_string(), Some(data));
         drop(overlay);
-        if was_tombstone {
-            self.persist_tombstones()?;
-        }
+        staged.commit();
         Ok(self.bump("update", path, kind))
     }
 
@@ -334,6 +352,11 @@ impl Tenant {
     /// does not carry — dropping an edit over a base file brings the base copy back, which is what
     /// makes an overlay export reproduce the source overlay exactly. The quota is checked against
     /// the resulting overlay before anything is written, so a refusal leaves the tenant untouched.
+    ///
+    /// It is all or nothing: the disk work is staged with an undo — a replaced or removed file is
+    /// moved aside rather than deleted — and the overlay is swapped only once every step has
+    /// succeeded. A failure puts the directory back, so what the caller is told and what a restart
+    /// reads are the same tenant.
     pub fn write_many(&self, files: Vec<(String, Vec<u8>)>, deleted: &[String], replace: bool) -> Result<Applied, WriteError> {
         let mut overlay = self.overlay.write().unwrap();
         let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
@@ -357,59 +380,35 @@ impl Tenant {
         let touched: BTreeSet<&str> = overlay.keys().chain(deleted.iter()).map(String::as_str).collect();
         let dropped: Vec<&str> =
             touched.into_iter().filter(|p| !incoming.contains(p) && overlaid(&overlay, p) != overlaid(&next, p)).collect();
-        for path in &dropped {
-            self.forget_on_disk(path)?;
-        }
         let (written, removed) = (files.len(), dropped.len());
-        for (path, bytes) in files {
-            next.insert(path.clone(), Some(self.store_on_disk(&path, bytes)?));
+        let mut staged = Staged::new(self.dir.as_deref());
+        if let Err(cause) = stage_batch(&mut staged, &mut next, &dropped, files) {
+            return Err(staged.undo(cause));
         }
         *overlay = next;
         drop(overlay);
-        self.persist_tombstones()?;
+        staged.commit();
         Ok(Applied { version: self.bump("update", "", UpdateKind::Module), written, deleted: removed })
     }
 
-    /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
-    /// anything past the inline limit lives on disk only.
-    fn store_on_disk(&self, path: &str, bytes: Vec<u8>) -> io::Result<FileData> {
-        let Some(dir) = &self.dir else { return Ok(FileData::Mem(bytes.into())) };
-        let target = dir.join("files").join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, &bytes)?;
-        if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
-    }
-
-    fn forget_on_disk(&self, path: &str) -> io::Result<()> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let target = dir.join("files").join(path);
-        if target.exists() {
-            std::fs::remove_file(target)?;
-        }
-        Ok(())
-    }
-
     pub fn delete(&self, path: &str) -> io::Result<u64> {
-        {
-            let mut overlay = self.overlay.write().unwrap();
-            if self.base.read().unwrap().get(path).is_some() {
-                overlay.insert(path.to_string(), None);
-            } else {
-                overlay.remove(path);
-            }
+        // held across the disk work, as a write is: the file leaves the directory and the tombstone
+        // list is rewritten before the overlay hears about it, and a failure puts both back
+        let mut overlay = self.overlay.write().unwrap();
+        let tombstone = self.base.read().unwrap().get(path).is_some();
+        let mut staged = Staged::new(self.dir.as_deref());
+        if let Err(cause) = stage_delete(&mut staged, &overlay, path, tombstone) {
+            staged.rollback();
+            return Err(cause);
         }
-        self.forget_on_disk(path)?;
-        self.persist_tombstones()?;
+        if tombstone {
+            overlay.insert(path.to_string(), None);
+        } else {
+            overlay.remove(path);
+        }
+        drop(overlay);
+        staged.commit();
         Ok(self.bump("delete", path, UpdateKind::Module))
-    }
-
-    fn persist_tombstones(&self) -> io::Result<()> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let overlay = self.overlay.read().unwrap();
-        let list: Vec<&str> = overlay.iter().filter(|(_, d)| d.is_none()).map(|(p, _)| p.as_str()).collect();
-        std::fs::write(dir.join("deleted.json"), serde_json::to_vec(&list)?)
     }
 
     fn bump(&self, event: &str, path: &str, kind: UpdateKind) -> u64 {
@@ -474,6 +473,214 @@ fn overlay_bytes(overlay: &BTreeMap<String, Option<FileData>>) -> u64 {
     overlay.values().flatten().map(|d| d.size()).sum()
 }
 
+/// The disk half of one write, and what it takes to put `<data-dir>/<id>` back. Nothing there is
+/// changed that is not recorded first, and a file that is replaced or removed is moved aside rather
+/// than deleted — a `FileData::Disk` entry is the only copy of its contents there is. So a failure
+/// anywhere can leave the directory exactly as it was, which is what lets the overlay be swapped
+/// only after every file has landed.
+struct Staged {
+    dir: Option<PathBuf>,
+    aside: Option<PathBuf>,
+    /// (the copy waiting in `aside`, where it came from)
+    moved: Vec<(PathBuf, PathBuf)>,
+    created: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    /// `Some` once `deleted.json` has been rewritten: what it held before, or `None` if there was no
+    /// such file.
+    tombstones: Option<Option<Vec<u8>>>,
+}
+
+impl Staged {
+    fn new(dir: Option<&Path>) -> Staged {
+        Staged { dir: dir.map(Path::to_path_buf), aside: None, moved: Vec::new(), created: Vec::new(), dirs: Vec::new(), tombstones: None }
+    }
+
+    /// `<data-dir>/<id>/.staged-<pid>-<n>`, a sibling of `files/` rather than a directory inside it,
+    /// so a copy left behind by a process that dies mid-write is not read back as a tenant file.
+    fn aside_dir(&mut self, dir: &Path) -> io::Result<PathBuf> {
+        if let Some(p) = &self.aside {
+            return Ok(p.clone());
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = dir.join(format!(".staged-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&p)?;
+        self.aside = Some(p.clone());
+        Ok(p)
+    }
+
+    fn move_aside(&mut self, dir: &Path, target: &Path) -> io::Result<()> {
+        if !target.exists() {
+            return Ok(());
+        }
+        let kept = self.aside_dir(dir)?.join(self.moved.len().to_string());
+        std::fs::rename(target, &kept)?;
+        self.moved.push((kept, target.to_path_buf()));
+        Ok(())
+    }
+
+    /// Creates the directories `target` needs, recording the ones that did not exist so the undo can
+    /// take them away again.
+    fn create_dirs(&mut self, target: &Path) -> io::Result<()> {
+        let mut missing = Vec::new();
+        let mut parent = target.parent();
+        while let Some(d) = parent.filter(|d| !d.exists()) {
+            missing.push(d.to_path_buf());
+            parent = d.parent();
+        }
+        for d in missing.into_iter().rev() {
+            std::fs::create_dir(&d)?;
+            self.dirs.push(d);
+        }
+        Ok(())
+    }
+
+    /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
+    /// anything past the inline limit lives on disk only.
+    fn write(&mut self, path: &str, bytes: Vec<u8>) -> io::Result<FileData> {
+        let Some(dir) = self.dir.clone() else { return Ok(FileData::Mem(bytes.into())) };
+        let target = dir.join("files").join(path);
+        self.create_dirs(&target)?;
+        self.move_aside(&dir, &target)?;
+        // recorded before the write, because a write that fails partway still leaves a file
+        self.created.push(target.clone());
+        std::fs::write(&target, &bytes)?;
+        if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
+    }
+
+    fn remove(&mut self, path: &str) -> io::Result<()> {
+        let Some(dir) = self.dir.clone() else { return Ok(()) };
+        let target = dir.join("files").join(path);
+        self.move_aside(&dir, &target)
+    }
+
+    fn tombstones(&mut self, list: &[&str]) -> io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let file = dir.join("deleted.json");
+        let before = match std::fs::read(&file) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            // a list that is there and unreadable must not be undone as if there were none
+            Err(e) => return Err(e),
+        };
+        self.tombstones = Some(before);
+        std::fs::write(file, serde_json::to_vec(list)?)
+    }
+
+    fn commit(self) {
+        if let Some(aside) = &self.aside {
+            sweep(aside);
+        }
+    }
+
+    /// Puts the directory back, newest step first. What it could not put back comes back as paths,
+    /// and those are the only ones the caller may not describe as untouched.
+    fn rollback(self) -> Vec<String> {
+        let mut torn = Vec::new();
+        for target in self.created.iter().rev() {
+            if let Err(e) = remove_if_present(target) {
+                torn.push(format!("{} ({e})", target.display()));
+            }
+        }
+        for (kept, target) in self.moved.iter().rev() {
+            if let Err(e) = std::fs::rename(kept, target) {
+                torn.push(format!("{} ({e})", target.display()));
+            }
+        }
+        if let (Some(dir), Some(before)) = (&self.dir, &self.tombstones) {
+            let file = dir.join("deleted.json");
+            let back = match before {
+                Some(raw) => std::fs::write(&file, raw),
+                None => remove_if_present(&file),
+            };
+            if let Err(e) = back {
+                torn.push(format!("{} ({e})", file.display()));
+            }
+        }
+        for d in self.dirs.iter().rev() {
+            // a directory something else has since put a file in is not empty, and stays
+            if let Err(e) = std::fs::remove_dir(d)
+                && !matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound)
+            {
+                eprintln!("write: cannot remove the directory {} the write made: {e}", d.display());
+            }
+        }
+        if let Some(aside) = &self.aside {
+            sweep(aside);
+        }
+        if !torn.is_empty() {
+            eprintln!("write: undoing a failed write left {} path(s) neither way: {}", torn.len(), torn.join(", "));
+        }
+        torn
+    }
+
+    fn undo(self, cause: io::Error) -> WriteError {
+        match self.rollback() {
+            paths if paths.is_empty() => WriteError::Io(cause),
+            paths => WriteError::Torn { cause, paths },
+        }
+    }
+}
+
+/// `remove_file` on a path whose parent turned out not to be a directory answers `ENOTDIR`, not
+/// `NotFound`, so whether the file is there is asked rather than read out of the error.
+fn remove_if_present(target: &Path) -> io::Result<()> {
+    if target.exists() { std::fs::remove_file(target) } else { Ok(()) }
+}
+
+/// The copies waiting in the staging directory are dead once a write has landed or been undone, but
+/// failing to sweep them cannot fail the write: it is reported instead.
+fn sweep(aside: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(aside) {
+        eprintln!("write: cannot remove the staging directory {}: {e}", aside.display());
+    }
+}
+
+/// One file's disk work. The tombstone list is rewritten here rather than after the overlay changes,
+/// so a failure to record it is a failure of the whole write.
+fn stage_write(
+    staged: &mut Staged,
+    overlay: &BTreeMap<String, Option<FileData>>,
+    path: &str,
+    bytes: Vec<u8>,
+    was_tombstone: bool,
+) -> io::Result<FileData> {
+    let data = staged.write(path, bytes)?;
+    if was_tombstone {
+        let list: Vec<&str> = overlay.iter().filter(|(p, d)| d.is_none() && p.as_str() != path).map(|(p, _)| p.as_str()).collect();
+        staged.tombstones(&list)?;
+    }
+    Ok(data)
+}
+
+/// Every disk change one batch makes. Until it answers `Ok` nothing has touched the overlay, and the
+/// `next` it fills in is only worth swapping in if it did.
+fn stage_batch(
+    staged: &mut Staged,
+    next: &mut BTreeMap<String, Option<FileData>>,
+    dropped: &[&str],
+    files: Vec<(String, Vec<u8>)>,
+) -> io::Result<()> {
+    for path in dropped {
+        staged.remove(path)?;
+    }
+    for (path, bytes) in files {
+        let data = staged.write(&path, bytes)?;
+        next.insert(path, Some(data));
+    }
+    let list: Vec<&str> = next.iter().filter(|(_, d)| d.is_none()).map(|(p, _)| p.as_str()).collect();
+    staged.tombstones(&list)
+}
+
+fn stage_delete(staged: &mut Staged, overlay: &BTreeMap<String, Option<FileData>>, path: &str, tombstone: bool) -> io::Result<()> {
+    staged.remove(path)?;
+    let mut list: Vec<&str> = overlay.iter().filter(|(p, d)| d.is_none() && p.as_str() != path).map(|(p, _)| p.as_str()).collect();
+    if tombstone {
+        list.push(path);
+        list.sort_unstable();
+    }
+    staged.tombstones(&list)
+}
+
 pub struct Store {
     bases: RwLock<HashMap<String, Arc<Base>>>,
     tenants: RwLock<HashMap<String, Arc<Tenant>>>,
@@ -499,10 +706,10 @@ impl Store {
         base
     }
 
-    /// Where `POST /api/bases` may read a project from. With `--bases` set the path must resolve
-    /// inside it — canonicalized first, so a symbolic link out of the directory is refused too.
-    /// Without the flag any readable directory on the host is allowed, which is why the route is
-    /// operator-only (see SECURITY.md).
+    /// Where a base project may be read from — `POST /api/bases` and the startup scan alike. With
+    /// `--bases` set the path must resolve inside it — canonicalized first, so a symbolic link out
+    /// of the directory is refused too. Without the flag any readable directory on the host is
+    /// allowed, which is why the route is operator-only (see SECURITY.md).
     pub fn base_root(&self, path: &Path) -> Result<PathBuf, String> {
         let root = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
         if !root.is_dir() {
@@ -515,6 +722,34 @@ impl Store {
             }
         }
         Ok(root)
+    }
+
+    /// The base projects `--bases` holds: one per sub-directory, named after it, in name order.
+    /// Every root goes through `base_root`, so the startup scan and `POST /api/bases` refuse the
+    /// same paths. `Ok(Vec::new())` without the flag.
+    pub fn bases_in_dir(&self) -> io::Result<Vec<(String, PathBuf)>> {
+        let Some(dir) = &self.bases_dir else { return Ok(Vec::new()) };
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // the entry's own type, not the resolved one: `Path::is_dir` follows the link and takes
+            // whatever it points at as a base
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                eprintln!("bases dir: skipping '{name}': a symbolic link is not followed (SECURITY.md)");
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            match self.base_root(&entry.path()) {
+                Ok(root) => found.push((name, root)),
+                Err(e) => eprintln!("bases dir: skipping '{name}': {e}"),
+            }
+        }
+        found.sort();
+        Ok(found)
     }
 
     /// Re-reads a base from its own root and points every tenant on it at the result. Each of those
@@ -566,9 +801,10 @@ impl Store {
             return Err("tenant id must be lowercase letters, digits and dashes".into());
         }
         let base = self.base(base_name).ok_or_else(|| format!("unknown base '{base_name}'"))?;
-        // `tenant` rather than the map: a tenant another node created under the same --data-dir
-        // exists, and creating over its directory would hide the files already in it
-        if self.tenant(id).is_some() {
+        // the data directory as well as the map: a tenant another node created exists, and creating
+        // over its directory would hide the files already in it. `tenant` alone would miss one whose
+        // base this node has not loaded, which is exactly when the map is empty of it.
+        if self.tenant(id).is_some() || self.tenant_dir(id).is_some() {
             return Err(format!("tenant '{id}' already exists"));
         }
         let dir = self.data_dir.as_ref().map(|d| d.join(id));
@@ -594,6 +830,17 @@ impl Store {
         Some(self.tenants.write().unwrap().entry(id.to_string()).or_insert(restored).clone())
     }
 
+    /// `<data-dir>/<id>` when that directory is there: the bytes a tenant is, whether or not this
+    /// node has it in memory and whether or not it could build one from them. `None` with
+    /// `--no-persist`, and for an id that is not a valid directory name.
+    fn tenant_dir(&self, id: &str) -> Option<PathBuf> {
+        if !valid_id(id) {
+            return None;
+        }
+        let dir = self.data_dir.as_ref()?.join(id);
+        dir.is_dir().then_some(dir)
+    }
+
     /// Builds a tenant from `<data-dir>/<id>` without registering it. Every reason it cannot —
     /// no `--data-dir`, no such directory, a base this node has not loaded — is an `Err`.
     fn read_tenant(&self, id: &str) -> Result<Tenant, String> {
@@ -613,23 +860,33 @@ impl Store {
         Ok(tenant)
     }
 
+    /// The tenants this node holds in memory. Not every tenant under `--data-dir`: one no request
+    /// has asked for since startup is not here (`Store::tenant`), so on a second node this is a
+    /// report of what is loaded rather than a census. Anything that acts on a tenant resolves it
+    /// through `tenant` or `tenant_dir` instead.
     pub fn tenants(&self) -> Vec<Arc<Tenant>> {
         let mut v: Vec<_> = self.tenants.read().unwrap().values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
 
-    /// `Ok(false)` is a tenant that was not there. A data directory that survives the delete is an
+    /// Drops the tenant from memory and removes `<data-dir>/<id>`, resolving it the way
+    /// `Store::tenant` does: a tenant that is on disk and not loaded is deleted, not answered
+    /// `404`, or the next request would restore it and serve it again. `Ok(false)` is a tenant
+    /// neither memory nor the data directory holds. A data directory that survives the delete is an
     /// error: it answered 204 and the tenant comes back at the next restore.
     pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
-        let Some(t) = self.tenants.write().unwrap().remove(id) else { return Ok(false) };
-        if let Some(dir) = &t.dir
-            && let Err(e) = std::fs::remove_dir_all(dir)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            return Err(e);
+        let dropped = self.tenants.write().unwrap().remove(id);
+        let dir = dropped.as_ref().and_then(|t| t.dir.clone()).or_else(|| self.tenant_dir(id));
+        let mut held = dropped.is_some();
+        if let Some(dir) = dir {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => held = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-        Ok(true)
+        Ok(held)
     }
 
     pub fn restore(&self) -> io::Result<usize> {
@@ -776,6 +1033,81 @@ mod tests {
             assert!(store.base_root(&root.join("bases/link")).is_err(), "a symlink out of --bases is resolved and refused");
         }
         assert!(Store::new(None, 0).base_root(&root.join("elsewhere")).is_ok(), "without --bases any directory is allowed");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #73: `Path::is_dir` resolved a link in `--bases`, so a directory the API refused a
+    /// second later was already a base — and every file under it was served through `/__sl/raw/`.
+    #[test]
+    fn the_startup_scan_takes_only_what_the_api_would_take() {
+        let root = temp("bases-scan");
+        std::fs::create_dir_all(root.join("bases/theme")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        seed(root.join("outside/secret.txt"), "SECRET\n");
+        seed(root.join("bases/README.md"), "not a base\n");
+        let store = Store::new(None, 0).with_bases_dir(Some(root.join("bases")));
+        let theme = || vec![("theme".to_string(), root.join("bases/theme").canonicalize().unwrap())];
+
+        assert_eq!(store.bases_in_dir().unwrap(), theme(), "a file in the bases dir is not a base");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("outside"), root.join("bases/sneaky")).unwrap();
+            std::os::unix::fs::symlink(root.join("bases/theme"), root.join("bases/alias")).unwrap();
+            assert_eq!(store.bases_in_dir().unwrap(), theme(), "a symbolic link in --bases is skipped, wherever it points");
+            assert!(store.base_root(&root.join("bases/sneaky")).is_err(), "which is what the API answers for the same path");
+        }
+        assert!(Store::new(None, 0).bases_in_dir().unwrap().is_empty(), "no --bases, nothing to scan");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #74: the delete acted on the map, and `Store::tenant` restores from the data
+    /// directory on a miss — so a tenant nothing had asked for yet answered 404, kept its files,
+    /// and was served again by the next request.
+    #[test]
+    fn deleting_a_tenant_that_is_not_loaded_removes_its_files() {
+        let root = temp("delete-unloaded");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let base = || Base::load("theme", &root.join("theme")).unwrap();
+        let store = Store::new(Some(data.clone()), 1 << 20);
+        store.add_base(base());
+        let t = store.create_tenant("acme", "theme").unwrap();
+        t.write(PAGE, b"<h1>mine</h1>".to_vec(), UpdateKind::Module).unwrap();
+        // what another node's daemon holds: the tenant is on disk and in nobody's map
+        store.tenants.write().unwrap().remove("acme");
+        assert!(store.tenant("acme").is_some(), "the restore-on-miss path serves it");
+        store.tenants.write().unwrap().remove("acme");
+
+        assert!(store.remove_tenant("acme").unwrap(), "a tenant the daemon can serve is deleted, not answered 404");
+        assert!(!data.join("acme").exists(), "the tenant's bytes are gone");
+        assert!(store.tenant("acme").is_none(), "and nothing brings it back");
+        let fresh = Store::new(Some(data.clone()), 1 << 20);
+        fresh.add_base(base());
+        assert_eq!(fresh.restore().unwrap(), 0, "a fresh store over the same data dir restores nothing");
+        assert!(fresh.tenant("acme").is_none());
+
+        assert!(!store.remove_tenant("acme").unwrap(), "neither memory nor disk holds it now");
+        assert!(!store.remove_tenant("../escape").unwrap(), "an id that is not a directory name never reaches the data dir");
+        assert!(store.create_tenant("acme", "theme").is_ok(), "and the id is free again");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other half of the same question: a directory under `--data-dir` is a tenant even when
+    /// this node cannot build one from it, and creating over it would adopt the files in it.
+    #[test]
+    fn a_tenant_directory_is_taken_as_existing_even_when_its_base_is_not_loaded() {
+        let root = temp("create-over");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let a = Store::new(Some(data.clone()), 1 << 20);
+        a.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        a.create_tenant("acme", "theme").unwrap().write("secret.txt", b"SECRET".to_vec(), UpdateKind::Module).unwrap();
+
+        let b = Store::new(Some(data.clone()), 1 << 20);
+        b.add_base(Base::load("other", &root.join("theme")).unwrap());
+        assert!(b.tenant("acme").is_none(), "b cannot restore it: the base it names is not loaded here");
+        assert!(b.create_tenant("acme", "other").is_err(), "so the directory is what says the tenant exists");
+        assert_eq!(std::fs::read_to_string(data.join("acme/files/secret.txt")).unwrap(), "SECRET", "and its files are untouched");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

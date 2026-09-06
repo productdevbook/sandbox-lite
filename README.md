@@ -186,7 +186,7 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 ```
 --listen ADDR        bind address (default 127.0.0.1:4321)
 --domain NAME        tenants are served at http://<id>.NAME:PORT/ (default localhost)
---bases DIR          directory whose sub-directories are base projects
+--bases DIR          directory whose sub-directories are base projects (symbolic links are skipped)
 --base NAME=PATH     add one base project (repeatable)
 --watch-bases N      re-read a base project when its files change, polled every N seconds (default: off)
 --data-dir DIR       where tenant edits are persisted (default ./data)
@@ -273,7 +273,7 @@ Editor host (`localhost`):
 | GET/POST | `/api/bases` | list / add `{name, path}`; the path must be inside `--bases` when that flag is set |
 | POST | `/api/bases/{name}/reload` | re-read the base from disk and re-point every tenant on it |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
-| DELETE | `/api/tenants/{id}` | remove tenant and its edits |
+| DELETE | `/api/tenants/{id}` | remove the tenant: its map entry and its whole `<data-dir>/{id}` directory, whether or not the daemon had it loaded |
 | POST | `/api/tenants/{id}/import` | tar.gz body → overlay; `?replace=1` drops the edits it does not carry |
 | GET | `/api/t/{id}/files` | merged base + overlay listing |
 | GET | `/api/t/{id}/export` | tar.gz of the merged tree; `?overlay=1` for the edits alone |
@@ -360,7 +360,10 @@ the mtime is not noticed; the reload endpoint is the escape hatch for that.
 `POST /api/bases {"name","path"}` adds a base to a running daemon. With
 `--bases` set the path must resolve inside that directory; without it, any
 readable directory on the host will do — the API token is the only gate, so
-this is an operator surface. See `SECURITY.md`.
+this is an operator surface. The startup scan applies the same rule: an entry
+of `--bases` becomes a base only when the entry itself is a directory, so a
+symbolic link is skipped rather than followed, and `--base NAME=PATH` is held
+to the containment too. See `SECURITY.md`.
 
 Bases and reloads are per process. Running more than one daemon behind a load
 balancer with a shared `--data-dir` — what each node does and does not see, and
