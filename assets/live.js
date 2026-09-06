@@ -3,7 +3,8 @@
   if (new URLSearchParams(location.search).has("sl_shot")) return;
   const prev = window.__sl_es;
   if (prev && prev.readyState !== EventSource.CLOSED) return;
-  const es = new EventSource("/__sl/events");
+  const slUrl = globalThis.__sl_url || ((u) => u);
+  const es = new EventSource(slUrl("/__sl/events"));
   window.__sl_es = es;
 
   const reload = () => location.reload();
@@ -19,7 +20,7 @@
   }
 
   async function fetchCss(el, url) {
-    const mod = await import(url);
+    const mod = await import(slUrl(url));
     if (typeof mod.default !== "string") throw new Error(`${url} exported no CSS`);
     put(el, mod.default);
   }

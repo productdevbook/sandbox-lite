@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import { createServer, type AddressInfo } from 'node:net';
 import path from 'node:path';
 
@@ -73,9 +74,21 @@ export class Daemon {
   }
 }
 
-export async function startDaemon(): Promise<Daemon> {
+/// A client with no cookie jar and full control of its headers, which a browser deliberately is not.
+export function rawGet(port: number, host: string, path: string, headers: Record<string, string> = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'GET', headers: { host, ...headers } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export async function startDaemon(extra: string[] = []): Promise<Daemon> {
   const port = await freePort();
-  const args = ['--listen', `127.0.0.1:${port}`, '--bases', path.join(root, 'examples'), '--no-persist'];
+  const args = ['--listen', `127.0.0.1:${port}`, '--bases', path.join(root, 'examples'), '--no-persist', ...extra];
   const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr!.on('data', (chunk) => (stderr += chunk));

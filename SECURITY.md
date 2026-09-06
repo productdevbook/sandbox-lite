@@ -114,11 +114,16 @@ credentials on the API side.
   that needs the compile in a child process with rlimits.
 - **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly` and no
   `Domain` attribute, so it is a host-only session cookie for that one tenant
-  host. `--cookie-samesite` picks `SameSite=Lax` (the default; `Secure` is
-  added only when the request carried `x-forwarded-proto: https`) or
-  `SameSite=None; Secure`, which an editor on another registrable domain needs
-  before a framed preview will carry the cookie, and which browsers store only
-  over HTTPS.
+  host, and its value is the tenant's token. Every response to a request that
+  carried a valid token sets it. `--cookie-samesite` picks `SameSite=Lax`
+  (`Secure` added only when the request carried `x-forwarded-proto: https`) or
+  `SameSite=None; Secure`; with `--preview-secret` the default is `none`,
+  because a browser stores no other form for a cross-site frame and the editor
+  frames its previews from another host. Browsers accept `Secure` over HTTPS
+  and on loopback origins (`localhost`, `127.0.0.1`, `*.localhost`), so the
+  default development setup works; a plain-`http` deployment on a public name
+  cannot hold the cookie, and only requests carrying the token in the URL will
+  be served there.
 - **Connections** that have not delivered a complete request head within 30 s,
   whether newly opened or idle between keep-alive requests, are closed.
 - **Archive imports.** `POST /api/tenants/{id}/import` is on the editor/API
@@ -202,10 +207,35 @@ endpoint, including `/__sl/raw/`, `/__sl/events` and `/__sl/check`.
   is a pure function of the secret and the id: it never expires and cannot be
   revoked for one tenant. Rotating `S` invalidates every tenant's link at once.
 - `GET http://<id>.<domain>/any/path?sl_token=<token>`: a wrong token answers
-  `403`; the right one answers `303` to the same path with the parameter
-  removed and sets the `sl_t` cookie described above. Later requests are
-  accepted when the cookie equals the token, otherwise `403`. Both
+  `403`; the right one is served, and the response sets the `sl_t` cookie
+  described above. A top-level navigation — `Sec-Fetch-Dest: document`, which a
+  frame reports as `iframe` — answers `303` to the same path with the parameter
+  removed, so a link a person opens becomes a clean URL. A frame is served
+  where it is instead: redirecting it would take the token out of the URL
+  before anything on the page had it. `Sec-Fetch-Dest` decides only that, never
+  access; it is a value the client chooses.
+- **A request carrying neither a valid token nor the cookie answers `403`.**
+  Nothing else is accepted — no request header, no referrer, no origin. The two
   comparisons, like the API token's, take constant time (`constant_time_eq`).
+- What the cookie is for: `<link rel="icon" href="/favicon.svg">` in a layout
+  and the imports inside a compiled module carry no token and nothing can put
+  one there, so the cookie is what serves them. This is why the `SameSite=None;
+  Secure` default matters — it is the only cookie a browser sends from a
+  cross-site frame.
+- The shell also puts the token in `window.__sl.token` and carries it on the
+  `/__sl/**` requests it issues itself, so a browser that will not store the
+  cookie still renders. Tenant JavaScript can read it there, which the
+  `HttpOnly` cookie did not allow — but tenant JavaScript already runs on that
+  host with the cookie attached to every request it makes, so the token gives
+  it nothing it did not have.
+- **Where the token in a URL ends up.** Every preview-host response carries
+  `Referrer-Policy: no-referrer` and the shell repeats it in a `<meta>`, so a
+  tenant page never names its own URL to `esm.sh` or any other third party. The
+  residue that cannot be removed: a token that reached the browser as a URL is
+  in that browser's history, and in the access log of any proxy in front of the
+  daemon. Since a token is a pure function of the secret and the tenant id, it
+  never expires and cannot be revoked for one tenant — rotating `S` is the only
+  way to invalidate one, and it invalidates every tenant's link at once.
 - `/api/tenants` returns each tenant's `preview_token` and a ready-made
   `preview` link, so anyone with API access can open every preview.
 - The `preview` link the API builds is

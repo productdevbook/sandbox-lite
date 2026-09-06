@@ -203,13 +203,19 @@ and `SANDBOX_LITE_CHATS_PER_TENANT` are read as defaults for those flags, and
 `SANDBOX_LITE_ANTHROPIC_BASE` points the chat at another Messages API
 endpoint (default `https://api.anthropic.com`). With a
 preview secret set, `/api/tenants` returns each tenant's `preview_token`;
-opening `http://<id>.<domain>/?sl_token=<token>` once sets a cookie for that
-host and redirects to the clean URL. Tokens are per-tenant, so a customer's
-link does not open another customer's preview. The cookie is `SameSite=Lax`,
-which browsers send only on same-site requests: an editor that embeds previews
-from a different registrable domain (`app.example.com` framing
-`acme.preview.example.net`) needs `--cookie-samesite none`, which also marks
-the cookie `Secure`, so those previews must be served over HTTPS.
+`?sl_token=<token>` is accepted on every request, so the token alone opens a
+preview, and every response that carries one also sets the `sl_t` cookie. A
+top-level navigation is redirected to the clean URL; a framed one is served
+where it is, keeping the token, because a redirect would drop it from the URL
+before the page had it. With a preview secret the cookie defaults to
+`SameSite=None; Secure` — the only form a browser stores for a cross-site frame
+— which browsers accept over HTTPS and on loopback (`localhost`, `127.0.0.1`
+and `*.localhost`); pass `--cookie-samesite lax` if the previews are same-site
+with the editor. The cookie is what carries the `/favicon.svg` a layout writes
+by hand and the imports inside a compiled module, which no URL rewriting
+reaches. A request with neither a valid token nor the cookie answers `403`,
+always: no request header decides access. Tokens are per-tenant, so a
+customer's link does not open another customer's preview.
 
 In production put the daemon behind a wildcard DNS record (`*.preview.example.com`),
 pass `--domain preview.example.com`, set both secrets, and keep `/` and `/api`

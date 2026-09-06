@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State as AxState};
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, LOCATION, SET_COOKIE};
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -53,6 +53,15 @@ pub type State = Arc<AppState>;
 pub enum SameSite {
     Lax,
     None,
+}
+
+impl SameSite {
+    /// A framed preview is cross-site, so a browser never stores or sends a Lax cookie there.
+    /// With a preview secret the cookie is only worth anything as `SameSite=None; Secure`,
+    /// which browsers accept on HTTPS and on loopback.
+    pub fn default_for(preview_secret: Option<&str>) -> SameSite {
+        if preview_secret.is_some() { SameSite::None } else { SameSite::Lax }
+    }
 }
 
 impl std::str::FromStr for SameSite {
@@ -138,6 +147,7 @@ pub fn app(state: State) -> Router {
         .route("/__sl/missing.js", get(preview::missing))
         .fallback(preview::page)
         .layer(middleware::from_fn_with_state(state.clone(), require_preview_token))
+        .layer(middleware::from_fn(no_referrer))
         .with_state(state.clone());
     let domain = state.domain.clone();
     Router::new().fallback(move |req: Request| {
@@ -195,6 +205,10 @@ pub fn preview_token(secret: &str, tenant: &str) -> String {
 
 const PREVIEW_COOKIE: &str = "sl_t";
 
+fn header_is(req: &Request, name: &str, value: &str) -> bool {
+    req.headers().get(name).is_some_and(|h| h.as_bytes() == value.as_bytes())
+}
+
 async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: Next) -> Response {
     let Some(secret) = &st.preview_secret else { return next.run(req).await };
     let Some(TenantId(id)) = req.extensions().get::<TenantId>().cloned() else { return next.run(req).await };
@@ -203,8 +217,6 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
         if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             return (StatusCode::FORBIDDEN, "wrong preview token\n").into_response();
         }
-        let rest: Vec<&str> = req.uri().query().unwrap_or("").split('&').filter(|p| !p.starts_with("sl_token=")).collect();
-        let location = if rest.is_empty() { req.uri().path().to_string() } else { format!("{}?{}", req.uri().path(), rest.join("&")) };
         let forwarded_https = req.headers().get("x-forwarded-proto").and_then(|h| h.to_str().ok()) == Some("https");
         let attributes = match st.cookie_samesite {
             SameSite::Lax if forwarded_https => "SameSite=Lax; Secure",
@@ -212,6 +224,18 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
             SameSite::None => "SameSite=None; Secure",
         };
         let cookie = format!("{PREVIEW_COOKIE}={expected}; Path=/; HttpOnly; {attributes}");
+        // A frame reports `iframe` here and a top-level navigation `document`. Only the top-level
+        // one is sent to the clean URL — a frame's redirect would lose the token from the URL
+        // before anything on the page had it — so the rest are served where they are.
+        if !header_is(&req, "sec-fetch-dest", "document") {
+            let mut res = next.run(req).await;
+            if let Ok(value) = cookie.parse() {
+                res.headers_mut().append(SET_COOKIE, value);
+            }
+            return res;
+        }
+        let rest: Vec<&str> = req.uri().query().unwrap_or("").split('&').filter(|p| !p.starts_with("sl_token=")).collect();
+        let location = if rest.is_empty() { req.uri().path().to_string() } else { format!("{}?{}", req.uri().path(), rest.join("&")) };
         return (StatusCode::SEE_OTHER, [(LOCATION, location), (SET_COOKIE, cookie)]).into_response();
     }
     let has_cookie = req
@@ -226,6 +250,14 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
         return next.run(req).await;
     }
     (StatusCode::FORBIDDEN, "this preview needs a token: open it from the editor\n").into_response()
+}
+
+/// The token rides in query strings, so a preview host must never name one to a third party —
+/// `esm.sh` would otherwise read it out of the `Referer` on every bare import.
+async fn no_referrer(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut().insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    res
 }
 
 pub fn tenant_from_host(host: &str, domain: &str) -> Option<String> {
@@ -271,7 +303,8 @@ mod tests {
     use std::time::Instant;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::header::{LOCATION, SET_COOKIE};
+    use axum::http::{HeaderName, Request, StatusCode};
     use tower::ServiceExt;
 
     use super::{AppState, SameSite, app, chats, constant_time_eq, preview_token, tenant_from_host};
@@ -279,7 +312,7 @@ mod tests {
     use crate::store::Store;
     use crate::transform::{Config, Engine};
 
-    fn baseless_app(api_token: Option<&str>) -> axum::Router {
+    fn baseless_app(api_token: Option<&str>, preview_secret: Option<&str>) -> axum::Router {
         let metrics = Arc::new(Metrics::default());
         app(Arc::new(AppState {
             store: Store::new(None, u64::MAX),
@@ -292,8 +325,8 @@ mod tests {
             api_key: None,
             api_base: "http://127.0.0.1:1".into(),
             api_token: api_token.map(str::to_string),
-            preview_secret: None,
-            cookie_samesite: SameSite::Lax,
+            preview_secret: preview_secret.map(str::to_string),
+            cookie_samesite: SameSite::default_for(preview_secret),
             chrome: None,
             shots: super::ai::Shots::default(),
             started: Instant::now(),
@@ -313,14 +346,14 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_are_open_until_an_api_token_is_set() {
-        let (status, body) = get(&baseless_app(None), "/metrics", None).await;
+        let (status, body) = get(&baseless_app(None, None), "/metrics", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("# TYPE sandbox_lite_compile_seconds histogram"), "{body}");
     }
 
     #[tokio::test]
     async fn metrics_need_the_api_token_when_one_is_set() {
-        let app = baseless_app(Some("s3cret"));
+        let app = baseless_app(Some("s3cret"), None);
         assert_eq!(get(&app, "/metrics", None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&app, "/metrics", Some("wrong")).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&app, "/metrics?token=s3cret", None).await.0, StatusCode::OK);
@@ -345,6 +378,65 @@ mod tests {
         assert_ne!(preview_token("s", "acme"), preview_token("s", "bakery"));
         assert_ne!(preview_token("s", "acme"), preview_token("t", "acme"));
         assert_eq!(preview_token("s", "acme").len(), 32);
+    }
+
+    /// No base and no tenant, so a request the middleware lets through reaches a handler that
+    /// answers `404` — which is what tells it apart from the `403` the middleware writes itself.
+    async fn preview_get(uri: &str, headers: &[(&str, &str)]) -> (StatusCode, Option<String>, Option<String>) {
+        let mut req = Request::builder().method("GET").uri(uri).header("host", "acme.localhost");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = baseless_app(None, Some("s")).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let header = |name: HeaderName| res.headers().get(name).and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        (res.status(), header(LOCATION), header(SET_COOKIE))
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_is_served_and_only_a_document_navigation_is_redirected() {
+        let token = preview_token("s", "acme");
+        let framed = format!("/?sl_token={token}");
+
+        let (status, _, cookie) = preview_get(&framed, &[("sec-fetch-dest", "iframe"), ("sec-fetch-site", "cross-site")]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(cookie.as_deref(), Some(format!("sl_t={token}; Path=/; HttpOnly; SameSite=None; Secure").as_str()));
+        assert_eq!(
+            preview_get(&format!("/__sl/routes.json?sl_token={token}"), &[("sec-fetch-dest", "empty")]).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(preview_get(&framed, &[]).await.0, StatusCode::NOT_FOUND);
+
+        let (status, location, cookie) = preview_get(&format!("/about?sl_token={token}&x=1"), &[("sec-fetch-dest", "document")]).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location.as_deref(), Some("/about?x=1"));
+        assert!(cookie.is_some_and(|c| c.contains(&token)), "the redirect sets the cookie");
+    }
+
+    /// `Sec-Fetch-*` is chosen by the client, so it decides presentation and never access:
+    /// `curl -H 'Sec-Fetch-Site: same-origin'` must not reach a tenant's files.
+    #[tokio::test]
+    async fn a_request_without_a_token_or_the_cookie_is_refused_whatever_it_claims() {
+        let token = preview_token("s", "acme");
+
+        assert_eq!(preview_get("/", &[]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(preview_get("/?sl_token=nope", &[]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(preview_get("/favicon.svg", &[("sec-fetch-site", "same-origin")]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            preview_get("/__sl/raw/.env", &[("sec-fetch-site", "same-origin"), ("sec-fetch-dest", "empty")]).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(preview_get("/favicon.svg", &[("sec-fetch-site", "cross-site")]).await.0, StatusCode::FORBIDDEN);
+
+        assert_eq!(preview_get("/", &[("cookie", &format!("sl_t={token}"))]).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn every_preview_response_forbids_a_referrer() {
+        let app = baseless_app(None, Some("s"));
+        let req = Request::builder().method("GET").uri("/").header("host", "acme.localhost");
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.headers().get("referrer-policy").unwrap(), "no-referrer");
     }
 
     #[test]

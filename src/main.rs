@@ -28,7 +28,7 @@ struct Args {
     api_token: Option<String>,
     preview_secret: Option<String>,
     tenant_quota_mb: u64,
-    cookie_samesite: http::SameSite,
+    cookie_samesite: Option<http::SameSite>,
     chrome: Option<PathBuf>,
     chrome_jobs: usize,
     chat_window: usize,
@@ -37,7 +37,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --max-source-kb N    largest .astro/.ts/.js/.mdx/.scss file the compilers accept, in KiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --max-compiles N     compiles that may run at once; one that waits too long for a slot is refused with 503 (default: one per core)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)\n  --chrome-jobs N      screenshots that may run at once; a call that waits longer than 10s is told the tool is busy (default {})\n  --chat-window N      turns of a conversation replayed to the model in full; older ones are folded into a stored summary (default {})\n  --chats-per-tenant N conversations a tenant may keep; saving past it drops the least recently updated (default {})\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET, SANDBOX_LITE_TENANT_QUOTA_MB, SANDBOX_LITE_MAX_COMPILES, SANDBOX_LITE_CHROME, SANDBOX_LITE_CHROME_JOBS, SANDBOX_LITE_CHAT_WINDOW and SANDBOX_LITE_CHATS_PER_TENANT are read as defaults for those flags; SANDBOX_LITE_ANTHROPIC_BASE points the chat at another Messages API endpoint (default https://api.anthropic.com).",
+        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --max-source-kb N    largest .astro/.ts/.js/.mdx/.scss file the compilers accept, in KiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --max-compiles N     compiles that may run at once; one that waits too long for a slot is refused with 503 (default: one per core)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)\n  --chrome-jobs N      screenshots that may run at once; a call that waits longer than 10s is told the tool is busy (default {})\n  --chat-window N      turns of a conversation replayed to the model in full; older ones are folded into a stored summary (default {})\n  --chats-per-tenant N conversations a tenant may keep; saving past it drops the least recently updated (default {})\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure. With --preview-secret the\n                       default is none, because a framed preview is cross-site and a browser\n                       drops a Lax cookie there; otherwise lax\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET, SANDBOX_LITE_TENANT_QUOTA_MB, SANDBOX_LITE_MAX_COMPILES, SANDBOX_LITE_CHROME, SANDBOX_LITE_CHROME_JOBS, SANDBOX_LITE_CHAT_WINDOW and SANDBOX_LITE_CHATS_PER_TENANT are read as defaults for those flags; SANDBOX_LITE_ANTHROPIC_BASE points the chat at another Messages API endpoint (default https://api.anthropic.com).",
         env!("CARGO_PKG_VERSION"),
         http::ai::DEFAULT_CHROME_JOBS,
         http::chats::DEFAULT_WINDOW_TURNS,
@@ -72,7 +72,7 @@ fn parse_args() -> Args {
             .ok()
             .filter(|v| !v.is_empty())
             .map_or(64, |v| v.parse().unwrap_or_else(|_| usage())),
-        cookie_samesite: http::SameSite::Lax,
+        cookie_samesite: None,
         chrome: std::env::var("SANDBOX_LITE_CHROME").ok().filter(|v| !v.is_empty()).map(PathBuf::from),
         chrome_jobs: env_usize("SANDBOX_LITE_CHROME_JOBS", http::ai::DEFAULT_CHROME_JOBS),
         chat_window: env_usize("SANDBOX_LITE_CHAT_WINDOW", http::chats::DEFAULT_WINDOW_TURNS),
@@ -101,7 +101,7 @@ fn parse_args() -> Args {
             "--api-token" => args.api_token = Some(value()),
             "--preview-secret" => args.preview_secret = Some(value()),
             "--tenant-quota-mb" => args.tenant_quota_mb = value().parse().unwrap_or_else(|_| usage()),
-            "--cookie-samesite" => args.cookie_samesite = value().parse().unwrap_or_else(|_| usage()),
+            "--cookie-samesite" => args.cookie_samesite = Some(value().parse().unwrap_or_else(|_| usage())),
             "--chrome" => args.chrome = Some(PathBuf::from(value())),
             "--chrome-jobs" => args.chrome_jobs = value().parse().unwrap_or_else(|_| usage()),
             "--chat-window" => args.chat_window = value().parse().unwrap_or_else(|_| usage()),
@@ -197,7 +197,7 @@ async fn main() {
             .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
         api_token: args.api_token.clone(),
         preview_secret: args.preview_secret.clone(),
-        cookie_samesite: args.cookie_samesite,
+        cookie_samesite: args.cookie_samesite.unwrap_or(http::SameSite::default_for(args.preview_secret.as_deref())),
         chrome: args.chrome.clone(),
         shots: http::ai::Shots::new(args.chrome_jobs),
         started: Instant::now(),

@@ -287,10 +287,14 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         }
     }
     let env = Value::Object(env_map(&t)).to_string().replace('<', "\\u003c");
+    let token = st.preview_secret.as_deref().map(|s| super::preview_token(s, &t.id)).unwrap_or_default();
+    let token_query = if token.is_empty() { String::new() } else { format!("?sl_token={token}") };
     let html = SHELL_HTML
         .replace("%TENANT%", &t.id)
         .replace("%VERSION%", &t.version().to_string())
         .replace("%ASSETS%", asset_version())
+        .replace("%TOKENQ%", &token_query)
+        .replace("%TOKEN%", &token)
         .replace("%ENV%", &env);
     ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }
