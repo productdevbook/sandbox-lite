@@ -1,0 +1,11 @@
+{
+  "name": "svelte",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "astro dev", "build": "astro build" },
+  "dependencies": {
+    "@astrojs/svelte": "^9.0.1",
+    "astro": "^7.3.1",
+    "svelte": "^5.57.0"
+  }
+}

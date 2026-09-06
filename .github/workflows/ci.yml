@@ -21,7 +21,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
-      - run: ./target/release/sandbox-lite check examples/starter examples/tailwind examples/react
+      - run: ./target/release/sandbox-lite check examples/starter examples/tailwind examples/react examples/vue examples/svelte
       - name: smoke test the daemon
         run: |
           ./target/release/sandbox-lite --listen 127.0.0.1:4399 --bases examples --no-persist &

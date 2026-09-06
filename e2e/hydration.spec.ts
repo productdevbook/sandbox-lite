@@ -23,3 +23,22 @@ test('an island imported from an npm package hydrates from the CDN', async ({ da
   // react-countup renders an empty span server-side and counts up to `end` only once its own React runs.
   await expect(island.locator('span')).toHaveText('2026', { timeout: CDN_TIMEOUT });
 });
+
+// Vue and Svelte single-file components have no Rust compiler: the daemon serves a loader module
+// that compiles them in the browser, so these also prove that pipeline end to end.
+for (const framework of ['vue', 'svelte'] as const) {
+  test(`a client:load ${framework} island hydrates and handles clicks`, async ({ daemon, page }) => {
+    const site = await daemon.tenant(framework, framework);
+    await page.goto(site.url('/'));
+    const count = page.locator('.counter strong');
+    await expect(count).toHaveText('41', { timeout: CDN_TIMEOUT });
+    await expect(page.locator('astro-island:not([ssr])'), 'island hydrated').toHaveCount(1, { timeout: CDN_TIMEOUT });
+
+    await page.getByRole('button', { name: 'increment' }).click();
+    await expect(count).toHaveText('42');
+    await expect(page.locator('.counter')).toHaveAttribute('data-count', '42');
+
+    await page.getByRole('button', { name: 'decrement' }).click();
+    await expect(count).toHaveText('41');
+  });
+}
