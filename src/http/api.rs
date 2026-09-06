@@ -40,9 +40,18 @@ pub fn rss_kb() -> Option<u64> {
 }
 
 pub fn preview_url(st: &AppState, id: &str) -> String {
+    preview_url_path(st, id, "/")
+}
+
+pub fn preview_url_path(st: &AppState, id: &str, path: &str) -> String {
+    let slash = if path.starts_with('/') { "" } else { "/" };
+    let url = format!("http://{id}.{}:{}{slash}{path}", st.domain, st.port);
     match &st.preview_secret {
-        Some(secret) => format!("http://{id}.{}:{}/?sl_token={}", st.domain, st.port, super::preview_token(secret, id)),
-        None => format!("http://{id}.{}:{}/", st.domain, st.port),
+        Some(secret) => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}sl_token={}", super::preview_token(secret, id))
+        }
+        None => url,
     }
 }
 
@@ -103,6 +112,7 @@ pub async fn create_tenant(AxState(st): AxState<State>, Json(req): Json<CreateRe
 }
 
 pub async fn delete_tenant(AxState(st): AxState<State>, Path(id): Path<String>) -> Response {
+    st.chats.forget(&id);
     if st.store.remove_tenant(&id) { StatusCode::NO_CONTENT.into_response() } else { err(StatusCode::NOT_FOUND, "unknown tenant") }
 }
 

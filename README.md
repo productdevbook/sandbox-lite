@@ -145,7 +145,15 @@ the preview reloads.
 
 With `ANTHROPIC_API_KEY` set, the Chat tab talks to Claude with `read_file`,
 `write_file`, `delete_file`, `list_files` and `check_site` tools scoped to that
-tenant. Every write shows up in the preview as it happens.
+tenant. Every write shows up in the preview as it happens. The reply is
+streamed: the editor sends `Accept: text/event-stream` and paints the text and
+each tool call as they arrive. Conversations are kept per tenant under
+`<data-dir>/<id>/chats/` and are listed in the Chat tab's dropdown, so a
+customer can pick an old thread back up; the tool loop sees the earlier turns.
+
+`--chrome PATH` adds a sixth tool, `screenshot`, which renders one page of the
+tenant's live preview in headless Chrome and hands the PNG back to the model,
+so it can look at the layout it just changed instead of guessing.
 
 ### Flags
 
@@ -162,13 +170,16 @@ tenant. Every write shows up in the preview as it happens.
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
 --preview-secret S   tenant hosts require a per-tenant token derived from S
+--chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)
 --tenant-quota-mb N  edited files a tenant may hold, in MiB (default 64)
 --cookie-samesite lax|none
                      SameSite of the preview cookie; none also sets Secure (default lax)
 ```
 
-`SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET` and
-`SANDBOX_LITE_TENANT_QUOTA_MB` are read as defaults for those flags. With a
+`SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET`,
+`SANDBOX_LITE_TENANT_QUOTA_MB` and `SANDBOX_LITE_CHROME` are read as defaults
+for those flags, and `SANDBOX_LITE_ANTHROPIC_BASE` points the chat at another
+Messages API endpoint (default `https://api.anthropic.com`). With a
 preview secret set, `/api/tenants` returns each tenant's `preview_token`;
 opening `http://<id>.<domain>/?sl_token=<token>` once sets a cookie for that
 host and redirects to the clean URL. Tokens are per-tenant, so a customer's
@@ -221,7 +232,9 @@ Editor host (`localhost`):
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
 | GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version |
 | GET | `/api/t/{id}/check` | compile every source file, return diagnostics |
-| POST | `/api/t/{id}/chat` | `{messages:[{role,content}]}` → `{text, changes}` |
+| POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, chat}`, or SSE with `Accept: text/event-stream` |
+| GET | `/api/t/{id}/chats` | saved conversations, newest first |
+| GET/DELETE | `/api/t/{id}/chats/{chat}` | one conversation with its turns / remove it |
 
 `export` answers `application/gzip` with a `<id>.tar.gz` attachment name. By
 default it holds the merged tree — the base project with the tenant's edits
@@ -294,7 +307,7 @@ src/store.rs           base projects, tenant overlays, versions, SSE fan-out, pe
 src/resolve.rs         import specifier → URL
 src/routes.rs          src/pages → route table
 src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), import.meta.glob, markdown, mdx (satteri-mdxjs), content collections, cache
-src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop
+src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop, stream framing, saved conversations
 src/check.rs           the `check` subcommand
 assets/                shell.html, shell.js, live.js, editor.html, astro.js and astro-jsx.js bundles, astro:* shims
 examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections, endpoints); the base used by CI's smoke test and bench/mem.sh
