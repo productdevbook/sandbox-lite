@@ -167,6 +167,7 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         Err(r) => return r,
     };
     let Some(name) = name.strip_suffix(".js") else { return err(StatusCode::NOT_FOUND, "no such shim") };
+    let resolver = Resolver::new(&t, &st.engine.cfg.cdn, t.version());
     let body: String = match name {
         "astro-content" => include_str!("../../assets/shims/astro-content.js").into(),
         "astro-assets" => include_str!("../../assets/shims/astro-assets.js").into(),
@@ -179,6 +180,16 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         "astro-components" => include_str!("../../assets/shims/astro-components.js").into(),
         "renderer-react" => include_str!("../../assets/shims/renderer-react.js").into(),
         "renderer-preact" => include_str!("../../assets/shims/renderer-preact.js").into(),
+        "renderer-vue" => include_str!("../../assets/shims/renderer-vue.js").into(),
+        "renderer-vue-client" => include_str!("../../assets/shims/renderer-vue-client.js").into(),
+        "vue-static-html" => include_str!("../../assets/shims/vue-static-html.js").into(),
+        "renderer-svelte" => include_str!("../../assets/shims/renderer-svelte.js").into(),
+        "renderer-svelte-client" => include_str!("../../assets/shims/renderer-svelte-client.js").into(),
+        // The loaders build blob modules, whose bare specifiers no resolver sees, so their URLs are baked in.
+        "vue-loader" => include_str!("../../assets/shims/vue-loader.js")
+            .replace("%VUE_COMPILER%", &crate::resolve::vue_compiler_url(&t, &st.engine.cfg.cdn))
+            .replace("%VUE%", &resolver.resolve("", "vue")),
+        "svelte-loader" => include_str!("../../assets/shims/svelte-loader.js").replace("%SVELTE%", &resolver.resolve("", "svelte")),
         "astro-config" => include_str!("../../assets/shims/astro-config.js").into(),
         "astro-loaders" => include_str!("../../assets/shims/astro-loaders.js").into(),
         "astro-jsx-runtime" => include_str!("../../assets/astro-jsx.js").into(),
@@ -196,7 +207,6 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         }
         _ => return err(StatusCode::NOT_FOUND, format!("no shim for astro:{name}")),
     };
-    let resolver = Resolver::new(&t, &st.engine.cfg.cdn, t.version());
     let mut out = String::with_capacity(body.len() + 128);
     let mut last = 0;
     for spec in js::scan(&body) {

@@ -115,3 +115,26 @@ test.describe('react', () => {
     await expect(page.locator('astro-island:not([ssr])'), 'both islands hydrated').toHaveCount(2, { timeout: CDN_TIMEOUT });
   });
 });
+
+test.describe('vue', () => {
+  test('/', async ({ daemon, page }) => {
+    const site = await daemon.tenant('vue', 'vue');
+    await page.goto(site.url('/'));
+    await expect(page).toHaveTitle('Vue islands', { timeout: CDN_TIMEOUT });
+    await expect(page.locator('h1')).toHaveText('Vue in the preview');
+    await expect(page.locator('.counter span')).toHaveText('Visitors today');
+    // The SFC's <style> block reached the document through globalThis.__sl_css.
+    await expect(page.locator('.counter')).toHaveCSS('border-radius', '14px');
+  });
+});
+
+test.describe('svelte', () => {
+  test('/', async ({ daemon, page }) => {
+    const site = await daemon.tenant('svelte', 'svelte');
+    await page.goto(site.url('/'));
+    await expect(page).toHaveTitle('Svelte islands', { timeout: CDN_TIMEOUT });
+    await expect(page.locator('h1')).toHaveText('Svelte in the preview');
+    await expect(page.locator('.counter span')).toHaveText('Visitors today');
+    await expect(page.locator('.counter')).toHaveCSS('border-radius', '14px');
+  });
+});

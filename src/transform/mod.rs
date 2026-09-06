@@ -306,6 +306,7 @@ impl Engine {
                         })?;
                         Ok(Built::js(css::to_module(path, &compiled, dirname(path))))
                     }
+                    "vue" | "svelte" => Ok(Built::js(sfc_loader(&ext, path, &text()))),
                     "json" => Ok(Built::js(format!("export default JSON.parse({});\n", json_str(&text())))),
                     "md" => Ok(Built::scanned(markdown::page_module(path, &text()))),
                     "mdx" => Ok(Built::scanned(mdx::page_module(path, &text())?)),
@@ -360,6 +361,16 @@ impl Engine {
     }
 }
 
+/// No Rust compiler exists for `.vue` or `.svelte`, so the file is served as a module that
+/// compiles its source in the browser and re-exports the component.
+fn sfc_loader(ext: &str, path: &str, source: &str) -> String {
+    format!(
+        "import {{ compileComponent }} from \"/__sl/shim/{ext}-loader.js\";\nexport default await compileComponent({}, {}, import.meta.url);\n",
+        json_str(source),
+        json_str(path)
+    )
+}
+
 pub(crate) fn svg_size(svg: &str) -> (usize, usize) {
     let Some(open) = svg.find("<svg") else { return (0, 0) };
     let tag = &svg[open..svg[open..].find('>').map(|i| open + i).unwrap_or(svg.len())];
@@ -395,8 +406,10 @@ pub fn json_str(s: &str) -> String {
 }
 
 pub fn is_source(path: &str) -> bool {
-    matches!(path.rsplit_once('.').map(|(_, e)| e).unwrap_or(""), "astro" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "md" | "mdx")
-        && path.starts_with("src/")
+    matches!(
+        path.rsplit_once('.').map(|(_, e)| e).unwrap_or(""),
+        "astro" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "md" | "mdx" | "vue" | "svelte"
+    ) && path.starts_with("src/")
 }
 
 #[cfg(test)]

@@ -1,0 +1,9 @@
+---
+import Layout from "../layouts/Layout.astro";
+import Counter from "../components/Counter.svelte";
+---
+<Layout title="Svelte islands">
+  <h1>Svelte in the preview</h1>
+  <p class="lede">The component below is compiled by <code>svelte/compiler</code> in your browser — once for <code>svelte/server</code> and once for the DOM — then hydrated with <code>client:load</code>.</p>
+  <Counter client:load label="Visitors today" start={41} />
+</Layout>

@@ -134,9 +134,10 @@ exact.
 7. **Render.** `experimental_AstroContainer.create({ resolve, astroConfig })`
    — `resolve` maps ids the runtime asks for (island component paths,
    `astro:*`) to daemon URLs. `/__sl/renderers.json` lists framework renderers
-   (`resolve::renderers`: `@astrojs/react` and `@astrojs/preact` from
-   `package.json`, or `sandbox-lite.json` `renderers`); each server renderer
-   is imported and registered, each client entrypoint recorded. Astro's own
+   (`resolve::renderers`: `@astrojs/react`, `@astrojs/preact`, `@astrojs/vue`
+   and `@astrojs/svelte` from `package.json`, or `sandbox-lite.json`
+   `renderers`); each server renderer is imported and registered, each client
+   entrypoint recorded. Astro's own
    `astro:jsx` renderer (`/__sl/shim/astro-jsx-runtime.js`, the JSX runtime
    plus `@astrojs/mdx/server.js`) is registered last; it renders MDX content.
    `container.renderToResponse(mod.default, { request, params, props })`
@@ -174,10 +175,37 @@ What `compile` does per kind and extension:
 | `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`) |
 | `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
+| `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser |
 | images | `export default { src: "/__sl/raw/…", width, height, format, fsPath }` |
 | `Style(i)` / `Script(i)` | builds the `.astro` module (cached) and returns its i-th CSS block or script as its own module |
 | `Raw` / `Url` | the text as a string export / the `/__sl/raw/` URL as a string export |
 | anything else | the `/__sl/raw/` URL as a string export |
+
+### Vue and Svelte islands
+
+There is no Rust compiler for `.vue` or `.svelte`, so `Kind::Module` returns a
+three-line loader that carries the source as a string literal and calls
+`/__sl/shim/vue-loader.js` or `/__sl/shim/svelte-loader.js` with it and with
+`import.meta.url`. The loader runs `@vue/compiler-sfc` or `svelte/compiler` in
+the browser and imports the result as a blob module.
+
+A blob module has no import map, so the loader rewrites the compiler's output
+before creating the blob: `vue`/`svelte` specifiers become CDN URLs, relative
+ones are resolved against the component's own `/__sl/m/…` URL. The CDN URLs are
+substituted into the loader shim by `preview::shim` (`%VUE%`, `%VUE_COMPILER%`,
+`%SVELTE%`) rather than baked into the cached module, because the transform
+cache is content-addressed and does not see `package.json`. Each `<style>`
+block is registered in `globalThis.__sl_css` the way a `.css` module is.
+
+The island imports that same module URL to hydrate, so the loader's default
+export is the *client* build. Vue's one component object serves both — Vue's
+server renderer falls back to the vdom for a component with no `ssrRender` —
+while Svelte needs two builds, and the server one is attached to the client one
+as `__sl_svelte_server` for `renderer-svelte.js` to find.
+
+Both client entrypoints are shims of ours rather than the integration's:
+`@astrojs/vue/client.js` imports a Vite virtual module, and
+`@astrojs/svelte/client.js` ships uncompiled runes, so neither runs off a CDN.
 
 A `Built` holds the compiled `body`, plus what `serve` needs later: `specs`
 (byte ranges of every import specifier, from oxc's module record),
@@ -382,5 +410,5 @@ assets/shell.html, shell.js, live.js    the browser side of a render
 assets/editor.html     the editor
 assets/astro.js        Astro runtime + container, built by scripts/build-runtime.sh
 assets/astro-jsx.js    Astro's JSX runtime + astro:jsx renderer, built by the same script
-assets/shims/          browser stand-ins for astro:* modules and the React/Preact renderers
+assets/shims/          browser stand-ins for astro:* modules, the framework renderers and the Vue/Svelte SFC loaders
 ```
