@@ -21,10 +21,10 @@ one per request from the `Host` header (lowercased, port stripped):
   (`preview::page`) for everything else. `require_preview_token` wraps all of
   it.
 - Any other host goes to the **editor/API router**: `/` (the editor page),
-  `/health`, `/api/stats`, `/api/bases`, `/api/tenants`, `/api/tenants/{id}`,
-  `/api/t/{id}/files`, `/api/t/{id}/file/{*path}`, `/api/t/{id}/events`,
-  `/api/t/{id}/check`, `/api/t/{id}/chat`, with a 64 MiB body limit.
-  `require_api_token` wraps all of it.
+  `/health`, `/metrics`, `/api/stats`, `/api/bases`, `/api/tenants`,
+  `/api/tenants/{id}`, `/api/t/{id}/files`, `/api/t/{id}/file/{*path}`,
+  `/api/t/{id}/events`, `/api/t/{id}/check`, `/api/t/{id}/chat`, with a 64 MiB
+  body limit. `require_api_token` wraps all of it.
 
 `SECURITY.md` describes the two middlewares.
 
@@ -244,7 +244,8 @@ invalidated explicitly.
 The cache (`Engine::cache`) is a `HashMap<u128, Arc<Built>>` behind a mutex
 with a `VecDeque` of insertion order. The budget (`--cache-mb`, default 64
 MiB) counts `body` bytes; when exceeded, the oldest-inserted entries are
-dropped (FIFO, not LRU). `/api/stats` reports entries, bytes, hits and misses.
+dropped (FIFO, not LRU). `/api/stats` and `/metrics` report entries, bytes,
+hits and misses.
 
 ### Why resolution and `import.meta.glob` happen at serve time
 
@@ -383,6 +384,34 @@ compile errors, 2 when a directory cannot be loaded. `/api/t/{id}/check` and
 `/__sl/check` run the same loop (`api::check_tenant`) on a live tenant; the
 error page uses the latter.
 
+## Metrics (`src/metrics.rs`)
+
+`Metrics` is a set of `AtomicU64`s with no dependencies: one counter per
+(`Kind`, status class) for the module endpoint, and one histogram per `Kind`
+for compile latency, over the fixed bucket set 1 ms, 5 ms, 20 ms, 50 ms,
+100 ms, 500 ms, 1 s, 5 s. It lives in an `Arc` shared by `AppState` and
+`Engine`, so `check` gets its own throwaway instance.
+
+Only two places write to it. `preview::module` adds one to the counter for the
+status it is about to return — a cache hit therefore costs one atomic add.
+`Engine::build` times what a cache miss costs — the `on_parser_stack` hop onto
+the big-stack thread and the `compile` it runs there, failures and a failed
+spawn included; a hit is not a compile and is not timed. A `Style`/`Script`
+compile calls `build` again for the module it needs, so on a cold cache the
+module's time is counted once on its own and once inside the style's
+observation.
+
+`GET /metrics` (`api::metrics`) renders those counters plus the gauges
+`/api/stats` already had — tenants, overlay bytes, cache entries and bytes,
+SSE subscribers, RSS, uptime, one series per base, and `Sass::stats`'s running,
+runaway, timed-out and refused compilations — as Prometheus text format 0.0.4,
+written by hand. Buckets are cumulative and `_count` is read off the `+Inf`
+bucket rather than counted separately, so the two can never disagree. The same
+numbers are in `/api/stats` under `modules`, `sass` and `sse_subscribers`.
+
+`require_api_token` exempts only `/` and `/health`, so `/metrics` needs the
+bearer token whenever `--api-token` is set; `http::tests` asserts both halves.
+
 ## Chat (`src/http/ai.rs`)
 
 `POST /api/t/{id}/chat` runs a tool loop against the Anthropic Messages API
@@ -401,6 +430,7 @@ src/http/api.rs        editor page, /api handlers, SSE, check_tenant
 src/http/archive.rs    tar.gz export and import of a tenant tree
 src/http/preview.rs    tenant-host handlers: shell, modules, raw, routes, renderers, shims, content
 src/http/ai.rs         chat tool loop
+src/metrics.rs         atomic counters, the compile histogram, the Prometheus renderer
 src/resolve.rs         Resolver, CDN URLs, renderers, sandbox-lite.json, tsconfig paths
 src/routes.rs          src/pages → route table
 src/transform/mod.rs   Engine, cache, Built, serve-time splice

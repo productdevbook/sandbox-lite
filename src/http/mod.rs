@@ -25,12 +25,14 @@ use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
+use crate::metrics::Metrics;
 use crate::store::{Store, valid_id};
 use crate::transform::Engine;
 
 pub struct AppState {
     pub store: Store,
     pub engine: Engine,
+    pub metrics: Arc<Metrics>,
     pub chats: chats::Chats,
     pub domain: String,
     pub port: u16,
@@ -103,6 +105,7 @@ pub fn app(state: State) -> Router {
     let root = Router::new()
         .route("/", get(api::editor))
         .route("/health", get(api::health))
+        .route("/metrics", get(api::metrics))
         .route("/api/stats", get(api::stats))
         .route("/api/bases", get(api::bases))
         .route("/api/tenants", get(api::tenants).post(api::create_tenant))
@@ -263,7 +266,65 @@ pub fn mime(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, preview_token, tenant_from_host};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::{AppState, SameSite, app, chats, constant_time_eq, preview_token, tenant_from_host};
+    use crate::metrics::Metrics;
+    use crate::store::Store;
+    use crate::transform::{Config, Engine};
+
+    fn baseless_app(api_token: Option<&str>) -> axum::Router {
+        let metrics = Arc::new(Metrics::default());
+        app(Arc::new(AppState {
+            store: Store::new(None, u64::MAX),
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
+            metrics,
+            chats: chats::Chats::default(),
+            domain: "localhost".into(),
+            port: 4321,
+            model: "m".into(),
+            api_key: None,
+            api_base: "http://127.0.0.1:1".into(),
+            api_token: api_token.map(str::to_string),
+            preview_secret: None,
+            cookie_samesite: SameSite::Lax,
+            chrome: None,
+            started: Instant::now(),
+        }))
+    }
+
+    async fn get(app: &axum::Router, uri: &str, bearer: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(t) = bearer {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let res = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn metrics_are_open_until_an_api_token_is_set() {
+        let (status, body) = get(&baseless_app(None), "/metrics", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("# TYPE sandbox_lite_compile_seconds histogram"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_need_the_api_token_when_one_is_set() {
+        let app = baseless_app(Some("s3cret"));
+        assert_eq!(get(&app, "/metrics", None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(&app, "/metrics", Some("wrong")).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(&app, "/metrics?token=s3cret", None).await.0, StatusCode::OK);
+        assert_eq!(get(&app, "/metrics", Some("s3cret")).await.0, StatusCode::OK);
+        assert_eq!(get(&app, "/health", None).await.0, StatusCode::OK);
+    }
 
     #[test]
     fn constant_time_eq_compares_whole_slices() {

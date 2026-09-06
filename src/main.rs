@@ -1,5 +1,6 @@
 mod check;
 mod http;
+mod metrics;
 mod resolve;
 mod routes;
 mod store;
@@ -149,14 +150,19 @@ async fn main() {
     }
     let port = args.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(80);
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
+    let metrics = Arc::new(metrics::Metrics::default());
     let state = Arc::new(http::AppState {
         store,
-        engine: transform::Engine::new(transform::Config {
-            cdn: args.cdn.clone(),
-            cache_bytes: args.cache_mb << 20,
-            max_source_bytes: args.max_source_kb << 10,
-            sass_timeout: Duration::from_millis(args.sass_timeout_ms),
-        }),
+        engine: transform::Engine::new(
+            transform::Config {
+                cdn: args.cdn.clone(),
+                cache_bytes: args.cache_mb << 20,
+                max_source_bytes: args.max_source_kb << 10,
+                sass_timeout: Duration::from_millis(args.sass_timeout_ms),
+            },
+            metrics.clone(),
+        ),
+        metrics,
         chats: http::chats::Chats::default(),
         domain: args.domain.clone(),
         port,

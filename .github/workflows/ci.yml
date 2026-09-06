@@ -40,6 +40,21 @@ jobs:
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=style&index=0' | grep -q __sl_css
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=script&index=0' | grep -q console.log
           test 200 = "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4399/health)"
+          curl -sf http://127.0.0.1:4399/metrics > /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_tenants gauge' /tmp/metrics.txt
+          grep -qxF 'sandbox_lite_tenants 1' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_cache_hits_total counter' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_sass_runaway gauge' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_compile_seconds histogram' /tmp/metrics.txt
+          grep -qxF 'sandbox_lite_bases{base="starter"} 1' /tmp/metrics.txt
+          grep -qE '^sandbox_lite_module_requests_total\{kind="module",status="200"\} [1-9][0-9]*$' /tmp/metrics.txt
+          grep -qE '^sandbox_lite_module_requests_total\{kind="module",status="500"\} [1-9][0-9]*$' /tmp/metrics.txt
+          grep -qE '^sandbox_lite_module_requests_total\{kind="style",status="200"\} [1-9][0-9]*$' /tmp/metrics.txt
+          grep -qE '^sandbox_lite_module_requests_total\{kind="script",status="200"\} [1-9][0-9]*$' /tmp/metrics.txt
+          grep -qE '^sandbox_lite_compile_seconds_sum\{kind="module"\} [0-9]+\.[0-9]{6}$' /tmp/metrics.txt
+          # the +Inf bucket and _count render the same number; drift between them is the bug worth catching
+          test "$(awk -F' ' '/^sandbox_lite_compile_seconds_bucket\{kind="module",le="\+Inf"\}/{print $2}' /tmp/metrics.txt)" \
+             = "$(awk -F' ' '/^sandbox_lite_compile_seconds_count\{kind="module"\}/{print $2}' /tmp/metrics.txt)"
       - run: bench/mem.sh 100 4398
   e2e:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository

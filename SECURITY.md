@@ -27,7 +27,7 @@ header of each request decides which of two routers answers
 | Host | Router | Contents |
 |---|---|---|
 | `<id>.<domain>` — exactly one label before `--domain`, and the label is a valid tenant id (1–63 bytes of `a-z`, `0-9`, `-`, no leading or trailing dash) | tenant | the shell page, `public/` files and everything under `/__sl/` for that tenant |
-| anything else — the bare domain, the daemon's IP address, a name with two labels, a missing `Host` header | editor / API | `/` (the editor), `/health`, `/api/*` |
+| anything else — the bare domain, the daemon's IP address, a name with two labels, a missing `Host` header | editor / API | `/` (the editor), `/health`, `/metrics`, `/api/*` |
 
 So the editor and the API are not only "on the bare domain": they answer on
 every hostname that does not parse as a tenant host. Put the daemon behind a

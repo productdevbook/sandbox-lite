@@ -220,9 +220,11 @@ mod tests {
         store.add_base(Base::load("b", &root.join("base")).unwrap());
         store.create_tenant("a", "b").unwrap();
         store.create_tenant("bb", "b").unwrap();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
         let state = Arc::new(AppState {
             store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }),
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
+            metrics,
             chats: crate::http::chats::Chats::default(),
             domain: "localhost".into(),
             port: 4321,

@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::metrics::Metrics;
 use crate::resolve::package_deps;
 use crate::store::{Base, Store};
 use crate::transform::{Config, Diag, Engine, Kind, is_source, scss};
@@ -63,7 +65,7 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
     let store = Store::new(None, u64::MAX);
     store.add_base(base);
     let tenant = store.create_tenant("check", "check")?;
-    let engine = Engine::new(Config::default());
+    let engine = Engine::new(Config::default(), Arc::new(Metrics::default()));
     let mut report = Report {
         name,
         files: 0,

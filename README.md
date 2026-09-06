@@ -224,7 +224,8 @@ Editor host (`localhost`):
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/stats` | RSS, tenant count, cache stats |
+| GET | `/metrics` | Prometheus text format: gauges, cache and request counters, compile-latency histograms |
+| GET | `/api/stats` | RSS, tenant count, cache stats, module requests and compile totals |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
 | DELETE | `/api/tenants/{id}` | remove tenant and its edits |
 | POST | `/api/tenants/{id}/import` | tar.gz body → overlay; `?replace=1` drops the edits it does not carry |
@@ -253,6 +254,18 @@ one `update` event, whatever the file count.
 curl -fsS localhost:4321/api/t/acme/export?overlay=1 > acme.tar.gz
 curl -fsS -X POST --data-binary @acme.tar.gz localhost:4321/api/tenants/acme-copy/import
 ```
+
+`/metrics` is scrapeable as it is — no exporter, no client library. It carries
+`sandbox_lite_tenants`, `sandbox_lite_overlay_bytes`, `sandbox_lite_cache_*`,
+`sandbox_lite_sse_subscribers`, `sandbox_lite_rss_bytes`,
+`sandbox_lite_uptime_seconds`, one series per base, `sandbox_lite_sass_*`
+(running, runaway, timeouts, refusals),
+`sandbox_lite_module_requests_total{kind,status}` and
+`sandbox_lite_compile_seconds{kind}` — a histogram of what a transform-cache
+miss costs, so `histogram_quantile(0.99, …)` answers "how slow is a cold
+compile" and `rate(sandbox_lite_cache_misses_total[5m])` answers "how often".
+It is behind `--api-token` like the rest of the editor host; a scrape then
+needs `bearer_token` in the job.
 
 Tenant host (`<id>.<domain>`):
 
@@ -310,6 +323,7 @@ src/routes.rs          src/pages → route table
 src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), import.meta.glob, markdown, mdx (satteri-mdxjs), content collections, cache
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop, stream framing, saved conversations
 src/check.rs           the `check` subcommand
+src/metrics.rs         atomic counters and the Prometheus text-format renderer behind /metrics
 assets/                shell.html, shell.js, live.js, editor.html, astro.js and astro-jsx.js bundles, astro:* shims
 examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections, endpoints); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
