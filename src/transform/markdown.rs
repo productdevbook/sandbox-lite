@@ -31,7 +31,7 @@ pub fn page_module(path: &str, source: &str) -> String {
     code
 }
 
-fn page_url(path: &str) -> String {
+pub(super) fn page_url(path: &str) -> String {
     let rest = path.strip_prefix("src/pages/").unwrap_or(path);
     let stem = rest.rsplit_once('.').map(|(s, _)| s).unwrap_or(rest);
     let stem = stem.strip_suffix("/index").or_else(|| (stem == "index").then_some("")).unwrap_or(stem);

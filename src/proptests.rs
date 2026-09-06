@@ -11,7 +11,7 @@ use crate::resolve::{import_map, join, normalize, package_name, strip_jsonc, tsc
 use crate::store::{clean_path, valid_id};
 use crate::transform::content::{parse_markdown, slugify, split_frontmatter, yaml_to_json};
 use crate::transform::css::rewrite_relative;
-use crate::transform::{Kind, glob, svg_size};
+use crate::transform::{Kind, glob, js, mdx, svg_size};
 
 #[rustfmt::skip]
 const TOKENS: &[&str] = &[
@@ -75,6 +75,11 @@ fn yaml() -> impl Strategy<Value = String> {
 
 fn markdown() -> impl Strategy<Value = String> {
     (yaml(), short()).prop_map(|(fm, body)| format!("---\n{fm}---\n{body}"))
+}
+
+fn mdx() -> impl Strategy<Value = String> {
+    (yaml(), short(), short())
+        .prop_map(|(fm, heading, text)| format!("---\n{fm}---\nimport X from \"./x.astro\";\n\n## {heading}\n\n<X>{text}</X>\n\n{text}\n"))
 }
 
 fn svg() -> impl Strategy<Value = String> {
@@ -258,6 +263,15 @@ proptest! {
         let md = parse_markdown(&src);
         prop_assert!(md.frontmatter.is_object());
         prop_assert_eq!(md.body.as_str(), body);
+    }
+
+    #[test]
+    fn mdx_page_module_is_a_module(src in prop_oneof![input(), markdown(), mdx()]) {
+        if let Ok(code) = mdx::page_module("src/pages/x.mdx", &src) {
+            prop_assert!(js::scan_checked(&code).is_some(), "generated module does not parse:\n{code}");
+            prop_assert!(code.contains("\nexport const frontmatter = {"), "no frontmatter export in:\n{code}");
+            prop_assert!(code.contains("\n__astro_tag_component__(Content, \"astro:jsx\");\n"), "Content not tagged in:\n{code}");
+        }
     }
 
     #[test]

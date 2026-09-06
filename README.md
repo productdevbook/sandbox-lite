@@ -36,7 +36,9 @@ What works in the preview today: `.astro` pages, layouts and components;
 TypeScript and JSX; scoped `<style>` blocks, plain CSS, Sass (`lang="scss"`
 and `.scss` files, compiled in-process) and Tailwind v4 (via its browser
 build); content collections (`getCollection`, `getEntry`, `render`); Markdown
-pages with `layout:`; dynamic routes with `getStaticPaths` and `paginate`;
+pages with `layout:`; MDX pages and MDX collection entries (compiled
+in-process with Astro's `satteri-mdxjs`, rendered with Astro's JSX runtime);
+dynamic routes with `getStaticPaths` and `paginate`;
 `import.meta.glob` (eager and lazy, `import:`/`query:` options); `import.meta.env`
 and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
 CDN pinned to the versions in `package.json`; React and Preact islands
@@ -186,14 +188,14 @@ Tenant host (`<id>.<domain>`):
 | Path | |
 |---|---|
 | `/` and any page path | shell HTML that renders the matching `src/pages` route in the browser |
-| `/__sl/m/<path>?v=N` | compiled ES module (`.astro`, `.ts`, `.tsx`, `.css`, `.scss`, `.json`, `.md`, images; `?raw`, `?url`) |
+| `/__sl/m/<path>?v=N` | compiled ES module (`.astro`, `.ts`, `.tsx`, `.css`, `.scss`, `.json`, `.md`, `.mdx`, images; `?raw`, `?url`) |
 | `/__sl/m/<file>.astro?astro&type=style&index=i` | one scoped `<style>` block of a component |
 | `/__sl/m/<file>.astro?astro&type=script&index=i` | one hoisted `<script>` of a component |
 | `/__sl/raw/<path>` | file as-is (assets, `@import`ed CSS) |
 | `/__sl/routes.json` | route table built from `src/pages`, in Astro priority order |
 | `/__sl/renderers.json` | framework renderers to register, derived from `package.json` (`@astrojs/react`, `@astrojs/preact`) or `sandbox-lite.json` |
-| `/__sl/content/<collection>` | `src/content/<collection>/*` as entries with rendered Markdown |
-| `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, … |
+| `/__sl/content/<collection>` | `src/content/<collection>/*` as entries; Markdown arrives rendered, MDX entries render through their compiled module |
+| `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, …; `astro-jsx-runtime.js` is Astro's JSX runtime and `astro:jsx` renderer |
 | `/__sl/astro.js` | Astro's runtime + container API, bundled once per Astro version |
 | `/__sl/events` | same SSE stream as the API; the page reloads itself on it |
 | anything under `public/` | served directly |
@@ -230,14 +232,14 @@ src/main.rs            CLI, startup
 src/store.rs           base projects, tenant overlays, versions, SSE fan-out, persistence
 src/resolve.rs         import specifier → URL
 src/routes.rs          src/pages → route table
-src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), import.meta.glob, markdown, content collections, cache
+src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), import.meta.glob, markdown, mdx (satteri-mdxjs), content collections, cache
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop
 src/check.rs           the `check` subcommand
-assets/                shell.html, shell.js, live.js, editor.html, astro.js bundle, astro:* shims
-examples/starter       a dependency-free Astro 7 site; the base used by CI's smoke test and bench/mem.sh
+assets/                shell.html, shell.js, live.js, editor.html, astro.js and astro-jsx.js bundles, astro:* shims
+examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         a React island hydrated with client:load
-scripts/build-runtime.sh   regenerates assets/astro.js for a new Astro version
+scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
 e2e/                   Playwright suite for the browser side: every example page, live reload, hydration, the error overlay
 ```
@@ -248,8 +250,7 @@ e2e/                   Playwright suite for the browser side: every example page
   another framework needs a `server` module exposing `check` and
   `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 40 lines) and a
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
-- **MDX and endpoints.** `.mdx` pages and `src/pages/*.ts` endpoints show an
-  "unsupported route" page. Markdown pages (`.md`, with `layout`) do render.
+- **Endpoints.** `src/pages/*.ts` endpoints show an "unsupported route" page.
 - **Less/Stylus.** Sass works; other preprocessors are passed through untouched.
 - **`content.config.ts` loaders.** Collections are read straight from
   `src/content/<name>/`, which is what the `glob` loader does for almost every
@@ -266,5 +267,5 @@ e2e/                   Playwright suite for the browser side: every example page
 
 ## License
 
-MIT. `assets/astro.js` is built from the `astro` npm package (MIT); the compiler
-is `withastro/compiler-rs` (MIT).
+MIT. `assets/astro.js` and `assets/astro-jsx.js` are built from the `astro` and
+`@astrojs/mdx` npm packages (MIT); the compiler is `withastro/compiler-rs` (MIT).

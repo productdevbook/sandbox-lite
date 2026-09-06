@@ -77,6 +77,9 @@ async function addRenderers(container) {
     container.addServerRenderer({ name: r.name, renderer: mod.default });
     if (r.client) container.addClientRenderer({ name: r.name, entrypoint: r.client });
   }
+  // Last, so framework renderers get to claim their components first, as in Astro.
+  const jsx = await import("/__sl/shim/astro-jsx-runtime.js");
+  container.addServerRenderer({ name: "astro:jsx", renderer: jsx.default });
 }
 
 function headExtras() {
@@ -124,8 +127,8 @@ async function main() {
   const routes = await fetchJSON(`/__sl/routes.json?v=${V}`);
   const hit = matchRoute(routes, location.pathname);
   if (!hit) return showError({ title: "404 — no matching page", message: `Nothing in src/pages matches ${location.pathname}`, routes });
-  if (hit.route.kind !== "astro" && hit.route.kind !== "md") {
-    return showError({ title: "Unsupported route", message: `${hit.route.component} is a ${hit.route.kind} route. sandbox-lite renders .astro and .md pages in the browser; endpoints and MDX are not available in the preview.` });
+  if (hit.route.kind !== "astro" && hit.route.kind !== "md" && hit.route.kind !== "mdx") {
+    return showError({ title: "Unsupported route", message: `${hit.route.component} is a ${hit.route.kind} route. sandbox-lite renders .astro, .md and .mdx pages in the browser; endpoints are not available in the preview.` });
   }
   const astro = await import("/__sl/astro.js");
   const mod = await import(`/__sl/m/${hit.route.component}?v=${V}`);

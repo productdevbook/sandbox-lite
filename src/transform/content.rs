@@ -113,9 +113,14 @@ pub fn collection_json(tenant: &Tenant, name: &str) -> Value {
         let Some(text) = tenant.read_text(&e.path) else { continue };
         let id = stem.to_ascii_lowercase();
         match ext {
-            "md" | "mdx" | "markdown" => {
+            "md" | "markdown" => {
                 let md = parse_markdown(&text);
                 entries.push(entry(&id, name, md.frontmatter, Some(&md.body), Some((md.html, md.headings)), &e.path));
+            }
+            "mdx" => {
+                let (fm, body) = split_frontmatter(&text);
+                let data = fm.map(yaml_to_json).unwrap_or_else(|| Value::Object(Map::new()));
+                entries.push(entry(&id, name, data, Some(body.trim()), None, &e.path));
             }
             "json" => match serde_json::from_str::<Value>(&text) {
                 Ok(Value::Array(items)) => {

@@ -29,8 +29,8 @@ test.describe('starter', () => {
     await page.goto(site.url('/blog'));
     await expect(page).toHaveTitle('Journal · Lumen Studio');
     await expect(page.locator('h1')).toHaveText('Journal');
-    await expect(page.locator('.posts a')).toHaveText(['Why we render previews in the browser', 'Launching the journal']);
-    await expect(page.locator('.posts a').first()).toHaveAttribute('href', '/blog/hello-world');
+    await expect(page.locator('.posts a')).toHaveText(['Writing journal posts in MDX', 'Why we render previews in the browser', 'Launching the journal']);
+    await expect(page.locator('.posts a').first()).toHaveAttribute('href', '/blog/writing-in-mdx');
   });
 
   test('/blog/hello-world', async ({ daemon, page }) => {
@@ -49,6 +49,29 @@ test.describe('starter', () => {
     await expect(page.locator('h1')).toHaveText('Editing this site');
     await expect(page.locator('article h2')).toHaveText(['What you can edit', 'What happens when you save']);
     await expect(page.locator('article ol li')).toHaveCount(3);
+  });
+
+  test('/mdx-demo', async ({ daemon, page }) => {
+    const site = await daemon.tenant('starter', 'starter');
+    await page.goto(site.url('/mdx-demo'));
+    await expect(page).toHaveTitle('MDX in the preview · Lumen Studio');
+    await expect(page.locator('h1')).toHaveText('MDX in the preview');
+    await expect(page.locator('article > p strong').first(), '{frontmatter.title} in the body').toHaveText('MDX in the preview');
+    await expect(page.locator('article h2')).toHaveText(['Components', 'Expressions', 'Headings']);
+    await expect(page.locator('article h2').first()).toHaveAttribute('id', 'components');
+    await expect(page.locator('.card h3'), 'an imported .astro component').toHaveText('Compiled in Rust');
+    await expect(page.locator('article ul li'), 'a mapped expression').toHaveCount(3);
+    await expect(page.locator('nav a.active')).toHaveText('MDX');
+  });
+
+  test('/blog/writing-in-mdx', async ({ daemon, page }) => {
+    const site = await daemon.tenant('starter', 'starter');
+    await page.goto(site.url('/blog/writing-in-mdx'));
+    await expect(page).toHaveTitle('Writing journal posts in MDX · Lumen Studio');
+    await expect(page.locator('h1')).toHaveText('Writing journal posts in MDX');
+    await expect(page.locator('article h2')).toHaveAttribute('id', 'what-an-entry-can-do');
+    await expect(page.locator('.card h3'), 'a component inside a collection entry').toHaveText('Components in a post');
+    await expect(page.locator('article > p').last()).toContainText('accepts 2 formats, Markdown and MDX');
   });
 });
 

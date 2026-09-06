@@ -1,0 +1,22 @@
+---
+title: Writing journal posts in MDX
+description: A collection entry can be MDX too — components and expressions included
+date: 2026-09-06
+tags: [mdx, content]
+---
+import Card from "../../components/Card.astro";
+
+export const formats = ["Markdown", "MDX"];
+
+This entry is `src/content/posts/writing-in-mdx.mdx`. The blog page calls
+`render()` on it like on any other post; the preview compiles it to a module
+and renders it with Astro's JSX runtime.
+
+## What an entry can do
+
+Import a component and use it in the middle of the prose:
+
+<Card title="Components in a post" text="Anything under src/components works here." />
+
+Or compute something inline: this journal accepts {formats.length} formats,
+{formats.join(" and ")}.
