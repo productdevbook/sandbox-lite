@@ -260,11 +260,11 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
             return ([(header::CONTENT_TYPE, mime(&public)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response();
         }
     }
-    let env = Value::Object(env_map(&t));
+    let env = Value::Object(env_map(&t)).to_string().replace('<', "\\u003c");
     let html = SHELL_HTML
         .replace("%TENANT%", &t.id)
         .replace("%VERSION%", &t.version().to_string())
         .replace("%ASSETS%", asset_version())
-        .replace("%ENV%", &env.to_string());
+        .replace("%ENV%", &env);
     ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }
