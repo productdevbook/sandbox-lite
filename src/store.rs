@@ -47,7 +47,7 @@ impl Base {
     pub fn load(name: &str, root: &Path) -> io::Result<Base> {
         let root = root.canonicalize()?;
         let mut files = BTreeMap::new();
-        walk(&root, &root, &mut files)?;
+        walk(&root, &root, &mut files, true)?;
         Ok(Base { name: name.to_string(), root, files })
     }
 
@@ -64,17 +64,18 @@ impl Base {
     }
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, FileData>) -> io::Result<()> {
+/// Base projects skip build output and dependencies; a tenant's own overlay must come back whole.
+fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, FileData>, skip_build_dirs: bool) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) {
+            if skip_build_dirs && SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            walk(root, &path, out)?;
+            walk(root, &path, out, skip_build_dirs)?;
         } else if ft.is_file() {
             let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
             out.insert(rel, FileData::from_disk(&path)?);
@@ -249,7 +250,7 @@ impl Tenant {
         let files = dir.join("files");
         let mut loaded = BTreeMap::new();
         if files.is_dir() {
-            walk(&files, &files, &mut loaded)?;
+            walk(&files, &files, &mut loaded, false)?;
         }
         let mut overlay = self.overlay.write().unwrap();
         for (p, d) in loaded {
