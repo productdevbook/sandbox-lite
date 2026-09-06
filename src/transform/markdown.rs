@@ -1,8 +1,11 @@
 use super::content::parse_markdown;
-use super::json_str;
+use super::{BuildError, Diag, json_str};
 
-pub fn page_module(path: &str, source: &str) -> String {
-    let md = parse_markdown(source);
+pub fn page_module(path: &str, source: &str) -> Result<String, BuildError> {
+    let md = parse_markdown(source).map_err(|text| {
+        let diag = Diag { severity: "error".into(), text: text.clone(), hint: String::new(), file: path.to_string(), line: 1, column: 1 };
+        BuildError::compile(format!("{path}: {text}"), vec![diag])
+    })?;
     let layout = md.frontmatter.get("layout").and_then(|l| l.as_str()).map(|s| s.to_string());
     let url = page_url(path);
     let mut code = String::with_capacity(md.html.len() + 1024);
@@ -28,7 +31,7 @@ pub fn page_module(path: &str, source: &str) -> String {
         "export default createComponent((result, props, slots) => Layout\n  ? render`${{renderComponent(result, \"Layout\", Layout, {{ frontmatter, headings, url, file, rawContent, compiledContent, ...props }}, {{ default: () => render`${{unescapeHTML(html)}}` }})}}`\n  : render`${{unescapeHTML(html)}}`, {});\n",
         json_str(path)
     ));
-    code
+    Ok(code)
 }
 
 pub(super) fn page_url(path: &str) -> String {

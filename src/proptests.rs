@@ -202,7 +202,8 @@ proptest! {
 
     #[test]
     fn tsconfig_targets_stay_inside_the_tenant(text in prop_oneof![input(), tsconfig()]) {
-        let aliases = tsconfig_paths(&text);
+        // Junk that does not parse is refused rather than read as no aliases; what it does parse to has to hold.
+        let Ok(aliases) = tsconfig_paths(&text) else { return Ok(()) };
         for (key, target) in &aliases {
             prop_assert!(!key.ends_with('*'));
             assert_inside_tenant(target.strip_suffix('/').unwrap_or(target))?;
@@ -214,12 +215,14 @@ proptest! {
     fn import_map_keeps_every_string_entry(entries in prop::collection::vec((short(), short()), 0..4), junk in input()) {
         let map: Map<String, Value> = entries.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
         let mut want: Vec<(String, String)> = map.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect();
-        let mut got = import_map(&json!({ "imports": map, "site": junk }).to_string());
+        let mut got = import_map(&json!({ "imports": map, "site": junk }).to_string()).unwrap();
         prop_assert!(longest_key_first(&got));
         got.sort();
         want.sort();
         prop_assert_eq!(got, want);
-        prop_assert!(longest_key_first(&import_map(&junk)));
+        if let Ok(m) = import_map(&junk) {
+            prop_assert!(longest_key_first(&m));
+        }
     }
 
     #[test]
@@ -279,9 +282,11 @@ proptest! {
             prop_assert!(s.starts_with("---") && s.contains(fm));
             prop_assert!(fm.len() + body.len() + 7 <= s.len());
         }
-        let md = parse_markdown(&src);
-        prop_assert!(md.frontmatter.is_object());
-        prop_assert_eq!(md.body.as_str(), body);
+        // Frontmatter that is not a YAML mapping is refused; whatever is accepted is still an object.
+        if let Ok(md) = parse_markdown(&src) {
+            prop_assert!(md.frontmatter.is_object());
+            prop_assert_eq!(md.body.as_str(), body);
+        }
     }
 
     #[test]
@@ -295,8 +300,10 @@ proptest! {
     }
 
     #[test]
-    fn yaml_to_json_is_always_an_object(yaml in prop_oneof![input(), yaml()]) {
-        prop_assert!(yaml_to_json(&yaml).is_object());
+    fn yaml_to_json_is_an_object_whenever_it_answers(yaml in prop_oneof![input(), yaml()]) {
+        if let Ok(v) = yaml_to_json(&yaml) {
+            prop_assert!(v.is_object());
+        }
     }
 
     #[test]

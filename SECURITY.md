@@ -97,8 +97,9 @@ roles or per-tenant credentials on the API side.
   Two parsed sources do not reach grass or oxc through `Engine::build`, and get
   the bounds where they are loaded instead:
   - `src/content.config.ts`, read by the content route — past the size or the
-    nesting cap it is left unparsed and the collection falls back to the
-    directory layout.
+    nesting cap the collection answers 500 with the diagnostic. It used to fall
+    back to the directory layout, which served a config nobody had read as if
+    the tenant had written no config at all (issue #48).
   - Sass partials, which grass reads itself and compiles on its own thread
     (see below) rather than on the one `Engine::build` reserved. Each is
     refused past the nesting cap, and that thread gets a 64 MiB stack.

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,13 +172,17 @@ impl Chats {
         self.cap
     }
 
-    pub fn load(&self, t: &Tenant, id: &str) -> Option<Conversation> {
+    /// `Ok(None)` is a chat that is not there; `Err` is one that is and could not be read back.
+    /// Answering "unknown chat" for the second loses a conversation the caller still has.
+    pub fn load(&self, t: &Tenant, id: &str) -> io::Result<Option<Conversation>> {
         if !valid_id(id) {
-            return None;
+            return Ok(None);
         }
-        match dir(t) {
-            Some(dir) => serde_json::from_slice(&std::fs::read(dir.join(format!("{id}.json"))).ok()?).ok(),
-            None => self.mem.read().unwrap().get(&t.id)?.get(id).cloned(),
+        let Some(dir) = dir(t) else { return Ok(self.mem.read().unwrap().get(&t.id).and_then(|m| m.get(id)).cloned()) };
+        match std::fs::read(dir.join(format!("{id}.json"))) {
+            Ok(raw) => serde_json::from_slice(&raw).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -192,68 +196,74 @@ impl Chats {
                 self.mem.write().unwrap().entry(t.id.clone()).or_default().insert(chat.id.clone(), chat.clone());
             }
         }
-        self.evict(t, &chat.id);
-        Ok(())
+        self.evict(t, &chat.id)
     }
 
     /// Brings the tenant back under the cap after a save. The count is taken first because it
     /// costs one `read_dir`, where choosing what to drop costs a parse of every conversation.
-    fn evict(&self, t: &Tenant, saved: &str) {
-        if self.count(t) <= self.cap {
-            return;
+    fn evict(&self, t: &Tenant, saved: &str) -> io::Result<()> {
+        if self.count(t)? <= self.cap {
+            return Ok(());
         }
-        for id in evictable(&self.list(t), self.cap, saved) {
-            self.delete(t, &id);
+        for id in evictable(&self.list(t)?, self.cap, saved) {
+            self.delete(t, &id)?;
         }
+        Ok(())
     }
 
-    fn count(&self, t: &Tenant) -> usize {
+    fn count(&self, t: &Tenant) -> io::Result<usize> {
         match dir(t) {
-            Some(dir) => std::fs::read_dir(dir).into_iter().flatten().flatten().filter(is_chat_file).count(),
-            None => self.mem.read().unwrap().get(&t.id).map_or(0, BTreeMap::len),
+            Some(dir) => Ok(chat_files(&dir)?.len()),
+            None => Ok(self.mem.read().unwrap().get(&t.id).map_or(0, BTreeMap::len)),
         }
     }
 
     /// What the tenant's conversations hold: the size of the files under `<data-dir>/<id>/chats/`,
     /// or what the in-memory ones would serialize to.
-    pub fn usage(&self, t: &Tenant) -> (usize, u64) {
+    pub fn usage(&self, t: &Tenant) -> io::Result<(usize, u64)> {
         match dir(t) {
-            Some(dir) => std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(is_chat_file)
-                .filter_map(|e| e.metadata().ok())
-                .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len())),
-            None => self.mem.read().unwrap().get(&t.id).map_or((0, 0), |m| {
+            Some(dir) => {
+                let mut out = (0usize, 0u64);
+                for entry in chat_files(&dir)? {
+                    out = (out.0 + 1, out.1 + entry.metadata()?.len());
+                }
+                Ok(out)
+            }
+            None => Ok(self.mem.read().unwrap().get(&t.id).map_or((0, 0), |m| {
                 m.values().fold((0, 0), |(n, bytes), c| (n + 1, bytes + serde_json::to_vec(c).map_or(0, |v| v.len() as u64)))
-            }),
+            })),
         }
     }
 
-    /// Newest first.
-    pub fn list(&self, t: &Tenant) -> Vec<Conversation> {
+    /// Newest first. A conversation file that cannot be read fails the listing rather than
+    /// disappearing from it: a short list looks exactly like a tenant that had fewer chats.
+    pub fn list(&self, t: &Tenant) -> io::Result<Vec<Conversation>> {
         let mut all: Vec<Conversation> = match dir(t) {
-            Some(dir) => std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(is_chat_file)
-                .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
-                .collect(),
+            Some(dir) => {
+                let mut out = Vec::new();
+                for entry in chat_files(&dir)? {
+                    let raw = std::fs::read(entry.path())?;
+                    out.push(serde_json::from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+                }
+                out
+            }
             None => self.mem.read().unwrap().get(&t.id).map(|m| m.values().cloned().collect()).unwrap_or_default(),
         };
         all.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
-        all
+        Ok(all)
     }
 
-    pub fn delete(&self, t: &Tenant, id: &str) -> bool {
+    /// `Ok(false)` is a chat that was not there. An `Err` is a chat still there after a delete that
+    /// answered 204.
+    pub fn delete(&self, t: &Tenant, id: &str) -> io::Result<bool> {
         if !valid_id(id) {
-            return false;
+            return Ok(false);
         }
-        match dir(t) {
-            Some(dir) => std::fs::remove_file(dir.join(format!("{id}.json"))).is_ok(),
-            None => self.mem.write().unwrap().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some()),
+        let Some(dir) = dir(t) else { return Ok(self.mem.write().unwrap().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some())) };
+        match std::fs::remove_file(dir.join(format!("{id}.json"))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -269,6 +279,25 @@ fn dir(t: &Tenant) -> Option<PathBuf> {
 
 fn is_chat_file(e: &std::fs::DirEntry) -> bool {
     e.file_name().to_string_lossy().ends_with(".json")
+}
+
+/// A tenant that has never been chatted with has no `chats/` directory, which is an empty listing.
+/// Anything else that stops the directory being read is not one, and must not be counted as one:
+/// a zero here silently stops the cap being enforced and understates what the tenant is holding.
+fn chat_files(dir: &Path) -> io::Result<Vec<std::fs::DirEntry>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if is_chat_file(&entry) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 fn now_millis() -> u64 {
@@ -293,7 +322,10 @@ pub async fn list(AxState(st): AxState<State>, AxPath(id): AxPath<String>) -> Re
         Ok(t) => t,
         Err(r) => return r,
     };
-    Json(json!({ "chats": st.chats.list(&t).iter().map(Conversation::brief).collect::<Vec<_>>() })).into_response()
+    match st.chats.list(&t) {
+        Ok(all) => Json(json!({ "chats": all.iter().map(Conversation::brief).collect::<Vec<_>>() })).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 pub async fn get(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(String, String)>) -> Response {
@@ -302,8 +334,9 @@ pub async fn get(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(String
         Err(r) => return r,
     };
     match st.chats.load(&t, &chat) {
-        Some(c) => Json(c).into_response(),
-        None => err(StatusCode::NOT_FOUND, "unknown chat"),
+        Ok(Some(c)) => Json(c).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "unknown chat"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -312,7 +345,11 @@ pub async fn remove(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(Str
         Ok(t) => t,
         Err(r) => return r,
     };
-    if st.chats.delete(&t, &chat) { StatusCode::NO_CONTENT.into_response() } else { err(StatusCode::NOT_FOUND, "unknown chat") }
+    match st.chats.delete(&t, &chat) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "unknown chat"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -468,12 +505,12 @@ mod tests {
                 let mut c = conversation(&format!("c{i}"), 2);
                 c.updated = 1000 + i as u64;
                 chats.save(&t, &c).unwrap();
-                assert!(chats.list(&t).len() <= 3, "persist={persist}, after {i}");
+                assert!(chats.list(&t).unwrap().len() <= 3, "persist={persist}, after {i}");
             }
-            let left: Vec<String> = chats.list(&t).into_iter().map(|c| c.id).collect();
+            let left: Vec<String> = chats.list(&t).unwrap().into_iter().map(|c| c.id).collect();
             assert_eq!(left, ["c5", "c4", "c3"], "persist={persist}");
-            assert!(chats.load(&t, "c0").is_none(), "persist={persist}");
-            let (count, bytes) = chats.usage(&t);
+            assert!(chats.load(&t, "c0").unwrap().is_none(), "persist={persist}");
+            let (count, bytes) = chats.usage(&t).unwrap();
             assert_eq!(count, 3, "persist={persist}");
             assert!(bytes > 0, "persist={persist}");
             let _ = std::fs::remove_dir_all(&root);
@@ -483,7 +520,7 @@ mod tests {
     #[test]
     fn usage_is_zero_for_a_tenant_that_has_never_chatted() {
         let (t, root) = tenant(true);
-        assert_eq!(Chats::default().usage(&t), (0, 0));
+        assert_eq!(Chats::default().usage(&t).unwrap(), (0, 0));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

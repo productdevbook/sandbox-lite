@@ -117,10 +117,11 @@ fn file_tool(st: &AppState, t: &Tenant, name: &str, input: &Value, changes: &mut
     let path = || input.get("path").and_then(|p| p.as_str()).and_then(clean_path);
     match name {
         "list_files" => t.list().iter().map(|e| format!("{} ({} bytes)", e.path, e.size)).collect::<Vec<_>>().join("\n"),
-        "read_file" => match path().and_then(|p| t.read(&p)) {
-            Some(bytes) if bytes.len() <= MAX_READ => String::from_utf8_lossy(&bytes).into_owned(),
-            Some(_) => "error: file too large to read".into(),
-            None => "error: no such file".into(),
+        "read_file" => match path().map(|p| t.read(&p)).transpose() {
+            Ok(Some(Some(bytes))) if bytes.len() <= MAX_READ => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(Some(Some(_))) => "error: file too large to read".into(),
+            Ok(_) => "error: no such file".into(),
+            Err(e) => format!("error: {e}"),
         },
         "write_file" => {
             let Some(p) = path() else { return "error: bad path".into() };
@@ -555,8 +556,9 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
     let Some(t) = st.store.tenant(&id) else { return err(StatusCode::NOT_FOUND, "unknown tenant") };
     let conv = match &req.chat {
         Some(chat) => match st.chats.load(&t, chat) {
-            Some(c) => c,
-            None => return err(StatusCode::NOT_FOUND, "unknown chat"),
+            Ok(Some(c)) => c,
+            Ok(None) => return err(StatusCode::NOT_FOUND, "unknown chat"),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         },
         None => Conversation::new(super::chats::new_id()),
     };
@@ -775,7 +777,7 @@ mod tests {
         assert!(done[0]["version"].as_u64().unwrap() > 0);
 
         let t = f.st.store.tenant("acme").unwrap();
-        assert_eq!(t.read_text("src/pages/new.astro").as_deref(), Some("<h1>hi</h1>"));
+        assert_eq!(t.read_text("src/pages/new.astro").unwrap().as_deref(), Some("<h1>hi</h1>"));
 
         // the second request has to carry the first turn's blocks back, with the tool result after them
         let seen = f.seen.lock().unwrap();
@@ -795,7 +797,7 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_1");
 
         let chat_id = done[0]["chat"].as_str().unwrap();
-        let stored = f.st.chats.load(&t, chat_id).expect("the conversation was saved");
+        let stored = f.st.chats.load(&t, chat_id).unwrap().expect("the conversation was saved");
         assert_eq!(stored.title, "add a page");
         assert_eq!(stored.messages[0], Turn { role: "user".into(), text: "add a page".into(), tools: vec![] });
         assert_eq!(
@@ -806,7 +808,7 @@ mod tests {
                 tools: vec![ToolCall { name: "write_file".into(), path: "src/pages/new.astro".into() }],
             }
         );
-        assert_eq!(f.st.chats.list(&t).len(), 1);
+        assert_eq!(f.st.chats.list(&t).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -840,8 +842,8 @@ mod tests {
             ])
         );
         let t = f.st.store.tenant("acme").unwrap();
-        assert_eq!(f.st.chats.load(&t, &chat_id).unwrap().messages.len(), 4, "in memory, without a data dir");
-        assert_eq!(f.st.chats.list(&t).len(), 1);
+        assert_eq!(f.st.chats.load(&t, &chat_id).unwrap().unwrap().messages.len(), 4, "in memory, without a data dir");
+        assert_eq!(f.st.chats.list(&t).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -904,7 +906,7 @@ mod tests {
         let (status, _) = post_chat(&f.st, None, ask("carry on", Some("old"))).await;
         assert_eq!(status, StatusCode::OK);
 
-        let stored = f.st.chats.load(&t, "old").unwrap();
+        let stored = f.st.chats.load(&t, "old").unwrap().unwrap();
         assert_eq!(stored.summary, STUB_SUMMARY);
         assert_eq!(stored.messages.len(), window * 2 - dropped + 2, "the window, plus this request's two turns");
         assert_eq!(stored.messages[0].text, format!("turn {dropped}"));
@@ -959,7 +961,7 @@ mod tests {
         let (status, _) = post_chat(&f.st, None, ask("carry on", Some("old"))).await;
         assert_eq!(status, StatusCode::OK, "a summary that cannot be written is not a failed request");
 
-        let stored = f.st.chats.load(&t, "old").unwrap();
+        let stored = f.st.chats.load(&t, "old").unwrap().unwrap();
         assert_eq!(stored.summary, "");
         assert_eq!(stored.messages.len(), window * 4 + 2, "no turn is dropped without a summary to stand for it");
         let seen = f.seen.lock().unwrap();

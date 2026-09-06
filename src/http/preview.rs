@@ -71,7 +71,7 @@ async fn module_response(st: &State, id: &TenantId, path: String, query: &str, k
     let versioned = query.split('&').any(|p| p.starts_with("v="));
     let st2 = st.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let resolver = Resolver::new(&t, &st2.engine.cfg.cdn, t.version());
+        let resolver = Resolver::new(&t, &st2.engine.cfg.cdn, t.version()).map_err(|e| BuildError::compile(e, vec![]))?;
         st2.engine.serve(&t, &path, kind, &resolver)
     })
     .await;
@@ -90,9 +90,13 @@ pub async fn raw(AxState(st): AxState<State>, Extension(id): Extension<TenantId>
         Err(r) => return r,
     };
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
-    match t.read(&path).filter(|_| !is_private_path(&path)) {
-        Some(bytes) => ([(header::CONTENT_TYPE, mime(&path)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response(),
-        None => err(StatusCode::NOT_FOUND, format!("{path}: not found")),
+    if is_private_path(&path) {
+        return err(StatusCode::NOT_FOUND, format!("{path}: not found"));
+    }
+    match t.read(&path) {
+        Ok(Some(bytes)) => ([(header::CONTENT_TYPE, mime(&path)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("{path}: not found")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{path}: {e}")),
     }
 }
 
@@ -104,9 +108,13 @@ pub async fn routes_json(AxState(st): AxState<State>, Extension(id): Extension<T
 }
 
 pub async fn renderers_json(AxState(st): AxState<State>, Extension(id): Extension<TenantId>) -> Response {
-    match tenant(&st, &id) {
-        Ok(t) => ([(header::CACHE_CONTROL, "no-cache")], Json(renderers(&t, &st.engine.cfg.cdn))).into_response(),
-        Err(r) => r,
+    let t = match tenant(&st, &id) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    match renderers(&t, &st.engine.cfg.cdn) {
+        Ok(list) => ([(header::CACHE_CONTROL, "no-cache")], Json(list)).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -123,10 +131,15 @@ pub async fn check(AxState(st): AxState<State>, Extension(id): Extension<TenantI
         Err(r) => return r,
     };
     let st2 = st.clone();
-    let out = tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+    let out = match tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await {
+        Ok(out) => out,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     ([(header::CACHE_CONTROL, "no-store")], Json(out)).into_response()
 }
 
+/// Issue #48: every way this can fail answers 500 with the diagnostic. An empty collection is a
+/// tenant with no entries, and a page rendered from one looks exactly like a page that is right.
 pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<TenantId>, Path(name): Path<String>) -> Response {
     let t = match tenant(&st, &id) {
         Ok(t) => t,
@@ -136,25 +149,31 @@ pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<Tenan
         return err(StatusCode::BAD_REQUEST, "bad collection name");
     }
     let st2 = st.clone();
-    let out = tokio::task::spawn_blocking(move || {
+    let collection = name.clone();
+    let joined = tokio::task::spawn_blocking(move || {
         let max = st2.engine.cfg.max_source_bytes;
-        st2.engine.on_parser_stack(move || content::collection_json(&t, &name, max))
+        st2.engine.on_parser_stack(move || content::collection_json(&t, &collection, max))
     })
     .await;
-    let out = out.ok().and_then(Result::ok).unwrap_or_else(content::empty_collection);
+    let out = match joined {
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(e))) => return build_error(e),
+        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: cannot start a compiler thread: {e}")),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
+    };
     ([(header::CACHE_CONTROL, "no-cache")], Json(out)).into_response()
 }
 
-fn env_map(t: &Tenant) -> Map<String, Value> {
+fn env_map(t: &Tenant) -> Result<Map<String, Value>, String> {
     let mut env = Map::new();
     env.insert("DEV".into(), json!(true));
     env.insert("PROD".into(), json!(false));
     env.insert("MODE".into(), json!("development"));
     env.insert("SSR".into(), json!(true));
     env.insert("BASE_URL".into(), json!("/"));
-    env.insert("SITE".into(), crate::resolve::tenant_site(t).map(Value::String).unwrap_or(Value::Null));
+    env.insert("SITE".into(), crate::resolve::tenant_site(t)?.map(Value::String).unwrap_or(Value::Null));
     env.insert("ASSETS_PREFIX".into(), Value::Null);
-    if let Some(dotenv) = t.read_text(".env") {
+    if let Some(dotenv) = t.read_text(".env").map_err(|e| format!(".env: {e}"))? {
         for line in dotenv.lines() {
             let line = line.trim();
             if line.starts_with('#') {
@@ -169,7 +188,7 @@ fn env_map(t: &Tenant) -> Map<String, Value> {
             env.insert(k.to_string(), Value::String(v.to_string()));
         }
     }
-    env
+    Ok(env)
 }
 
 pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId>, Path(name): Path<String>) -> Response {
@@ -178,7 +197,10 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         Err(r) => return r,
     };
     let Some(name) = name.strip_suffix(".js") else { return err(StatusCode::NOT_FOUND, "no such shim") };
-    let resolver = Resolver::new(&t, &st.engine.cfg.cdn, t.version());
+    let resolver = match Resolver::new(&t, &st.engine.cfg.cdn, t.version()) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     let body: String = match name {
         "astro-content" => include_str!("../../assets/shims/astro-content.js").into(),
         "astro-assets" => include_str!("../../assets/shims/astro-assets.js").into(),
@@ -197,9 +219,15 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         "renderer-svelte" => include_str!("../../assets/shims/renderer-svelte.js").into(),
         "renderer-svelte-client" => include_str!("../../assets/shims/renderer-svelte-client.js").into(),
         // The loaders build blob modules, whose bare specifiers no resolver sees, so their URLs are baked in.
-        "vue-loader" => include_str!("../../assets/shims/vue-loader.js")
-            .replace("%VUE_COMPILER%", &crate::resolve::vue_compiler_url(&t, &st.engine.cfg.cdn))
-            .replace("%VUE%", &resolver.resolve("", "vue")),
+        "vue-loader" => {
+            let compiler = match crate::resolve::vue_compiler_url(&t, &st.engine.cfg.cdn) {
+                Ok(url) => url,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            include_str!("../../assets/shims/vue-loader.js")
+                .replace("%VUE_COMPILER%", &compiler)
+                .replace("%VUE%", &resolver.resolve("", "vue"))
+        }
         "svelte-loader" => include_str!("../../assets/shims/svelte-loader.js").replace("%SVELTE%", &resolver.resolve("", "svelte")),
         "astro-config" => include_str!("../../assets/shims/astro-config.js").into(),
         "astro-loaders" => include_str!("../../assets/shims/astro-loaders.js").into(),
@@ -208,7 +236,11 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         "viewtransitions-css" => css::to_module("astro:viewtransitions", VIEW_TRANSITIONS_CSS, ""),
         "astro-env-client" | "astro-env-server" => {
             let mut out = String::new();
-            for (k, v) in env_map(&t) {
+            let env = match env_map(&t) {
+                Ok(env) => env,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            for (k, v) in env {
                 if k.starts_with("PUBLIC_") {
                     out.push_str(&format!("export const {k} = {v};\n"));
                 }
@@ -282,11 +314,18 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
     let decoded = percent_decode(uri.path());
     if let Some(rel) = clean_path(&decoded).filter(|rel| !is_private_path(rel)) {
         let public = format!("public/{rel}");
-        if let Some(bytes) = t.read(&public) {
-            return ([(header::CONTENT_TYPE, mime(&public)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response();
+        match t.read(&public) {
+            Ok(Some(bytes)) => {
+                return ([(header::CONTENT_TYPE, mime(&public)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response();
+            }
+            Ok(None) => {}
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{public}: {e}")),
         }
     }
-    let env = Value::Object(env_map(&t)).to_string().replace('<', "\\u003c");
+    let env = match env_map(&t) {
+        Ok(env) => Value::Object(env).to_string().replace('<', "\\u003c"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     let token = st.preview_secret.as_deref().map(|s| super::preview_token(s, &t.id)).unwrap_or_default();
     let token_query = if token.is_empty() { String::new() } else { format!("?sl_token={token}") };
     let html = SHELL_HTML
@@ -301,7 +340,20 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
     use super::percent_decode;
+    use crate::http::{AppState, SameSite, app, chats};
+    use crate::metrics::Metrics;
+    use crate::store::{Base, Store, UpdateKind};
+    use crate::transform::{Config, Engine};
 
     #[test]
     fn percent_decode_takes_any_string() {
@@ -310,5 +362,60 @@ mod tests {
         assert_eq!(percent_decode("%C3%A9%"), "é%");
         assert_eq!(percent_decode("%+1%-1%2"), "%+1%-1%2");
         assert_eq!(percent_decode("%FF"), "\u{fffd}");
+    }
+
+    fn starter_app(files: &[(&str, &str)]) -> axum::Router {
+        let metrics = Arc::new(Metrics::default());
+        let store = Store::new(None, u64::MAX);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &root).unwrap());
+        let t = store.create_tenant("acme", "starter").unwrap();
+        for (path, body) in files {
+            t.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
+        }
+        app(Arc::new(AppState {
+            store,
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
+            metrics,
+            chats: chats::Chats::default(),
+            shots: crate::http::ai::Shots::default(),
+            domain: "localhost".into(),
+            port: 4321,
+            model: "m".into(),
+            api_key: None,
+            api_base: "http://127.0.0.1:1".into(),
+            api_token: None,
+            preview_secret: None,
+            cookie_samesite: SameSite::Lax,
+            chrome: None,
+            started: Instant::now(),
+        }))
+    }
+
+    async fn collection(app: &axum::Router, name: &str) -> (StatusCode, Value) {
+        let req = Request::builder().uri(format!("/__sl/content/{name}")).header("host", "acme.localhost").body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_collection_that_builds_is_served() {
+        let (status, body) = collection(&starter_app(&[]), "posts").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #48: this answered 200 with `{"entries": []}`, and the page then rendered as a tenant
+    /// with no posts — a wrong answer wearing the shape of a right one.
+    #[tokio::test]
+    async fn a_collection_that_fails_to_build_is_a_500_with_the_diagnostic() {
+        let app = starter_app(&[("src/content/posts/bad.md", "---\ntitle: \"unterminated\n---\nbody\n")]);
+        let (status, body) = collection(&app, "posts").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"].as_str().unwrap().contains("src/content/posts/bad.md"), "{body}");
+        assert_eq!(body["diagnostics"][0]["file"], "src/content/posts/bad.md");
+        assert_eq!(body["diagnostics"][0]["severity"], "error");
     }
 }

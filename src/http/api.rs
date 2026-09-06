@@ -73,20 +73,31 @@ fn module_stats(st: &AppState) -> Vec<Value> {
 
 /// Conversations and the bytes they hold across every tenant. They are outside the tenant quota,
 /// so `overlay_bytes` does not see them and this is the only place the chats directory is counted.
-fn chat_stats(st: &AppState) -> Value {
-    let (conversations, bytes) = st.store.tenants().iter().map(|t| st.chats.usage(t)).fold((0, 0), |(n, b), (cn, cb)| (n + cn, b + cb));
-    json!({
+fn chat_stats(st: &AppState) -> std::io::Result<Value> {
+    let (mut conversations, mut bytes) = (0usize, 0u64);
+    for t in st.store.tenants() {
+        let (n, b) = st.chats.usage(&t)?;
+        conversations += n;
+        bytes += b;
+    }
+    Ok(json!({
         "conversations": conversations,
         "bytes": bytes,
         "max_per_tenant": st.chats.cap(),
         "window_turns": st.chats.window(),
-    })
+    }))
 }
 
-pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
+pub async fn stats(AxState(st): AxState<State>) -> Response {
     let tenants = st.store.tenants();
     let overlay_bytes: u64 = tenants.iter().map(|t| t.overlay_stats().1).sum();
     let subscribers: usize = tenants.iter().map(|t| t.events.receiver_count()).sum();
+    // A gauge that reads zero because a directory could not be listed is a wrong number, not a
+    // missing one, and nothing downstream can tell the two apart.
+    let chats = match chat_stats(&st) {
+        Ok(chats) => chats,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chats: {e}")),
+    };
     Json(json!({
         "rss_kb": rss_kb(),
         "uptime_s": st.started.elapsed().as_secs(),
@@ -97,7 +108,7 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "cache": st.engine.stats(),
         "sass": st.engine.sass_stats(),
         "compiles": st.engine.compile_stats(),
-        "chats": chat_stats(&st),
+        "chats": chats,
         "screenshots": st.shots.stats(),
         "modules": module_stats(&st),
         "ai": st.api_key.is_some(),
@@ -107,6 +118,7 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "port": st.port,
         "astro": include_str!("../../assets/astro.version").trim(),
     }))
+    .into_response()
 }
 
 fn snapshot(st: &AppState) -> Snapshot {
@@ -230,7 +242,11 @@ pub async fn create_tenant(AxState(st): AxState<State>, Json(req): Json<CreateRe
 
 pub async fn delete_tenant(AxState(st): AxState<State>, Path(id): Path<String>) -> Response {
     st.chats.forget(&id);
-    if st.store.remove_tenant(&id) { StatusCode::NO_CONTENT.into_response() } else { err(StatusCode::NOT_FOUND, "unknown tenant") }
+    match st.store.remove_tenant(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "unknown tenant"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("tenant '{id}' was dropped but its data directory was not: {e}")),
+    }
 }
 
 pub async fn files(AxState(st): AxState<State>, Path(id): Path<String>) -> Response {
@@ -249,8 +265,9 @@ pub async fn read_file(AxState(st): AxState<State>, Path((id, path)): Path<(Stri
     };
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
     match t.read(&path) {
-        Some(bytes) => ([(header::CONTENT_TYPE, mime(&path)), (header::CACHE_CONTROL, "no-store")], bytes.to_vec()).into_response(),
-        None => err(StatusCode::NOT_FOUND, "no such file"),
+        Ok(Some(bytes)) => ([(header::CONTENT_TYPE, mime(&path)), (header::CACHE_CONTROL, "no-store")], bytes.to_vec()).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "no such file"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{path}: {e}")),
     }
 }
 
@@ -292,7 +309,13 @@ pub async fn delete_file(AxState(st): AxState<State>, Path((id, path)): Path<(St
 
 pub fn sse(t: &Tenant) -> Sse<impl Stream<Item = Result<Event, Infallible>> + use<>> {
     let hello = tokio_stream::once(Ok(Event::default().event("hello").data(t.version().to_string())));
-    let updates = BroadcastStream::new(t.events.subscribe()).filter_map(|r| r.ok()).map(|s| Ok(Event::default().data(s)));
+    // A subscriber that fell behind the 64-slot channel has missed edits. Dropped, the last one it
+    // missed is a reload that never happens and a preview that quietly stops following the tenant.
+    // An update with no path is what a whole-tree change already looks like to both clients, and it
+    // reloads rather than swapping CSS, which is the only safe thing to do about writes nobody saw.
+    let missed = r#"{"type":"update","path":"","kind":"module","version":0}"#;
+    let updates =
+        BroadcastStream::new(t.events.subscribe()).map(|r| r.unwrap_or_else(|_| missed.to_string())).map(|s| Ok(Event::default().data(s)));
     Sse::new(hello.chain(updates)).keep_alive(KeepAlive::default())
 }
 
@@ -339,6 +362,8 @@ pub async fn check(AxState(st): AxState<State>, Path(id): Path<String>) -> Respo
         Err(r) => return r,
     };
     let st2 = st.clone();
-    let out = tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await.unwrap_or_else(|e| json!({ "error": e.to_string() }));
-    Json(out).into_response()
+    match tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }

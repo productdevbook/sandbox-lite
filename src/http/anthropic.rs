@@ -88,7 +88,21 @@ impl Reply {
             "content_block_stop" => {
                 let slot = self.slot(v)?;
                 if slot.value["type"] == "tool_use" {
-                    let input = serde_json::from_str(&slot.json).unwrap_or_else(|_| json!({}));
+                    // A tool whose input schema is empty streams no partial_json at all; a tool call
+                    // whose arguments arrived broken must not run as if it had been called with none.
+                    let input = if slot.json.is_empty() {
+                        json!({})
+                    } else {
+                        match serde_json::from_str(&slot.json) {
+                            Ok(input) => input,
+                            Err(e) => {
+                                let message = format!("the model's tool arguments did not parse: {e}");
+                                self.error = Some(message.clone());
+                                return Some(Emit::Error(message));
+                            }
+                        }
+                    };
+                    let slot = self.slot(v)?;
                     if let Some(block) = slot.value.as_object_mut() {
                         block.insert("input".into(), input);
                     }
