@@ -1,0 +1,37 @@
+---
+interface Props {
+  title: string;
+  text: string;
+  href?: string;
+  price?: string;
+}
+
+const { title, text, href, price } = Astro.props;
+---
+<article class="card">
+  <h3>{title}</h3>
+  <p>{text}</p>
+  <div class="foot">
+    {price && <strong>{price}</strong>}
+    {href && <a href={href}>Details →</a>}
+    <button type="button" data-like>♡ <span>0</span></button>
+  </div>
+</article>
+
+<style>
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; display: flex; flex-direction: column; gap: 8px; }
+  h3 { margin: 0; font-size: 18px; }
+  p { margin: 0; color: var(--muted); flex: 1; }
+  .foot { display: flex; align-items: center; gap: 12px; }
+  .foot a { margin-left: auto; text-decoration: none; font-weight: 600; }
+  button { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>("[data-like]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const n = btn.querySelector("span")!;
+      n.textContent = String(Number(n.textContent) + 1);
+    });
+  });
+</script>

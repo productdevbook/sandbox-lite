@@ -1,0 +1,30 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+}
+
+const { title } = Astro.props;
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body class="min-h-screen bg-slate-50 text-slate-900 antialiased">
+    <header class="border-b border-slate-200 bg-white">
+      <nav class="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
+        <a href="/" class="text-lg font-bold tracking-tight">Northwind Bakery</a>
+        <div class="flex gap-6 text-sm font-medium text-slate-600">
+          <a href="/" class="hover:text-brand">Home</a>
+          <a href="/menu" class="hover:text-brand">Menu</a>
+        </div>
+      </nav>
+    </header>
+    <main class="mx-auto max-w-5xl px-6 py-12">
+      <slot />
+    </main>
+  </body>
+</html>

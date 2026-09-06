@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandbox-lite</title>
+<style>
+:root{--bg:#0f1117;--panel:#161922;--line:#262b38;--text:#d6dae3;--muted:#7d8597;--accent:#6ea8fe;--ok:#4cc38a;--warn:#f0b35a;--err:#ef6b73}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:13px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:grid;grid-template-rows:44px 1fr;grid-template-columns:minmax(320px,38%) 1fr;grid-template-areas:"top top" "left right"}
+header{grid-area:top;display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+header .logo{font-weight:700;letter-spacing:.2px}header .logo span{color:var(--accent)}
+select,input,button,textarea{font:inherit;color:inherit;background:#0b0d13;border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+button{cursor:pointer;background:#1d2230}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#08101f;border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.stat{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.stat b{color:var(--ok)}
+#left{grid-area:left;display:grid;grid-template-rows:auto minmax(120px,32%) 1fr;border-right:1px solid var(--line);min-height:0}
+#tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line);background:var(--panel)}
+#tabs button{border-radius:6px 6px 0 0;border-bottom:none;background:transparent}
+#tabs button.active{background:var(--bg);border-color:var(--line)}
+#files{overflow:auto;padding:6px 0;border-bottom:1px solid var(--line)}
+#files div{padding:2px 10px;cursor:pointer;white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
+#files div:hover{background:#1b2030;color:var(--text)}#files div.active{background:#22293a;color:var(--text)}
+#files div.modified::after{content:" ●";color:var(--warn)}
+#editorWrap{display:flex;flex-direction:column;min-height:0}
+#editorWrap .bar{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--line);color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:12px}
+#editor{flex:1;resize:none;border:none;border-radius:0;background:#0b0d13;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;tab-size:2;white-space:pre;overflow:auto;outline:none}
+#chat{display:none;flex-direction:column;min-height:0;grid-row:2/4}
+#chat.visible{display:flex}
+#msgs{flex:1;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:92%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;line-height:1.45}
+.msg.user{align-self:flex-end;background:#243352}.msg.ai{align-self:flex-start;background:#1d2230}.msg.sys{align-self:center;color:var(--muted);font-size:12px}
+.msg .chips{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px}.msg .chips span{background:#0b0d13;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:11px}
+#chatForm{display:flex;gap:6px;padding:8px;border-top:1px solid var(--line)}
+#chatForm textarea{flex:1;resize:none;height:60px}
+#right{grid-area:right;display:grid;grid-template-rows:auto 1fr;min-height:0}
+#right .bar{display:flex;gap:6px;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--panel);align-items:center}
+#right .bar input{flex:1;font-family:ui-monospace,monospace}
+iframe{width:100%;height:100%;border:none;background:#fff}
+#empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);flex-direction:column;gap:10px;text-align:center;padding:20px}
+.hidden{display:none!important}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:16px;min-width:320px}
+dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">sandbox<span>-lite</span></div>
+  <select id="tenant"></select>
+  <button id="newTenant">+ tenant</button>
+  <button id="delTenant" title="delete this tenant">✕</button>
+  <div class="stat" id="stat">…</div>
+</header>
+<section id="left">
+  <div id="tabs"><button class="active" data-tab="files">Files</button><button data-tab="chat">Chat</button></div>
+  <div id="files"></div>
+  <div id="editorWrap">
+    <div class="bar"><span id="fileName">no file</span><span id="saveState" style="margin-left:auto"></span></div>
+    <textarea id="editor" spellcheck="false" placeholder="Pick a file on the left. Edits are saved as you type; the preview reloads itself."></textarea>
+  </div>
+  <div id="chat">
+    <div id="msgs"><div class="msg sys" id="chatHint">Ask for a change in plain language. The assistant reads and writes files in this tenant; the preview follows.</div></div>
+    <form id="chatForm"><textarea id="chatInput" placeholder="e.g. make the hero headline mention our summer sale and turn the buttons green"></textarea><button class="primary" id="chatSend">Send</button></form>
+  </div>
+</section>
+<section id="right">
+  <div class="bar"><span style="color:var(--muted)">preview</span><input id="path" value="/"><button id="go">Go</button><button id="reload">↻</button><button id="openTab">open ↗</button></div>
+  <div id="frameWrap"><div id="empty"><div>No tenant yet.</div><button class="primary" id="emptyNew">Create one from a base project</button></div><iframe id="frame" class="hidden"></iframe></div>
+</section>
+<dialog id="dlg"><form method="dialog"><b>New tenant</b><label>id <input id="dlgId" placeholder="acme" pattern="[a-z0-9][a-z0-9-]*" required></label><label>base <select id="dlgBase"></select></label><div style="display:flex;gap:6px;justify-content:flex-end"><button value="cancel">Cancel</button><button value="ok" class="primary">Create</button></div></form></dialog>
+<script>
+const $ = (s) => document.querySelector(s);
+const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chat: [], saving: null };
+const BINARY = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|pdf|wasm|zip)$/i;
+let apiToken = "";
+try { apiToken = localStorage.getItem("sl_api_token") || ""; } catch {}
+const authHeaders = () => (apiToken ? { authorization: `Bearer ${apiToken}` } : {});
+const withToken = (url) => (apiToken ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(apiToken) : url);
+const api = async (method, url, body, raw) => {
+  const r = await fetch(url, { method, headers: { ...authHeaders(), ...(body !== undefined && !raw ? { "content-type": "application/json" } : {}) }, body: body === undefined ? undefined : raw ? body : JSON.stringify(body) });
+  if (r.status === 401) {
+    const t = prompt("This daemon requires an API token (--api-token):", apiToken);
+    if (t) { apiToken = t; try { localStorage.setItem("sl_api_token", t); } catch {} return api(method, url, body, raw); }
+  }
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).error || m; } catch {} throw new Error(m); }
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? r.json() : r.text();
+};
+const previewUrl = (id, path = "/") => {
+  const t = state.tenants.find((x) => x.id === id);
+  const token = t && t.preview_token ? `?sl_token=${t.preview_token}` : "";
+  return `http://${id}.${state.stats.domain}:${state.stats.port}${path}${token}`;
+};
+const fmtKB = (kb) => kb == null ? "?" : kb > 10240 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB";
+
+async function refreshStats() {
+  try { state.stats = await api("GET", "/api/stats"); } catch (e) { $("#stat").textContent = "daemon unreachable"; return; }
+  const s = state.stats;
+  $("#stat").innerHTML = `daemon RSS <b>${fmtKB(s.rss_kb)}</b> · ${s.tenants} tenants · cache ${(s.cache.bytes / 1024).toFixed(0)} kB / ${s.cache.entries} · astro ${s.astro} · chat ${s.ai ? "on" : "off"}`;
+  $("#chatSend").disabled = !s.ai;
+  if (!s.ai) $("#chatHint").textContent = "Chat is off: start the daemon with ANTHROPIC_API_KEY set to enable the built-in assistant. The file editor works without it.";
+}
+
+async function loadTenants(selectId) {
+  state.tenants = await api("GET", "/api/tenants");
+  const sel = $("#tenant");
+  sel.innerHTML = state.tenants.map((t) => `<option value="${t.id}">${t.id} (${t.base})</option>`).join("");
+  const id = selectId || state.tenant || (state.tenants[0] && state.tenants[0].id);
+  if (id && state.tenants.some((t) => t.id === id)) { sel.value = id; await selectTenant(id); }
+  else { state.tenant = null; $("#frame").classList.add("hidden"); $("#empty").classList.remove("hidden"); $("#files").innerHTML = ""; }
+}
+
+async function selectTenant(id) {
+  if (state.tenant === id) return;
+  state.tenant = id; state.file = null; state.chat = []; $("#msgs").querySelectorAll(".msg:not(.sys)").forEach((m) => m.remove());
+  $("#editor").value = ""; $("#fileName").textContent = "no file";
+  $("#empty").classList.add("hidden"); $("#frame").classList.remove("hidden");
+  $("#frame").src = previewUrl(id, $("#path").value || "/");
+  if (state.es) state.es.close();
+  state.es = new EventSource(withToken(`/api/t/${id}/events`));
+  state.es.onmessage = async (e) => {
+    const d = JSON.parse(e.data);
+    await loadFiles();
+    if (state.file && d.path === state.file && !state.dirty && d.type === "update") openFile(state.file, true);
+  };
+  await loadFiles();
+}
+
+async function loadFiles() {
+  if (!state.tenant) return;
+  const { files } = await api("GET", `/api/t/${state.tenant}/files`);
+  $("#files").innerHTML = files.map((f) => `<div data-path="${f.path}" class="${f.modified ? "modified" : ""}${f.path === state.file ? " active" : ""}" title="${f.size} bytes">${f.path}</div>`).join("");
+}
+
+async function openFile(path, silent) {
+  if (state.dirty && !silent && !confirm("Discard unsaved edits?")) return;
+  state.file = path; state.dirty = false;
+  $("#files").querySelectorAll("div").forEach((d) => d.classList.toggle("active", d.dataset.path === path));
+  $("#fileName").textContent = path;
+  if (BINARY.test(path)) { $("#editor").value = "(binary file)"; $("#editor").disabled = true; return; }
+  $("#editor").disabled = false;
+  $("#editor").value = await api("GET", `/api/t/${state.tenant}/file/${path}`);
+  $("#saveState").textContent = "";
+}
+
+let saveTimer = null;
+async function save() {
+  if (!state.file || !state.tenant) return;
+  const path = state.file, body = $("#editor").value;
+  $("#saveState").textContent = "saving…";
+  try { await api("PUT", `/api/t/${state.tenant}/file/${path}`, body, true); state.dirty = false; $("#saveState").textContent = "saved"; }
+  catch (e) { $("#saveState").textContent = "save failed: " + e.message; }
+}
+$("#editor").addEventListener("input", () => { state.dirty = true; $("#saveState").textContent = "…"; clearTimeout(saveTimer); saveTimer = setTimeout(save, 350); });
+$("#editor").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); clearTimeout(saveTimer); save(); }
+  if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("  ", s, t.selectionEnd, "end"); t.dispatchEvent(new Event("input")); }
+});
+$("#files").addEventListener("click", (e) => { const d = e.target.closest("[data-path]"); if (d) openFile(d.dataset.path); });
+$("#tenant").addEventListener("change", (e) => selectTenant(e.target.value));
+$("#tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  $("#tabs").querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+  const chat = b.dataset.tab === "chat";
+  $("#chat").classList.toggle("visible", chat); $("#files").classList.toggle("hidden", chat); $("#editorWrap").classList.toggle("hidden", chat);
+});
+const openDialog = async () => {
+  const bases = await api("GET", "/api/bases");
+  $("#dlgBase").innerHTML = bases.map((b) => `<option value="${b.name}">${b.name} (${b.files} files)</option>`).join("");
+  $("#dlgId").value = ""; $("#dlg").showModal();
+};
+$("#newTenant").onclick = openDialog; $("#emptyNew").onclick = openDialog;
+$("#dlg").addEventListener("close", async () => {
+  if ($("#dlg").returnValue !== "ok") return;
+  try { const t = await api("POST", "/api/tenants", { id: $("#dlgId").value.trim(), base: $("#dlgBase").value }); await loadTenants(t.id); refreshStats(); }
+  catch (e) { alert(e.message); }
+});
+$("#delTenant").onclick = async () => {
+  if (!state.tenant || !confirm(`Delete tenant '${state.tenant}' and all its edits?`)) return;
+  await api("DELETE", `/api/tenants/${state.tenant}`); const gone = state.tenant; state.tenant = null; await loadTenants(); refreshStats();
+  if (state.tenant === gone) state.tenant = null;
+};
+$("#go").onclick = () => { if (state.tenant) $("#frame").src = previewUrl(state.tenant, $("#path").value || "/"); };
+$("#path").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#go").click(); });
+$("#reload").onclick = () => { try { $("#frame").contentWindow.location.reload(); } catch { $("#go").click(); } };
+$("#openTab").onclick = () => { if (state.tenant) window.open(previewUrl(state.tenant, $("#path").value || "/"), "_blank"); };
+$("#frame").addEventListener("load", () => { try { $("#path").value = new URL($("#frame").contentWindow.location.href).pathname; } catch {} });
+
+function addMsg(role, text, changes) {
+  const div = document.createElement("div"); div.className = "msg " + role; div.textContent = text;
+  if (changes && changes.length) { const c = document.createElement("div"); c.className = "chips"; c.innerHTML = changes.map((p) => `<span>${p}</span>`).join(""); div.appendChild(c); }
+  $("#msgs").appendChild(div); $("#msgs").scrollTop = 1e9; return div;
+}
+$("#chatForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("#chatInput").value.trim(); if (!text || !state.tenant) return;
+  $("#chatInput").value = ""; addMsg("user", text); state.chat.push({ role: "user", content: text });
+  const pending = addMsg("sys", "working… (files change live in the preview)"); $("#chatSend").disabled = true;
+  try {
+    const r = await api("POST", `/api/t/${state.tenant}/chat`, { messages: state.chat });
+    pending.remove(); addMsg("ai", r.text || "(no reply)", r.changes); state.chat.push({ role: "assistant", content: r.text || "(done)" });
+  } catch (err) { pending.textContent = "failed: " + err.message; }
+  $("#chatSend").disabled = false;
+});
+$("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#chatForm").requestSubmit(); } });
+
+(async () => { await refreshStats(); await loadTenants(); setInterval(refreshStats, 5000); })();
+</script>
+</body>
+</html>

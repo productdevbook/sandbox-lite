@@ -1,0 +1,25 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import { getCollection } from "astro:content";
+
+const posts = (await getCollection("posts")).sort((a, b) => new Date(b.data.date).getTime() - new Date(a.data.date).getTime());
+---
+<Layout title="Journal">
+  <h1>Journal</h1>
+  <ul class="posts">
+    {posts.map((p) => (
+      <li>
+        <a href={`/blog/${p.id}`}>{p.data.title}</a>
+        <span>{new Date(p.data.date).toLocaleDateString("en", { dateStyle: "medium" })}</span>
+        <p>{p.data.description}</p>
+      </li>
+    ))}
+  </ul>
+</Layout>
+
+<style>
+  .posts { list-style: none; padding: 0; display: grid; gap: 18px; }
+  .posts a { font-size: 20px; font-weight: 700; text-decoration: none; }
+  .posts span { margin-left: 10px; color: var(--muted); font-size: 14px; }
+  .posts p { margin: 4px 0 0; color: var(--muted); }
+</style>

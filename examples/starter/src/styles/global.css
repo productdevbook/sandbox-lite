@@ -1,0 +1,13 @@
+@import "./tokens.css";
+
+* { box-sizing: border-box; }
+html { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg); }
+body { margin: 0; line-height: 1.55; }
+a { color: var(--brand); }
+.container { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+.button { display: inline-block; padding: 10px 18px; border-radius: 999px; background: var(--brand); color: var(--brand-ink); text-decoration: none; font-weight: 600; }
+.button.secondary { background: transparent; color: var(--brand); border: 1px solid var(--brand); }
+.grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.prose :is(h1, h2, h3) { line-height: 1.2; }
+.prose pre { background: #1b1b1f; color: #f5f5f5; padding: 14px; border-radius: 10px; overflow: auto; }
+.prose code { font-family: ui-monospace, Menlo, monospace; font-size: 0.95em; }

@@ -1,0 +1,15 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+const team = [
+  { name: "Mara", role: "Design lead" },
+  { name: "Deniz", role: "Engineering" },
+];
+---
+<Layout title="About" description="Who we are">
+  <h1>About the studio</h1>
+  <p>Small on purpose. We take on a handful of projects a year and see each one through to launch.</p>
+  <ul>
+    {team.map((m) => <li><strong>{m.name}</strong> — {m.role}</li>)}
+  </ul>
+</Layout>

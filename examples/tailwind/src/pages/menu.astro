@@ -1,0 +1,21 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+const items = [
+  ["Country sourdough", "€5.50"],
+  ["Seeded rye", "€6.00"],
+  ["Cardamom bun", "€2.80"],
+  ["Cinnamon knot", "€2.80"],
+];
+---
+<Layout title="Menu · Northwind Bakery">
+  <h1 class="text-4xl font-extrabold tracking-tight">Menu</h1>
+  <ul class="mt-8 divide-y divide-slate-200 rounded-2xl border border-slate-200 bg-white">
+    {items.map(([name, price]) => (
+      <li class="flex items-center justify-between px-6 py-4">
+        <span class="font-medium">{name}</span>
+        <span class="tabular-nums text-slate-500">{price}</span>
+      </li>
+    ))}
+  </ul>
+</Layout>

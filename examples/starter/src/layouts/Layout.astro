@@ -1,0 +1,33 @@
+---
+import "../styles/global.css";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const { title, description = "A small studio site rendered by sandbox-lite." } = Astro.props;
+const siteName = import.meta.env.PUBLIC_SITE_NAME ?? "Lumen";
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="description" content={description} />
+    <title>{title} · {siteName}</title>
+  </head>
+  <body>
+    <Header siteName={siteName} />
+    <main class="container">
+      <slot />
+    </main>
+    <Footer />
+  </body>
+</html>
+
+<style is:global>
+  main { padding: 40px 20px 64px; min-height: 60vh; }
+</style>

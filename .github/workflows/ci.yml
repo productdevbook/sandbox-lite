@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - run: ./target/release/sandbox-lite check examples/starter examples/tailwind examples/react
+      - name: smoke test the daemon
+        run: |
+          ./target/release/sandbox-lite --listen 127.0.0.1:4399 --bases examples --no-persist &
+          for i in $(seq 50); do curl -sf http://127.0.0.1:4399/health >/dev/null && break; sleep 0.2; done
+          curl -sf -X POST -H 'content-type: application/json' -d '{"id":"ci","base":"starter"}' http://127.0.0.1:4399/api/tenants
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/pages/index.astro?v=1' | grep -q createComponent
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/routes.json' | grep -q '"/blog/\[slug\]"'
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/' | grep -q shell.js
+      - run: bench/mem.sh 100 4398

@@ -1,0 +1,33 @@
+---
+interface Props {
+  siteName: string;
+}
+
+const { siteName } = Astro.props;
+const links = [
+  { href: "/", label: "Home" },
+  { href: "/about", label: "About" },
+  { href: "/blog", label: "Blog" },
+  { href: "/docs", label: "Docs" },
+];
+const current = Astro.url.pathname;
+---
+<header>
+  <div class="container row">
+    <a class="brand" href="/">{siteName}</a>
+    <nav>
+      {links.map((l) => (
+        <a href={l.href} class:list={{ active: current === l.href || (l.href !== "/" && current.startsWith(l.href)) }}>{l.label}</a>
+      ))}
+    </nav>
+  </div>
+</header>
+
+<style>
+  header { border-bottom: 1px solid var(--line); background: var(--card); }
+  .row { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { font-weight: 800; text-decoration: none; color: var(--ink); letter-spacing: -0.01em; }
+  nav { display: flex; gap: 18px; }
+  nav a { text-decoration: none; color: var(--muted); font-weight: 500; }
+  nav a.active { color: var(--brand); }
+</style>
