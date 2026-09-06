@@ -39,7 +39,8 @@ So with two daemons, A and B, sharing `--data-dir`:
 | `GET /api/t/acme/files` on B | B's view: the files it knows about, at B's version. |
 | A tenant created on A, then a request for it on B | B has no such tenant in memory, so it restores one from `<data-dir>/acme` and serves it (`Store::tenant`). |
 | A writes again after B has restored | B does not see it. The restore happens once, on the miss. |
-| `DELETE /api/tenants/acme` on A | The directory goes; B keeps serving the tenant it already holds in memory. |
+| `DELETE /api/tenants/acme` on A | The directory goes, whether or not A had the tenant loaded — a node deletes what the data directory holds, not only what its map does. B keeps serving the tenant it already holds in memory; a B that had not loaded it has nothing left to restore. |
+| Creating `acme` on B while A's `acme` is on disk | Refused. The directory is what says the tenant exists, so B says so too, even when it cannot build a tenant from it because A's base is not loaded here. |
 | `POST /api/bases/theme/reload` on A | Only A re-reads the base. B keeps the copy it loaded. |
 | `POST /api/t/acme/chat` on A, then `GET /api/t/acme/chats` on B | B lists it: conversations are read from the shared data directory on every call, not cached. |
 | `POST /api/tenants/acme/import` on A | A's overlay and the data directory change; B's overlay does not, exactly as for a single write. |
@@ -111,6 +112,11 @@ theme. A tenant's base is in `<data-dir>/<id>/tenant.json`, and a node skips
 any tenant whose base it has not loaded — at startup with a message, and on a
 lookup miss silently — so the tenants of another node's bases are simply not
 served, which is what you want here.
+
+Tenant ids are still shared, because `<data-dir>/<id>` is one directory
+whichever node created it: creating an id that another node's base already uses
+is refused rather than written over, and deleting one removes the directory
+from under whichever node holds it.
 
 This is how to scale a catalogue of themes past what one process should hold in
 memory: two daemons, disjoint base sets, one data directory, and the routing

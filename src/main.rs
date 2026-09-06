@@ -140,16 +140,21 @@ async fn main() {
     let args = parse_args();
     let store =
         store::Store::new(args.data_dir.clone(), args.tenant_quota_mb.saturating_mul(1 << 20)).with_bases_dir(args.bases_dir.clone());
-    let mut bases = args.bases.clone();
-    if let Some(dir) = &args.bases_dir {
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                for e in entries.flatten() {
-                    if e.path().is_dir() {
-                        bases.push((e.file_name().to_string_lossy().into_owned(), e.path()));
-                    }
-                }
+    // `--base NAME=PATH` and the `--bases` scan are contained by the one rule `POST /api/bases`
+    // applies, so a path outside `--bases` cannot become a base whichever way it arrives.
+    let mut bases = Vec::new();
+    for (name, path) in &args.bases {
+        match store.base_root(path) {
+            Ok(root) => bases.push((name.clone(), root)),
+            Err(e) => {
+                eprintln!("cannot add base {name}: {e}");
+                std::process::exit(1);
             }
+        }
+    }
+    if let Some(dir) = &args.bases_dir {
+        match store.bases_in_dir() {
+            Ok(found) => bases.extend(found),
             Err(e) => {
                 eprintln!("cannot read bases dir {}: {e}", dir.display());
                 std::process::exit(1);

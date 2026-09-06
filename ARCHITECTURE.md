@@ -38,8 +38,12 @@ A **base** is a project directory read at startup (`Base::load`): every regular
 file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`, `.netlify`,
 `.output`. Files up to 256 KiB are held in memory (`FileData::Mem`); larger ones
 stay on disk and are re-read on each access (`FileData::Disk`). Bases come from
-every sub-directory of `--bases` (default `./examples` when it exists), from
-each `--base NAME=PATH`, and from `POST /api/bases` at run time. `Base::load`
+every sub-directory of `--bases` (default `./examples` when it exists) that is
+a directory in its own right — `Store::bases_in_dir` reads the entry's own
+type, so a symbolic link is skipped rather than followed — from each
+`--base NAME=PATH`, and from `POST /api/bases` at run time. All three put the
+root through `Store::base_root` first, so with `--bases` set a root outside it
+is refused whichever way it arrives. `Base::load`
 also records a `stamp`: a hash of the name, size and mtime of every file it
 took, in path order, which is what the watcher compares.
 
@@ -80,6 +84,15 @@ at startup with a fresh version and skips any whose base is not loaded.
 daemon created under a shared `--data-dir` is restored the first time this one
 is asked for it; a tenant already in memory is never re-read, which is the
 limit `docs/multi-node.md` sets out. `--no-persist` keeps everything in memory.
+
+Because that fallback makes the data directory as much a source of tenants as
+the map, the two operations that decide whether a tenant exists consult both:
+`Store::remove_tenant` drops the map entry and removes `<data-dir>/<id>`,
+answering "no such tenant" only when neither holds it, and `create_tenant`
+refuses an id whose directory is already there even when it cannot build a
+tenant from it — its base may not be loaded on this node. `Store::tenants` is
+the exception, and stays a list of what this daemon has loaded: it answers
+`/api/tenants`, `/api/stats` and `/metrics`, none of which act on a tenant.
 
 ### Reloading a base
 
