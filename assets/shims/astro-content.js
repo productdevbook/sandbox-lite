@@ -45,6 +45,10 @@ export async function getLiveCollection() { return { entries: [] }; }
 export async function getLiveEntry() { return { entry: undefined }; }
 
 export async function render(entry) {
+  if (!entry?.rendered && entry?.filePath?.endsWith(".mdx")) {
+    const mod = await import(`/__sl/m/${entry.filePath}?v=${globalThis.__sl?.version ?? ""}`);
+    return { Content: mod.Content, headings: mod.getHeadings(), remarkPluginFrontmatter: mod.frontmatter };
+  }
   const html = entry?.rendered?.html ?? "";
   const Content = createComponent(() => renderTemplate`${unescapeHTML(html)}`, `${entry?.collection}/${entry?.id}:Content`);
   return { Content, headings: entry?.rendered?.metadata?.headings ?? [], remarkPluginFrontmatter: entry?.data ?? {} };

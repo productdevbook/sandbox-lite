@@ -82,8 +82,8 @@ at startup with a fresh version and skips any whose base is not loaded.
    static, 1 for `[param]`, 2 for `[...rest]` — compared lexicographically,
    so static routes come before dynamic ones and a route sorts before any
    longer route it is a prefix of; equal keys are ordered by path. The kind is
-   `astro`, `md`, `mdx` or `endpoint`; the shell renders the first two and
-   shows an "unsupported route" page for the others.
+   `astro`, `md`, `mdx` or `endpoint`; the shell renders the first three and
+   shows an "unsupported route" page for endpoints.
 4. **Page module.** The shell imports `/__sl/astro.js` and
    `/__sl/m/src/pages/blog/[slug].astro?v=<version>`. `preview::module`
    cleans the path, reads the kind from the query, and on the blocking pool
@@ -107,7 +107,9 @@ at startup with a fresh version and skips any whose base is not loaded.
    `astro:*`) to daemon URLs. `/__sl/renderers.json` lists framework renderers
    (`resolve::renderers`: `@astrojs/react` and `@astrojs/preact` from
    `package.json`, or `sandbox-lite.json` `renderers`); each server renderer
-   is imported and registered, each client entrypoint recorded.
+   is imported and registered, each client entrypoint recorded. Astro's own
+   `astro:jsx` renderer (`/__sl/shim/astro-jsx-runtime.js`, the JSX runtime
+   plus `@astrojs/mdx/server.js`) is registered last; it renders MDX content.
    `container.renderToResponse(mod.default, { request, params, props })`
    produces the HTML.
 8. **Document.** A `3xx` with `Location` becomes `location.replace`.
@@ -141,6 +143,7 @@ What `compile` does per kind and extension:
 | `.css` | a module that registers the text in `globalThis.__sl_css`, with relative `url()` and `@import` targets rewritten to `/__sl/raw/…` (`src/transform/css.rs`) |
 | `.scss` `.sass` | grass over the tenant's file tree (`src/transform/scss.rs`), then as `.css` |
 | `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`) |
+| `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
 | images | `export default { src: "/__sl/raw/…", width, height, format, fsPath }` |
 | `Style(i)` / `Script(i)` | builds the `.astro` module (cached) and returns its i-th CSS block or script as its own module |
@@ -206,7 +209,7 @@ For a specifier in `importer`, `Resolver::resolve` returns the first of:
    `data:`, `blob:`, `/__sl/`);
 2. `/__sl/shim/astro-<name>.js` for `astro:<name>`, and a shim for
    `astro/components`, `astro/zod`, `astro/config`, `astro/loaders`,
-   `astro/types`;
+   `astro/types`, `astro/jsx-runtime`;
 3. for `./`, `../`, `/`-rooted and `tsconfig` `paths` specifiers: the first
    existing file among the candidate plus `""`, `.ts`, `.tsx`, `.js`, `.jsx`,
    `.mjs`, `.mts`, `.json`, `.astro`, `.md`, `.mdx`, then `/index.*` — as
@@ -251,19 +254,21 @@ The transform cache never sees the version; it is content-addressed.
 ## Content collections and Markdown (`src/transform/content.rs`)
 
 `/__sl/content/<name>` reads `src/content/<name>/` and returns entries:
-`.md`/`.mdx`/`.markdown` with parsed YAML frontmatter as `data`, the body,
-the rendered HTML and headings; `.json` arrays as one entry per item, other
-JSON as one entry; `.yaml`/`.yml` as one entry. The `astro:content` shim
-fetches that JSON,
-revives ISO dates, and implements `getCollection`, `getEntry` and `render`
-on top of it. `content.config.ts` is not executed.
+`.md`/`.markdown` with parsed YAML frontmatter as `data`, the body, the
+rendered HTML and headings; `.mdx` with `data` and the body only; `.json`
+arrays as one entry per item, other JSON as one entry; `.yaml`/`.yml` as one
+entry. The `astro:content` shim fetches that JSON, revives ISO dates, and
+implements `getCollection`, `getEntry` and `render` on top of it; for an
+`.mdx` entry `render` imports the compiled module at `/__sl/m/<filePath>` and
+returns its `Content`, `getHeadings()` and `frontmatter`. `content.config.ts`
+is not executed.
 
 ## `check` (`src/check.rs`)
 
 `sandbox-lite check DIR…` loads each directory as a base, creates an
 in-memory tenant on it, and calls `Engine::build(…, Kind::Module)` on every
 source file under `src/` (`.astro`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`,
-`.mts`, `.md`). It prints diagnostics and a census — islands, glob calls,
+`.mts`, `.md`, `.mdx`). It prints diagnostics and a census — islands, glob calls,
 Sass, MDX, endpoints, `@astrojs/*` integrations, bare imports — and exits 1 on
 compile errors, 2 when a directory cannot be loaded. `/api/t/{id}/check` and
 `/__sl/check` run the same loop (`api::check_tenant`) on a live tenant; the
@@ -295,9 +300,11 @@ src/transform/css.rs   CSS-as-module, relative URL rewriting
 src/transform/scss.rs  grass over the tenant tree, fingerprint
 src/transform/glob.rs  import.meta.glob detection and expansion
 src/transform/markdown.rs, content.rs   Markdown pages and collections
+src/transform/mdx.rs   MDX pages and entries through satteri-mdxjs
 src/check.rs           the check subcommand
 assets/shell.html, shell.js, live.js    the browser side of a render
 assets/editor.html     the editor
 assets/astro.js        Astro runtime + container, built by scripts/build-runtime.sh
+assets/astro-jsx.js    Astro's JSX runtime + astro:jsx renderer, built by the same script
 assets/shims/          browser stand-ins for astro:* modules and the React/Preact renderers
 ```

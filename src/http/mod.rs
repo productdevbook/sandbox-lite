@@ -239,7 +239,7 @@ pub fn mime(path: &str) -> &'static str {
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
-        "txt" | "md" | "astro" | "ts" | "tsx" | "jsx" | "mts" | "env" | "yaml" | "yml" | "toml" => "text/plain; charset=utf-8",
+        "txt" | "md" | "mdx" | "astro" | "ts" | "tsx" | "jsx" | "mts" | "env" | "yaml" | "yml" | "toml" => "text/plain; charset=utf-8",
         "xml" => "application/xml",
         "wasm" => "application/wasm",
         "mp4" => "video/mp4",

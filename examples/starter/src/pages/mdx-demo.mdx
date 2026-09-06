@@ -1,0 +1,26 @@
+---
+layout: ../layouts/Markdown.astro
+title: MDX in the preview
+description: Components and expressions inside Markdown
+---
+import Card from "../components/Card.astro";
+
+export const stack = ["satteri-mdxjs compiles the file in the daemon", "Astro's JSX runtime renders it in the browser", "the same container API as every other page"];
+
+This page is `src/pages/mdx-demo.mdx`. Its title, **{frontmatter.title}**, comes from the frontmatter, and its layout is the same `Markdown.astro` the docs page uses.
+
+## Components
+
+Any `.astro` component can be imported and used like a tag:
+
+<Card title="Compiled in Rust" text="The daemon turns MDX into an ES module; nothing runs in Node." />
+
+## Expressions
+
+<ul>
+  {stack.map((item) => <li>{item}</li>)}
+</ul>
+
+## Headings
+
+Every heading on this page has an id, so `getHeadings()` and anchor links agree: [back to Components](#components).

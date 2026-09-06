@@ -58,6 +58,13 @@ pub fn scan_checked(code: &str) -> Option<Vec<SpecRef>> {
     Some(out)
 }
 
+/// Names a module exports, so generated code does not export them twice.
+pub fn exports(code: &str) -> Vec<String> {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, code, SourceType::mjs()).parse();
+    ret.module_record.exported_bindings.keys().map(|k| k.to_string()).collect()
+}
+
 fn push(out: &mut Vec<SpecRef>, code: &str, start: usize, end: usize, name: Option<&str>) {
     let Some(slice) = code.get(start..end) else { return };
     let quoted =

@@ -180,6 +180,7 @@ pub async fn shim(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         "renderer-preact" => include_str!("../../assets/shims/renderer-preact.js").into(),
         "astro-config" => include_str!("../../assets/shims/astro-config.js").into(),
         "astro-loaders" => include_str!("../../assets/shims/astro-loaders.js").into(),
+        "astro-jsx-runtime" => include_str!("../../assets/astro-jsx.js").into(),
         "astro-types" | "astro-prefetch" | "astro-scripts-before-hydration" | "astro-scripts-page" => "export {};\n".into(),
         "viewtransitions-css" => css::to_module("astro:viewtransitions", VIEW_TRANSITIONS_CSS, ""),
         "astro-env-client" | "astro-env-server" => {

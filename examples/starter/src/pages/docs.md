@@ -8,7 +8,7 @@ This page is a plain Markdown file (`src/pages/docs.md`) wrapped in `src/layouts
 
 ## What you can edit
 
-- Pages in `src/pages` — `.astro` and `.md` files become routes
+- Pages in `src/pages` — `.astro`, `.md` and `.mdx` files become routes
 - Components in `src/components`, layouts in `src/layouts`
 - Styles in `src/styles`, shared data in `src/data`
 - Journal posts in `src/content/posts`

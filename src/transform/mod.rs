@@ -4,6 +4,7 @@ pub mod css;
 pub mod glob;
 pub mod js;
 pub mod markdown;
+pub mod mdx;
 pub mod scss;
 
 use std::collections::{HashMap, VecDeque};
@@ -290,6 +291,7 @@ impl Engine {
                     }
                     "json" => Ok(Built::js(format!("export default JSON.parse({});\n", json_str(&text())))),
                     "md" => Ok(Built::scanned(markdown::page_module(path, &text()))),
+                    "mdx" => Ok(Built::scanned(mdx::page_module(path, &text())?)),
                     "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "ico" | "bmp" | "tiff" => {
                         let (w, h) = if ext == "svg" {
                             svg_size(&text())
@@ -376,7 +378,7 @@ pub fn json_str(s: &str) -> String {
 }
 
 pub fn is_source(path: &str) -> bool {
-    matches!(path.rsplit_once('.').map(|(_, e)| e).unwrap_or(""), "astro" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "md")
+    matches!(path.rsplit_once('.').map(|(_, e)| e).unwrap_or(""), "astro" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "md" | "mdx")
         && path.starts_with("src/")
 }
 

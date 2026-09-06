@@ -213,6 +213,7 @@ fn astro_shim(spec: &str) -> Option<&'static str> {
         "astro/config" => Some("astro-config"),
         "astro/loaders" => Some("astro-loaders"),
         "astro/types" => Some("astro-types"),
+        "astro/jsx-runtime" => Some("astro-jsx-runtime"),
         _ => None,
     }
 }
