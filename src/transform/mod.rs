@@ -129,11 +129,12 @@ fn nesting_depth(source: &[u8]) -> usize {
     max
 }
 
-/// Extensions whose module build hands the source to one of those parsers. `md` is out: markdown
-/// never overflowed at any size the cap allows, and long articles are legitimate. `css` and `json`
-/// are out too — they are embedded in a JS module as a string, never parsed.
+/// Extensions whose module build hands the source to one of those parsers — `.vue` and `.svelte`
+/// among them, since `sfc::strip_types` runs oxc over their `<script lang="ts">` blocks. `md` is
+/// out: markdown never overflowed at any size the cap allows, and long articles are legitimate.
+/// `css` and `json` are out too — they are embedded in a JS module as a string, never parsed.
 fn parses_source(ext: &str) -> bool {
-    matches!(ext, "astro" | "ts" | "tsx" | "jsx" | "mts" | "js" | "mjs" | "mdx" | "scss" | "sass")
+    matches!(ext, "astro" | "ts" | "tsx" | "jsx" | "mts" | "js" | "mjs" | "mdx" | "scss" | "sass" | "vue" | "svelte")
 }
 
 thread_local! {
@@ -656,6 +657,7 @@ mod tests {
             ("src/unclosed.ts", format!("const x = {}", "[".repeat(20_000))),
             ("src/quotes.mdx", ">".repeat(20_000)),
             ("src/braces.scss", "a{".repeat(20_000)),
+            ("src/deep.vue", format!("<script lang=\"ts\">const x = {}</script>\n", "[".repeat(20_000))),
         ] {
             let t = tenant_with(path, &source);
             let e = build_err(engine_capped(CAP).build(&t, path, Kind::Module));
