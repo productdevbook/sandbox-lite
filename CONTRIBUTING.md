@@ -5,6 +5,20 @@ Node.js in the build or at runtime: the Astro runtime the browser needs is
 committed as `assets/astro.js`, and every file under `assets/` is embedded in
 the binary with `include_str!`, so editing an asset means rebuilding.
 
+## Verification happens in CI, not on your machine
+
+Do not run the suite locally to decide whether a change is good. Write it,
+format it, commit it, push the branch, and read the run: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test`, a release build,
+`sandbox-lite check` over every example, an HTTP smoke test, `bench/mem.sh` and
+the Playwright suite all run on every push, to any branch. A red run is the
+feedback; fix the cause and push again.
+
+The reasons are practical: a local pass proves nothing about the merged tree —
+two branches green on their own broke `main` once already — and a machine that
+happens to have a warm cargo cache, a stale binary or another daemon on the
+port produces answers the reviewer cannot reproduce.
+
 ## Build and run
 
 A current stable toolchain is required: the crate is edition 2024 and uses let

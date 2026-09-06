@@ -1,10 +1,14 @@
 name: ci
 on:
   push:
-    branches: [main]
   pull_request:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
+    # Every branch push runs; a same-repo pull request would only duplicate it.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -28,6 +32,7 @@ jobs:
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/' | grep -q shell.js
       - run: bench/mem.sh 100 4398
   e2e:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     needs: test
     runs-on: ubuntu-latest
     steps:
