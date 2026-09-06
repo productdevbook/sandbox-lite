@@ -403,9 +403,8 @@ pub fn is_source(path: &str) -> bool {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
-    use super::{Config, Engine, Kind, scss, svg_size};
+    use super::{Config, Engine, Kind, svg_size};
     use crate::resolve::Resolver;
     use crate::store::{Base, Store, Tenant};
 
