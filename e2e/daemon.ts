@@ -73,9 +73,9 @@ export class Daemon {
   }
 }
 
-export async function startDaemon(): Promise<Daemon> {
+export async function startDaemon(extra: string[] = []): Promise<Daemon> {
   const port = await freePort();
-  const args = ['--listen', `127.0.0.1:${port}`, '--bases', path.join(root, 'examples'), '--no-persist'];
+  const args = ['--listen', `127.0.0.1:${port}`, '--bases', path.join(root, 'examples'), '--no-persist', ...extra];
   const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr!.on('data', (chunk) => (stderr += chunk));

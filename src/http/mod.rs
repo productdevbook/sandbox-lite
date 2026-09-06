@@ -195,6 +195,10 @@ pub fn preview_token(secret: &str, tenant: &str) -> String {
 
 const PREVIEW_COOKIE: &str = "sl_t";
 
+fn header_is(req: &Request, name: &str, value: &str) -> bool {
+    req.headers().get(name).is_some_and(|h| h.as_bytes() == value.as_bytes())
+}
+
 async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: Next) -> Response {
     let Some(secret) = &st.preview_secret else { return next.run(req).await };
     let Some(TenantId(id)) = req.extensions().get::<TenantId>().cloned() else { return next.run(req).await };
@@ -202,6 +206,13 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
     if let Some(token) = query_param(req.uri(), "sl_token") {
         if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             return (StatusCode::FORBIDDEN, "wrong preview token\n").into_response();
+        }
+        // A framed preview is a cross-site navigation, and a browser drops the Lax cookie a
+        // redirect would set. Only a top-level navigation (`Sec-Fetch-Dest: document`, which an
+        // iframe reports as `iframe`) is sent to the clean URL; everything else is served where
+        // it is, so the token alone is enough.
+        if !header_is(&req, "sec-fetch-dest", "document") {
+            return next.run(req).await;
         }
         let rest: Vec<&str> = req.uri().query().unwrap_or("").split('&').filter(|p| !p.starts_with("sl_token=")).collect();
         let location = if rest.is_empty() { req.uri().path().to_string() } else { format!("{}?{}", req.uri().path(), rest.join("&")) };
@@ -223,6 +234,12 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
         .filter_map(|c| c.trim().strip_prefix(PREVIEW_COOKIE).and_then(|r| r.strip_prefix('=')))
         .any(|given| constant_time_eq(given.as_bytes(), expected.as_bytes()));
     if has_cookie {
+        return next.run(req).await;
+    }
+    // A page can reference `/favicon.svg` or import a module whose own imports nothing rewrites,
+    // so not every subresource can carry the token. `same-origin` is only sent for a request a
+    // document on this tenant host made, and opening that document needed the token.
+    if header_is(&req, "sec-fetch-site", "same-origin") {
         return next.run(req).await;
     }
     (StatusCode::FORBIDDEN, "this preview needs a token: open it from the editor\n").into_response()
@@ -271,7 +288,7 @@ mod tests {
     use std::time::Instant;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header::LOCATION};
     use tower::ServiceExt;
 
     use super::{AppState, SameSite, app, chats, constant_time_eq, preview_token, tenant_from_host};
@@ -279,7 +296,7 @@ mod tests {
     use crate::store::Store;
     use crate::transform::{Config, Engine};
 
-    fn baseless_app(api_token: Option<&str>) -> axum::Router {
+    fn baseless_app(api_token: Option<&str>, preview_secret: Option<&str>) -> axum::Router {
         let metrics = Arc::new(Metrics::default());
         app(Arc::new(AppState {
             store: Store::new(None, u64::MAX),
@@ -292,7 +309,7 @@ mod tests {
             api_key: None,
             api_base: "http://127.0.0.1:1".into(),
             api_token: api_token.map(str::to_string),
-            preview_secret: None,
+            preview_secret: preview_secret.map(str::to_string),
             cookie_samesite: SameSite::Lax,
             chrome: None,
             shots: super::ai::Shots::default(),
@@ -313,14 +330,14 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_are_open_until_an_api_token_is_set() {
-        let (status, body) = get(&baseless_app(None), "/metrics", None).await;
+        let (status, body) = get(&baseless_app(None, None), "/metrics", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("# TYPE sandbox_lite_compile_seconds histogram"), "{body}");
     }
 
     #[tokio::test]
     async fn metrics_need_the_api_token_when_one_is_set() {
-        let app = baseless_app(Some("s3cret"));
+        let app = baseless_app(Some("s3cret"), None);
         assert_eq!(get(&app, "/metrics", None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&app, "/metrics", Some("wrong")).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&app, "/metrics?token=s3cret", None).await.0, StatusCode::OK);
@@ -345,6 +362,48 @@ mod tests {
         assert_ne!(preview_token("s", "acme"), preview_token("s", "bakery"));
         assert_ne!(preview_token("s", "acme"), preview_token("t", "acme"));
         assert_eq!(preview_token("s", "acme").len(), 32);
+    }
+
+    /// No base and no tenant, so a request the middleware lets through reaches a handler that
+    /// answers `404` — which is what tells it apart from the `403` the middleware writes itself.
+    async fn preview_get(uri: &str, headers: &[(&str, &str)]) -> (StatusCode, Option<String>) {
+        let mut req = Request::builder().method("GET").uri(uri).header("host", "acme.localhost");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = baseless_app(None, Some("s")).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let location = res.headers().get(LOCATION).and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        (res.status(), location)
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_is_served_and_only_a_document_navigation_is_redirected() {
+        let token = preview_token("s", "acme");
+        let framed = format!("/?sl_token={token}");
+
+        assert_eq!(preview_get(&framed, &[("sec-fetch-dest", "iframe"), ("sec-fetch-site", "cross-site")]).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            preview_get(&format!("/__sl/routes.json?sl_token={token}"), &[("sec-fetch-dest", "empty")]).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(preview_get(&framed, &[]).await.0, StatusCode::NOT_FOUND);
+
+        let (status, location) = preview_get(&format!("/about?sl_token={token}&x=1"), &[("sec-fetch-dest", "document")]).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location.as_deref(), Some("/about?x=1"));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_token_needs_the_cookie_or_a_same_origin_initiator() {
+        let token = preview_token("s", "acme");
+
+        assert_eq!(preview_get("/", &[]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(preview_get("/?sl_token=nope", &[]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(preview_get("/favicon.svg", &[("sec-fetch-site", "cross-site")]).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(preview_get("/favicon.svg", &[("sec-fetch-site", "none")]).await.0, StatusCode::FORBIDDEN);
+
+        assert_eq!(preview_get("/favicon.svg", &[("sec-fetch-site", "same-origin")]).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(preview_get("/", &[("cookie", &format!("sl_t={token}"))]).await.0, StatusCode::NOT_FOUND);
     }
 
     #[test]

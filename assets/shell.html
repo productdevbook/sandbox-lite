@@ -4,9 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>preview</title>
-<script>window.__sl = { tenant: "%TENANT%", version: %VERSION%, assets: "%ASSETS%", env: %ENV% }; globalThis.__sl_env = window.__sl.env;</script>
-<script type="module" src="/__sl/live.js"></script>
-<script type="module" src="/__sl/shell.js"></script>
+<script>window.__sl = { tenant: "%TENANT%", version: %VERSION%, assets: "%ASSETS%", token: "%TOKEN%", env: %ENV% }; globalThis.__sl_env = window.__sl.env;
+// A framed preview is cross-site and never gets the cookie, so every /__sl/ URL this page builds carries the token.
+globalThis.__sl_url = (u) => (window.__sl.token && typeof u === "string" && u.startsWith("/") ? `${u}${u.includes("?") ? "&" : "?"}sl_token=${window.__sl.token}` : u);</script>
+<script type="module" src="/__sl/live.js%TOKENQ%"></script>
+<script type="module" src="/__sl/shell.js%TOKENQ%"></script>
 </head>
 <body></body>
 </html>

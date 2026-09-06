@@ -3,7 +3,7 @@
   if (new URLSearchParams(location.search).has("sl_shot")) return;
   const prev = window.__sl_es;
   if (prev && prev.readyState !== EventSource.CLOSED) return;
-  const es = new EventSource("/__sl/events");
+  const es = new EventSource((globalThis.__sl_url || ((u) => u))("/__sl/events"));
   window.__sl_es = es;
 
   const reload = () => location.reload();

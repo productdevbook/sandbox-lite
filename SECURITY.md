@@ -114,11 +114,11 @@ credentials on the API side.
   that needs the compile in a child process with rlimits.
 - **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly` and no
   `Domain` attribute, so it is a host-only session cookie for that one tenant
-  host. `--cookie-samesite` picks `SameSite=Lax` (the default; `Secure` is
-  added only when the request carried `x-forwarded-proto: https`) or
-  `SameSite=None; Secure`, which an editor on another registrable domain needs
-  before a framed preview will carry the cookie, and which browsers store only
-  over HTTPS.
+  host. It is a convenience, not a precondition: it is set only on a top-level
+  navigation that carried the token, and a preview reached any other way works
+  without it. `--cookie-samesite` picks `SameSite=Lax` (the default; `Secure`
+  is added only when the request carried `x-forwarded-proto: https`) or
+  `SameSite=None; Secure`, which browsers store only over HTTPS.
 - **Connections** that have not delivered a complete request head within 30 s,
   whether newly opened or idle between keep-alive requests, are closed.
 - **Archive imports.** `POST /api/tenants/{id}/import` is on the editor/API
@@ -202,10 +202,26 @@ endpoint, including `/__sl/raw/`, `/__sl/events` and `/__sl/check`.
   is a pure function of the secret and the id: it never expires and cannot be
   revoked for one tenant. Rotating `S` invalidates every tenant's link at once.
 - `GET http://<id>.<domain>/any/path?sl_token=<token>`: a wrong token answers
-  `403`; the right one answers `303` to the same path with the parameter
-  removed and sets the `sl_t` cookie described above. Later requests are
-  accepted when the cookie equals the token, otherwise `403`. Both
-  comparisons, like the API token's, take constant time (`constant_time_eq`).
+  `403`. The right one is served. A top-level navigation — `Sec-Fetch-Dest:
+  document`, which a frame reports as `iframe` — answers `303` to the same path
+  with the parameter removed and sets the `sl_t` cookie described above, so a
+  link a person opens becomes a clean URL; every other request is served where
+  it is, because a browser drops the Lax cookie a cross-site frame would be
+  given and the editor frames its preview from another host. Later requests are
+  accepted when the cookie equals the token, otherwise `403`. Both comparisons,
+  like the API token's, take constant time (`constant_time_eq`).
+- A request carrying neither token nor cookie is still served when it arrives
+  with `Sec-Fetch-Site: same-origin`. Not every subresource can be made to
+  carry the token — `<link href="/favicon.svg">` is written by hand, and a
+  module's own imports are rewritten without one — and only a document already
+  on that tenant host makes a browser send `same-origin`, which opening it
+  needed the token or the cookie for. A client that sends no `Sec-Fetch-*`
+  headers (`curl`, an older browser) is unaffected and still needs one of them.
+- The shell puts the token in `window.__sl.token` so it can carry it on the
+  `/__sl/**` requests it makes. Tenant JavaScript can read it there, which the
+  `HttpOnly` cookie did not allow — but tenant JavaScript already runs on that
+  host, with the cookie attached to every request it makes, so the token gives
+  it nothing it did not have.
 - `/api/tenants` returns each tenant's `preview_token` and a ready-made
   `preview` link, so anyone with API access can open every preview.
 - The `preview` link the API builds is

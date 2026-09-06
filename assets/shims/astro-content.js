@@ -1,6 +1,8 @@
 import { createComponent, render as renderTemplate, unescapeHTML } from "/__sl/astro.js";
 import { z } from "/__sl/shim/zod.js";
 
+const slUrl = globalThis.__sl_url || ((u) => u);
+
 const cache = new Map();
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
@@ -30,7 +32,7 @@ function reviveFields(data, paths) {
 
 function load(name) {
   if (!cache.has(name)) {
-    cache.set(name, fetch(`/__sl/content/${encodeURIComponent(name)}?v=${globalThis.__sl?.version ?? ""}`).then(async (r) => {
+    cache.set(name, fetch(slUrl(`/__sl/content/${encodeURIComponent(name)}?v=${globalThis.__sl?.version ?? ""}`)).then(async (r) => {
       if (!r.ok) throw new Error(`content collection '${name}' is not available (${r.status})`);
       const { entries, dates } = await r.json();
       for (const e of entries) e.data = dates ? reviveFields(e.data, dates) : reviveDates(e.data);
@@ -59,7 +61,7 @@ export async function getLiveEntry() { return { entry: undefined }; }
 
 export async function render(entry) {
   if (!entry?.rendered && entry?.filePath?.endsWith(".mdx")) {
-    const mod = await import(`/__sl/m/${entry.filePath}?v=${globalThis.__sl?.version ?? ""}`);
+    const mod = await import(slUrl(`/__sl/m/${entry.filePath}?v=${globalThis.__sl?.version ?? ""}`));
     return { Content: mod.Content, headings: mod.getHeadings(), remarkPluginFrontmatter: mod.frontmatter };
   }
   const html = entry?.rendered?.html ?? "";

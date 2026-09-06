@@ -1,5 +1,6 @@
 const sl = window.__sl;
 const V = sl.version;
+const slUrl = globalThis.__sl_url || ((u) => u);
 const registry = (globalThis.__sl_css ||= new Map());
 const TAILWIND_CDN = "https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4";
 
@@ -8,7 +9,7 @@ function esc(s) {
 }
 
 async function fetchJSON(url) {
-  const r = await fetch(url);
+  const r = await fetch(slUrl(url));
   if (!r.ok) throw new Error(`${url} answered ${r.status}`);
   return r.json();
 }
@@ -64,21 +65,22 @@ function paginate(route) {
 }
 
 function resolveId(id) {
-  if (/^(https?:)?\/\//.test(id) || id.startsWith("/__sl/")) return id;
-  if (id.startsWith("astro:")) return `/__sl/shim/astro-${id.slice(6).replace(/\.js$/, "").replace(/\//g, "-")}.js`;
+  if (/^(https?:)?\/\//.test(id)) return id;
+  if (id.startsWith("/__sl/")) return slUrl(id);
+  if (id.startsWith("astro:")) return slUrl(`/__sl/shim/astro-${id.slice(6).replace(/\.js$/, "").replace(/\//g, "-")}.js`);
   const clean = id.startsWith("/") ? id.slice(1) : id;
-  return `/__sl/m/${clean}${clean.includes("?") ? "&" : "?"}v=${V}`;
+  return slUrl(`/__sl/m/${clean}${clean.includes("?") ? "&" : "?"}v=${V}`);
 }
 
 async function addRenderers(container) {
   const renderers = await fetchJSON(`/__sl/renderers.json?v=${V}`);
   for (const r of renderers) {
-    const mod = await import(r.server);
+    const mod = await import(slUrl(r.server));
     container.addServerRenderer({ name: r.name, renderer: mod.default });
-    if (r.client) container.addClientRenderer({ name: r.name, entrypoint: r.client });
+    if (r.client) container.addClientRenderer({ name: r.name, entrypoint: slUrl(r.client) });
   }
   // Last, so framework renderers get to claim their components first, as in Astro.
-  const jsx = await import("/__sl/shim/astro-jsx-runtime.js");
+  const jsx = await import(slUrl("/__sl/shim/astro-jsx-runtime.js"));
   container.addServerRenderer({ name: "astro:jsx", renderer: jsx.default });
 }
 
@@ -90,7 +92,7 @@ function headExtras() {
     tailwind ||= tw;
     blocks.push(`<style${tw ? ' type="text/tailwindcss"' : ""} data-sl="${esc(key)}">\n${css}\n</style>`);
   }
-  blocks.push(`<script type="module" src="/__sl/live.js"></script>`);
+  blocks.push(`<script type="module" src="${esc(slUrl("/__sl/live.js"))}"></script>`);
   return { html: blocks.join("\n"), tailwind };
 }
 
@@ -133,7 +135,7 @@ function showResponse({ component, status, statusText, type, body }) {
 <style>body{margin:0;background:#1a1b26;color:#c0caf5;font:14px/1.5 ui-monospace,Menlo,monospace;padding:32px}
 h1{color:#7aa2f7;font-size:18px;margin:0 0 4px}p{margin:0 0 12px;color:#565f89}pre{white-space:pre-wrap;background:#16161e;padding:12px;border-radius:6px;overflow:auto}
 b{color:#9ece6a}small{color:#565f89}</style>
-<script type="module" src="/__sl/live.js"></script></head>
+<script type="module" src="${esc(slUrl("/__sl/live.js"))}"></script></head>
 <body data-sl-overlay><h1>${status} ${esc(statusText || "")}</h1><p>${esc(component)} → <b>${esc(type || "no content-type")}</b></p><pre>${esc(text)}</pre>
 <small>sandbox-lite · tenant ${esc(sl.tenant)} · the page reloads itself when a file changes</small></body></html>`);
 }
@@ -147,7 +149,7 @@ function showError({ title, message, stack, diagnostics = [], routes }) {
 <style>body{margin:0;background:#1a1b26;color:#c0caf5;font:14px/1.5 ui-monospace,Menlo,monospace;padding:32px}
 h1{color:#f7768e;font-size:18px;margin:0 0 12px}pre{white-space:pre-wrap;background:#16161e;padding:12px;border-radius:6px;overflow:auto}
 ul{padding-left:18px}b{color:#7aa2f7}i{color:#9ece6a}a{color:#7dcfff}small{color:#565f89}</style>
-<script type="module" src="/__sl/live.js"></script></head>
+<script type="module" src="${esc(slUrl("/__sl/live.js"))}"></script></head>
 <body data-sl-overlay><h1>${esc(title)}</h1><pre>${esc(message || "")}</pre>${diag ? `<ul>${diag}</ul>` : ""}${stack ? `<pre>${esc(stack)}</pre>` : ""}${list}
 <small>sandbox-lite · tenant ${esc(sl.tenant)} · the page reloads itself when a file changes</small></body></html>`);
 }
@@ -158,8 +160,8 @@ async function main() {
   const hit = matchRoute(routes, location.pathname);
   if (!hit) return showError({ title: "404 — no matching page", message: `Nothing in src/pages matches ${location.pathname}`, routes });
   const endpoint = hit.route.kind === "endpoint";
-  const astro = await import("/__sl/astro.js");
-  const mod = await import(`/__sl/m/${hit.route.component}?v=${V}`);
+  const astro = await import(slUrl("/__sl/astro.js"));
+  const mod = await import(slUrl(`/__sl/m/${hit.route.component}?v=${V}`));
   if (endpoint) {
     if (typeof mod.GET !== "function" && typeof mod.ALL !== "function") {
       return showError({ title: "Endpoint without a handler", message: `${hit.route.component} exports no GET or ALL function. The preview only issues GET requests.` });
@@ -179,8 +181,11 @@ async function main() {
   const container = await astro.experimental_AstroContainer.create({ resolve: resolveId, astroConfig: sl.env.SITE ? { site: sl.env.SITE } : undefined });
   // An endpoint renders no components, so the framework renderers are not worth fetching.
   if (!endpoint) await addRenderers(container);
+  // the token is the daemon's, not the page's: Astro.url must not show it
+  const pageUrl = new URL(location.href);
+  pageUrl.searchParams.delete("sl_token");
   const res = await container.renderToResponse(endpoint ? mod : mod.default, {
-    request: new Request(location.href),
+    request: new Request(pageUrl.href),
     params,
     props,
     partial: false,
