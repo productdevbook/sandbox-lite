@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -111,28 +113,81 @@ fn reject(name: &str, why: &str) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, format!("{name}: {why}"))
 }
 
+/// Framing an archive may spend above the tenant's quota: a 512-byte header and up to 511 bytes of
+/// padding per file, so about sixteen thousand files. An import that needs more than this is refused
+/// rather than read, and the message says so.
+const FRAMING_SLACK: u64 = 16 << 20;
+/// However well it compresses, an archive may not hand `tar` more than this many times its own size:
+/// gzip itself tops out near 1030:1, so this is a ceiling on the amplification, not on the content.
+const MAX_EXPANSION: u64 = 1000;
+/// The floor under that ratio — an archive this small is not worth bounding more tightly.
+const MIN_EXPANSION: u64 = 1 << 20;
+
+/// What `tar` may read out of the decompressor, whatever the entries declare.
+fn stream_cap(compressed: u64, quota: u64) -> u64 {
+    compressed.saturating_mul(MAX_EXPANSION).max(MIN_EXPANSION).min(quota.saturating_add(FRAMING_SLACK))
+}
+
+/// Cuts the decompressor off at `limit` bytes and remembers that it did, so a bomb is told apart
+/// from a truncated archive.
+struct Capped<R> {
+    inner: R,
+    read: u64,
+    limit: u64,
+    tripped: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        if self.read > self.limit {
+            self.tripped.store(true, Ordering::Relaxed);
+            return Err(io::Error::other("the archive expands past what the tenant may hold"));
+        }
+        Ok(n)
+    }
+}
+
 /// Reads the archive into memory, refusing anything that is not a plain file inside the tenant
-/// tree. `quota` bounds the total: entry sizes are summed from the headers before any body is
-/// read, so an archive that decompresses past the quota is refused without being decompressed.
+/// tree. `quota` bounds the total two ways: every entry costs its declared size whether or not it is
+/// taken — `tar` reads those bytes to reach the next header either way — and the decompressor itself
+/// is cut off at `stream_cap`, which also bounds what `tar` reads without ever showing it as an
+/// entry (a GNU long name, a pax payload, padding). So an archive that decompresses past the quota
+/// is refused without being decompressed.
 fn unpack(body: &[u8], quota: u64) -> Result<Unpacked, (StatusCode, String)> {
-    let mut archive = Archive::new(GzDecoder::new(body));
-    let unreadable = |e: io::Error| (StatusCode::BAD_REQUEST, format!("cannot read the archive: {e}"));
+    let cap = stream_cap(body.len() as u64, quota);
+    let tripped = Arc::new(AtomicBool::new(false));
+    let mut archive = Archive::new(Capped { inner: GzDecoder::new(body), read: 0, limit: cap, tripped: tripped.clone() });
+    let unreadable = |e: io::Error| {
+        if tripped.load(Ordering::Relaxed) {
+            let over = format!(
+                "the archive expands past {cap} bytes, the most an import may read for a quota of {quota} bytes (--tenant-quota-mb)"
+            );
+            (StatusCode::PAYLOAD_TOO_LARGE, over)
+        } else {
+            (StatusCode::BAD_REQUEST, format!("cannot read the archive: {e}"))
+        }
+    };
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut deleted: Vec<String> = Vec::new();
     let mut total: u64 = 0;
     for entry in archive.entries().map_err(unreadable)? {
         let mut entry = entry.map_err(unreadable)?;
         let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        // before the type match: a directory or pax entry declares a size too, and those bytes are
+        // read out of the decompressor to reach the next header even though nothing is kept
+        total = total.saturating_add(entry.size());
+        if total > quota {
+            let over =
+                format!("the archive declares at least {total} bytes of entries, the tenant quota is {quota} bytes (--tenant-quota-mb)");
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, over));
+        }
         match entry.header().entry_type() {
             EntryType::Regular | EntryType::Continuous => {}
             EntryType::Directory | EntryType::XHeader | EntryType::XGlobalHeader => continue,
             EntryType::Symlink | EntryType::Link => return Err(reject(&name, "symbolic and hard links are not imported")),
             other => return Err(reject(&name, &format!("unsupported tar entry (type byte {})", other.as_byte()))),
-        }
-        total = total.saturating_add(entry.size());
-        if total > quota {
-            let over = format!("the archive holds at least {total} bytes of files, the tenant quota is {quota} bytes (--tenant-quota-mb)");
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, over));
         }
         let mut bytes = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut bytes).map_err(unreadable)?;
@@ -152,6 +207,7 @@ fn unpack(body: &[u8], quota: u64) -> Result<Unpacked, (StatusCode, String)> {
 }
 
 /// A refused import applies nothing, and says so where a caller looking for the counts will see it.
+/// Only an error `write_many` has undone may answer this way — a `Torn` one has not, and says so.
 fn refused(message: String) -> Json<Value> {
     Json(json!({ "error": message, "files": 0, "deleted": 0 }))
 }
@@ -173,7 +229,10 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
             Json(json!({ "files": written, "deleted": deleted, "version": version })).into_response()
         }
         Err(e @ WriteError::Quota { .. }) => (StatusCode::PAYLOAD_TOO_LARGE, refused(e.to_string())).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // the batch put itself back, so the tenant is what it was and the counts say it
+        Err(e @ WriteError::Io(_)) => (StatusCode::INTERNAL_SERVER_ERROR, refused(e.to_string())).into_response(),
+        // it could not, so there are no counts to give: the message names what is neither way
+        Err(e @ WriteError::Torn { .. }) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -387,6 +446,75 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (1, 40));
         assert!(!f.root.join("data/a/files/src/huge.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn a_bomb_is_refused_before_it_lands() {
+        let f = fixture("bomb", 64);
+        // a directory entry declares a size like any other, and tar reads those bytes to reach the
+        // next header even though the entry itself is skipped
+        let archive = tar_gz(&[("dir", EntryType::Directory, &vec![0u8; 8 << 20][..])]);
+        assert!(archive.len() < 64 << 10, "the bomb is small on the wire: {} bytes", archive.len());
+        let (status, body) = call(&f, "POST", "/api/tenants/a/import", archive).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["files"], 0);
+        assert!(body["error"].as_str().unwrap().contains("quota"), "{body}");
+        assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (0, 0));
+
+        // tar reads a GNU long name itself and never shows it as an entry, so only the cap on the
+        // decompressor bounds it — and it reads the whole thing into memory
+        let archive = tar_gz(&[("longname", EntryType::GNULongName, &vec![b'a'; 24 << 20][..])]);
+        let (status, body) = call(&f, "POST", "/api/tenants/a/import", archive).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (0, 0));
+    }
+
+    #[test]
+    fn the_cap_on_the_decompressor_bounds_both_ways() {
+        // a small request cannot buy a large decompression...
+        assert_eq!(stream_cap(1 << 10, 64 << 20), MIN_EXPANSION);
+        assert_eq!(stream_cap(64 << 10, 64 << 20), (64 << 10) * MAX_EXPANSION);
+        // ...and no request buys more than the quota and the framing allowed above it
+        assert_eq!(stream_cap(64 << 20, 64 << 20), (64 << 20) + FRAMING_SLACK);
+        assert_eq!(stream_cap(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn a_failed_import_leaves_the_tenant_exactly_as_it_was() {
+        for (name, query) in [("atomic", ""), ("atomic-replace", "?replace=1")] {
+            let f = fixture(name, 1 << 20);
+            call(&f, "PUT", "/api/t/a/file/src/data.ts", b"export const n = 9;\n".to_vec()).await;
+            call(&f, "DELETE", "/api/t/a/file/readme.md", Vec::new()).await;
+            let before = (listing(&f, "a"), bytes_of(&f, "a"));
+            let tombstones = std::fs::read(f.root.join("data/a/deleted.json")).ok();
+
+            // "x" < "x/y", so the file lands first and the directory the second entry needs cannot
+            // be created over it: the batch fails on its last entry
+            let archive = tar_gz(&[("x", EntryType::Regular, b"i am a file"), ("x/y", EntryType::Regular, b"child")]);
+            let (status, body) = call(&f, "POST", &format!("/api/tenants/a/import{query}"), archive).await;
+            assert!(status.is_server_error(), "{query}: {status} {}", String::from_utf8_lossy(&body));
+            let report: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(report["files"], 0, "{query}: {report}");
+            assert_eq!(report["deleted"], 0, "{query}: {report}");
+
+            assert_eq!((listing(&f, "a"), bytes_of(&f, "a")), before, "{query}");
+            assert!(!f.root.join("data/a/files/x").exists(), "{query}: the failed import left its file on disk");
+            assert!(f.root.join("data/a/files/src/data.ts").exists(), "{query}: the failed import took an edit away");
+            assert_eq!(std::fs::read(f.root.join("data/a/deleted.json")).ok(), tombstones, "{query}");
+            let left: Vec<String> =
+                std::fs::read_dir(f.root.join("data/a")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            assert!(!left.iter().any(|n| n.starts_with(".staged")), "{query}: staging left behind: {left:?}");
+
+            // and the daemon does not change its mind about what it holds when it is restarted
+            let store = Store::new(Some(f.root.join("data")), 1 << 20);
+            store.add_base(Base::load("b", &f.root.join("base")).unwrap());
+            store.restore().unwrap();
+            let t = store.tenant("a").unwrap();
+            let restored: Vec<(String, u64, bool)> = t.list().into_iter().map(|e| (e.path, e.size, e.modified)).collect();
+            assert_eq!(restored, before.0, "{query}: a restart reads a different tenant");
+            assert_eq!(t.read_text("x").unwrap(), None, "{query}: a restart reads the file the import was told not to write");
+        }
     }
 
     #[tokio::test]
