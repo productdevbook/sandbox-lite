@@ -28,10 +28,14 @@ button:disabled{opacity:.5;cursor:default}
 #editor{flex:1;resize:none;border:none;border-radius:0;background:#0b0d13;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;tab-size:2;white-space:pre;overflow:auto;outline:none}
 #chat{display:none;flex-direction:column;min-height:0;grid-row:2/4}
 #chat.visible{display:flex}
+#chat .bar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid var(--line)}
+#chatList{flex:1;min-width:0}
 #msgs{flex:1;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:10px}
 .msg{max-width:92%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;line-height:1.45}
 .msg.user{align-self:flex-end;background:#243352}.msg.ai{align-self:flex-start;background:#1d2230}.msg.sys{align-self:center;color:var(--muted);font-size:12px}
-.msg .chips{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px}.msg .chips span{background:#0b0d13;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:11px}
+.msg .chips{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px}.msg .chips:empty{display:none}
+.msg .chips span{background:#0b0d13;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:11px}
+.msg .chips span.run{border-color:var(--accent);color:var(--accent)}
 #chatForm{display:flex;gap:6px;padding:8px;border-top:1px solid var(--line)}
 #chatForm textarea{flex:1;resize:none;height:60px}
 #right{grid-area:right;display:grid;grid-template-rows:auto 1fr;min-height:0}
@@ -60,6 +64,7 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
     <textarea id="editor" spellcheck="false" placeholder="Pick a file on the left. Edits are saved as you type; the preview reloads itself."></textarea>
   </div>
   <div id="chat">
+    <div class="bar"><select id="chatList" title="past conversations"></select><button id="newChat">+ chat</button><button id="delChat" title="delete this conversation">✕</button></div>
     <div id="msgs"><div class="msg sys" id="chatHint">Ask for a change in plain language. The assistant reads and writes files in this tenant; the preview follows.</div></div>
     <form id="chatForm"><textarea id="chatInput" placeholder="e.g. make the hero headline mention our summer sale and turn the buttons green"></textarea><button class="primary" id="chatSend">Send</button></form>
   </div>
@@ -71,7 +76,7 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
 <dialog id="dlg"><form method="dialog"><b>New tenant</b><label>id <input id="dlgId" placeholder="acme" pattern="[a-z0-9][a-z0-9-]*" required></label><label>base <select id="dlgBase"></select></label><div style="display:flex;gap:6px;justify-content:flex-end"><button value="cancel">Cancel</button><button value="ok" class="primary">Create</button></div></form></dialog>
 <script>
 const $ = (s) => document.querySelector(s);
-const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chat: [], saving: null };
+const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chatId: null, busy: false, saving: null };
 const BINARY = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|pdf|wasm|zip)$/i;
 const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 const esc = (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
@@ -100,7 +105,7 @@ async function refreshStats() {
   try { state.stats = await api("GET", "/api/stats"); } catch (e) { $("#stat").textContent = "daemon unreachable"; return; }
   const s = state.stats;
   $("#stat").innerHTML = `daemon RSS <b>${esc(fmtKB(s.rss_kb))}</b> · ${esc(s.tenants)} tenants · cache ${esc((s.cache.bytes / 1024).toFixed(0))} kB / ${esc(s.cache.entries)} · astro ${esc(s.astro)} · chat ${esc(s.ai ? "on" : "off")}`;
-  $("#chatSend").disabled = !s.ai;
+  $("#chatSend").disabled = !s.ai || state.busy;
   if (!s.ai) $("#chatHint").textContent = "Chat is off: start the daemon with ANTHROPIC_API_KEY set to enable the built-in assistant. The file editor works without it.";
 }
 
@@ -115,7 +120,7 @@ async function loadTenants(selectId) {
 
 async function selectTenant(id) {
   if (state.tenant === id) return;
-  state.tenant = id; state.file = null; state.chat = []; $("#msgs").querySelectorAll(".msg:not(.sys)").forEach((m) => m.remove());
+  state.tenant = id; state.file = null; state.chatId = null; clearMsgs();
   $("#editor").value = ""; $("#fileName").textContent = "no file";
   $("#empty").classList.add("hidden"); $("#frame").classList.remove("hidden");
   $("#frame").src = previewUrl(id, $("#path").value || "/");
@@ -128,6 +133,7 @@ async function selectTenant(id) {
     if (state.file && !state.dirty && d.type === "update" && (d.path === state.file || d.path === "")) openFile(state.file, true);
   };
   await loadFiles();
+  await loadChats();
 }
 
 async function loadFiles() {
@@ -196,26 +202,103 @@ $("#reload").onclick = () => { try { $("#frame").contentWindow.location.reload()
 $("#openTab").onclick = () => { if (state.tenant) window.open(previewUrl(state.tenant, $("#path").value || "/"), "_blank"); };
 $("#frame").addEventListener("load", () => { try { $("#path").value = new URL($("#frame").contentWindow.location.href).pathname; } catch {} });
 
-function addMsg(role, text, changes) {
-  const div = document.createElement("div"); div.className = "msg " + role; div.textContent = text;
-  if (changes && changes.length) {
-    const c = document.createElement("div"); c.className = "chips";
-    for (const p of changes) { const s = document.createElement("span"); s.textContent = p; c.appendChild(s); }
-    div.appendChild(c);
-  }
+function addMsg(role, text, chips) {
+  const div = document.createElement("div"); div.className = "msg " + role;
+  const body = document.createElement("span"); body.className = "text"; body.textContent = text || "";
+  const box = document.createElement("div"); box.className = "chips";
+  div.append(body, box);
+  for (const c of chips || []) addChip(div, c);
   $("#msgs").appendChild(div); $("#msgs").scrollTop = 1e9; return div;
 }
+function setMsg(div, text) { div.querySelector(".text").textContent = text; $("#msgs").scrollTop = 1e9; }
+function addChip(div, label, running) {
+  const s = document.createElement("span"); s.textContent = label; if (running) s.className = "run";
+  div.querySelector(".chips").appendChild(s); $("#msgs").scrollTop = 1e9; return s;
+}
+const clearMsgs = () => $("#msgs").querySelectorAll(".msg:not(.sys)").forEach((m) => m.remove());
+const chipLabel = (t) => (t.path ? `${t.name} ${t.path}` : t.name);
+
+async function loadChats(select) {
+  if (!state.tenant) return;
+  let chats = [];
+  try { chats = (await api("GET", `/api/t/${state.tenant}/chats`)).chats || []; } catch {}
+  $("#chatList").replaceChildren(new Option("new conversation", ""), ...chats.map((c) => new Option(c.title || c.id, c.id)));
+  $("#chatList").value = select !== undefined ? select : state.chatId || "";
+}
+
+async function openChat(id) {
+  state.chatId = id || null; clearMsgs();
+  if (!id) return;
+  try {
+    const c = await api("GET", `/api/t/${state.tenant}/chats/${encodeURIComponent(id)}`);
+    for (const m of c.messages) addMsg(m.role === "user" ? "user" : "ai", m.text, (m.tools || []).map(chipLabel));
+  } catch (e) { addMsg("sys", "cannot open that conversation: " + e.message); }
+}
+
+// EventSource cannot POST, so the stream is read off the fetch body itself.
+async function streamChat(body, onEvent) {
+  const r = await fetch(`/api/t/${state.tenant}/chat`, {
+    method: "POST",
+    headers: { ...authHeaders(), "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify(body),
+  });
+  if (r.status === 401) {
+    const t = prompt("This daemon requires an API token (--api-token):", apiToken);
+    if (t) { apiToken = t; try { localStorage.setItem("sl_api_token", t); } catch {} return streamChat(body, onEvent); }
+  }
+  if (!r.ok || !r.body) {
+    let m = r.statusText;
+    try { const e = (await r.json()).error; m = typeof e === "string" ? e : JSON.stringify(e); } catch {}
+    throw new Error(m);
+  }
+  const reader = r.body.getReader(), decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, cut); buf = buf.slice(cut + 2);
+      let name = "message", data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) name = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).replace(/^ /, "");
+      }
+      if (data) onEvent(name, JSON.parse(data));
+    }
+  }
+}
+
 $("#chatForm").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const text = $("#chatInput").value.trim(); if (!text || !state.tenant) return;
-  $("#chatInput").value = ""; addMsg("user", text); state.chat.push({ role: "user", content: text });
-  const pending = addMsg("sys", "working… (files change live in the preview)"); $("#chatSend").disabled = true;
+  const text = $("#chatInput").value.trim(); if (!text || !state.tenant || state.busy) return;
+  $("#chatInput").value = ""; addMsg("user", text);
+  const reply = addMsg("ai", "…");
+  state.busy = true; $("#chatSend").disabled = true;
+  let streamed = "", running = null;
   try {
-    const r = await api("POST", `/api/t/${state.tenant}/chat`, { messages: state.chat });
-    pending.remove(); addMsg("ai", r.text || "(no reply)", r.changes); state.chat.push({ role: "assistant", content: r.text || "(done)" });
-  } catch (err) { pending.textContent = "failed: " + err.message; }
-  $("#chatSend").disabled = false;
+    await streamChat({ messages: [{ role: "user", content: text }], chat: state.chatId }, (name, d) => {
+      if (name === "text") { streamed += d.text; setMsg(reply, streamed); }
+      else if (name === "tool") running = addChip(reply, chipLabel({ name: d.name, path: d.input }), true);
+      else if (name === "tool_result") { if (running) { running.className = ""; running.title = d.result; running = null; } }
+      else if (name === "error") { const m = typeof d.error === "string" ? d.error : JSON.stringify(d.error); setMsg(reply, streamed ? `${streamed}\n\nfailed: ${m}` : "failed: " + m); }
+      else if (name === "done") {
+        setMsg(reply, d.text || streamed || "(no reply)");
+        for (const p of d.changes || []) addChip(reply, p);
+        if (d.chat !== state.chatId) { state.chatId = d.chat; loadChats(d.chat); } else loadChats();
+      }
+    });
+  } catch (err) { setMsg(reply, "failed: " + err.message); }
+  state.busy = false; $("#chatSend").disabled = false;
 });
+$("#chatList").addEventListener("change", (e) => openChat(e.target.value));
+$("#newChat").onclick = () => { $("#chatList").value = ""; openChat(""); };
+$("#delChat").onclick = async () => {
+  if (!state.chatId || !confirm("Delete this conversation?")) return;
+  try { await api("DELETE", `/api/t/${state.tenant}/chats/${encodeURIComponent(state.chatId)}`); } catch (e) { alert(e.message); }
+  state.chatId = null; clearMsgs(); await loadChats("");
+};
 $("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#chatForm").requestSubmit(); } });
 
 (async () => { await refreshStats(); await loadTenants(); setInterval(refreshStats, 5000); })();

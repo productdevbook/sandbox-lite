@@ -26,11 +26,12 @@ struct Args {
     preview_secret: Option<String>,
     tenant_quota_mb: u64,
     cookie_samesite: http::SameSite,
+    chrome: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET and SANDBOX_LITE_TENANT_QUOTA_MB are read as defaults for those flags.",
+        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET, SANDBOX_LITE_TENANT_QUOTA_MB and SANDBOX_LITE_CHROME are read as defaults for those flags; SANDBOX_LITE_ANTHROPIC_BASE points the chat at another Messages API endpoint (default https://api.anthropic.com).",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -54,6 +55,7 @@ fn parse_args() -> Args {
             .filter(|v| !v.is_empty())
             .map_or(64, |v| v.parse().unwrap_or_else(|_| usage())),
         cookie_samesite: http::SameSite::Lax,
+        chrome: std::env::var("SANDBOX_LITE_CHROME").ok().filter(|v| !v.is_empty()).map(PathBuf::from),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -77,6 +79,7 @@ fn parse_args() -> Args {
             "--preview-secret" => args.preview_secret = Some(value()),
             "--tenant-quota-mb" => args.tenant_quota_mb = value().parse().unwrap_or_else(|_| usage()),
             "--cookie-samesite" => args.cookie_samesite = value().parse().unwrap_or_else(|_| usage()),
+            "--chrome" => args.chrome = Some(PathBuf::from(value())),
             "-h" | "--help" => usage(),
             _ => usage(),
         }
@@ -150,13 +153,19 @@ async fn main() {
             cache_bytes: args.cache_mb << 20,
             sass_timeout: Duration::from_millis(args.sass_timeout_ms),
         }),
+        chats: http::chats::Chats::default(),
         domain: args.domain.clone(),
         port,
         model: args.model.clone(),
         api_key,
+        api_base: std::env::var("SANDBOX_LITE_ANTHROPIC_BASE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
         api_token: args.api_token.clone(),
         preview_secret: args.preview_secret.clone(),
         cookie_samesite: args.cookie_samesite,
+        chrome: args.chrome.clone(),
         started: Instant::now(),
     });
     let listener = match tokio::net::TcpListener::bind(&args.listen).await {
@@ -167,10 +176,14 @@ async fn main() {
         }
     };
     eprintln!(
-        "sandbox-lite listening on http://{}\n  editor:  http://localhost:{port}/\n  preview: http://<tenant>.{}:{port}/\n  chat:    {}\n  auth:    api token {}, preview token {}",
+        "sandbox-lite listening on http://{}\n  editor:  http://localhost:{port}/\n  preview: http://<tenant>.{}:{port}/\n  chat:    {}, screenshot tool {}\n  auth:    api token {}, preview token {}",
         args.listen,
         args.domain,
         if state.api_key.is_some() { format!("enabled ({})", state.model) } else { "disabled (set ANTHROPIC_API_KEY)".to_string() },
+        match &state.chrome {
+            Some(path) => format!("via {}", path.display()),
+            None => "off (set --chrome)".to_string(),
+        },
         if state.api_token.is_some() { "required" } else { "off" },
         if state.preview_secret.is_some() { "required" } else { "off" }
     );

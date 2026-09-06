@@ -1,9 +1,12 @@
 pub mod ai;
+pub mod anthropic;
 pub mod api;
 pub mod archive;
+pub mod chats;
 pub mod preview;
 
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,13 +31,16 @@ use crate::transform::Engine;
 pub struct AppState {
     pub store: Store,
     pub engine: Engine,
+    pub chats: chats::Chats,
     pub domain: String,
     pub port: u16,
     pub model: String,
     pub api_key: Option<String>,
+    pub api_base: String,
     pub api_token: Option<String>,
     pub preview_secret: Option<String>,
     pub cookie_samesite: SameSite,
+    pub chrome: Option<PathBuf>,
     pub started: Instant,
 }
 
@@ -108,6 +114,8 @@ pub fn app(state: State) -> Router {
         .route("/api/t/{id}/events", get(api::events))
         .route("/api/t/{id}/check", get(api::check))
         .route("/api/t/{id}/chat", post(ai::chat))
+        .route("/api/t/{id}/chats", get(chats::list))
+        .route("/api/t/{id}/chats/{chat}", get(chats::get).delete(chats::remove))
         .layer(DefaultBodyLimit::max(64 << 20))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_token))
         .with_state(state.clone());
