@@ -1,0 +1,32 @@
+name: Feature
+description: Something the preview or the API should do and does not
+labels: [feature]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful feature request is an Astro idiom the preview cannot render, shown with a real project. README.md lists what is out of scope today.
+  - type: textarea
+    id: idiom
+    attributes:
+      label: What does not work
+      description: The Astro feature, API endpoint or flag, and what the preview or the daemon does instead (the error page, the diagnostic, the wrong output).
+    validations:
+      required: true
+  - type: textarea
+    id: project
+    attributes:
+      label: A project that shows it
+      description: A link to a theme or repository, or the smallest files that use the idiom. Include the output of `sandbox-lite check <dir>` if it says anything about it.
+      render: text
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Optional. Which part of the code (see ARCHITECTURE.md) and what it would do.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I checked the "What the preview does not do" section of README.md and this is not listed there as intentional
