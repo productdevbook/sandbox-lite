@@ -215,9 +215,17 @@ pub async fn write_file(AxState(st): AxState<State>, Path((id, path)): Path<(Str
         Err(r) => return r,
     };
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
-    match t.write(&path, body.to_vec()) {
-        Ok(version) => Json(json!({ "path": path, "version": version })).into_response(),
-        Err(e @ WriteError::Quota { .. }) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+    // Classifying an `.astro` write compiles it, so the whole write goes to a blocking thread.
+    let p2 = path.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        let kind = st.engine.update_kind(&t, &p2, &body);
+        t.write(&p2, body.to_vec(), kind)
+    })
+    .await;
+    match written {
+        Ok(Ok(version)) => Json(json!({ "path": path, "version": version })).into_response(),
+        Ok(Err(e @ WriteError::Quota { .. })) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

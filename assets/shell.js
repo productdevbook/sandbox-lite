@@ -126,6 +126,7 @@ function prettyJSON(body) {
   }
 }
 
+// data-sl-overlay marks a document that is not the rendered page, so live.js reloads rather than swapping CSS into it.
 function showResponse({ component, status, statusText, type, body }) {
   const text = /\bjson\b/i.test(type) ? prettyJSON(body) : body;
   replaceDocument(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(component)}</title>
@@ -133,7 +134,7 @@ function showResponse({ component, status, statusText, type, body }) {
 h1{color:#7aa2f7;font-size:18px;margin:0 0 4px}p{margin:0 0 12px;color:#565f89}pre{white-space:pre-wrap;background:#16161e;padding:12px;border-radius:6px;overflow:auto}
 b{color:#9ece6a}small{color:#565f89}</style>
 <script type="module" src="/__sl/live.js"></script></head>
-<body><h1>${status} ${esc(statusText || "")}</h1><p>${esc(component)} → <b>${esc(type || "no content-type")}</b></p><pre>${esc(text)}</pre>
+<body data-sl-overlay><h1>${status} ${esc(statusText || "")}</h1><p>${esc(component)} → <b>${esc(type || "no content-type")}</b></p><pre>${esc(text)}</pre>
 <small>sandbox-lite · tenant ${esc(sl.tenant)} · the page reloads itself when a file changes</small></body></html>`);
 }
 
@@ -147,7 +148,7 @@ function showError({ title, message, stack, diagnostics = [], routes }) {
 h1{color:#f7768e;font-size:18px;margin:0 0 12px}pre{white-space:pre-wrap;background:#16161e;padding:12px;border-radius:6px;overflow:auto}
 ul{padding-left:18px}b{color:#7aa2f7}i{color:#9ece6a}a{color:#7dcfff}small{color:#565f89}</style>
 <script type="module" src="/__sl/live.js"></script></head>
-<body><h1>${esc(title)}</h1><pre>${esc(message || "")}</pre>${diag ? `<ul>${diag}</ul>` : ""}${stack ? `<pre>${esc(stack)}</pre>` : ""}${list}
+<body data-sl-overlay><h1>${esc(title)}</h1><pre>${esc(message || "")}</pre>${diag ? `<ul>${diag}</ul>` : ""}${stack ? `<pre>${esc(stack)}</pre>` : ""}${list}
 <small>sandbox-lite · tenant ${esc(sl.tenant)} · the page reloads itself when a file changes</small></body></html>`);
 }
 

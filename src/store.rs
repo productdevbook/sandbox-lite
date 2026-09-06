@@ -119,6 +119,35 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1)
 }
 
+/// How the live-reload client should apply one change: swap a stylesheet, swap a component's
+/// `<style>` blocks, or reload. A client that renders stale JS is worse than one that reloads too
+/// often, so anything unproven is `Module`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpdateKind {
+    Css,
+    Style,
+    Module,
+}
+
+impl UpdateKind {
+    /// What the path alone proves. `.astro` needs its compiled JS compared against the last build
+    /// before it can claim `Style`, which is `Engine::update_kind`'s job.
+    pub fn from_path(path: &str) -> UpdateKind {
+        match path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+            Some("css" | "scss" | "sass") => UpdateKind::Css,
+            _ => UpdateKind::Module,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateKind::Css => "css",
+            UpdateKind::Style => "style",
+            UpdateKind::Module => "module",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum WriteError {
     Quota { quota: u64, after: u64 },
@@ -219,7 +248,10 @@ impl Tenant {
         out.into_iter().map(|(path, (size, modified))| Entry { path, size, modified }).collect()
     }
 
-    pub fn write(&self, path: &str, bytes: Vec<u8>) -> Result<u64, WriteError> {
+    /// The caller says how the preview should apply the write: `UpdateKind::from_path` is the whole
+    /// answer for a stylesheet, and proving `Style` takes a compile — `Engine::update_kind` — which
+    /// is why it does not happen here.
+    pub fn write(&self, path: &str, bytes: Vec<u8>, kind: UpdateKind) -> Result<u64, WriteError> {
         // held across the disk write so a concurrent write cannot slip past the quota check
         let mut overlay = self.overlay.write().unwrap();
         let replaced = overlay.get(path).and_then(|d| d.as_ref()).map_or(0, |d| d.size());
@@ -233,7 +265,7 @@ impl Tenant {
         if was_tombstone {
             self.persist_tombstones()?;
         }
-        Ok(self.bump("update", path))
+        Ok(self.bump("update", path, kind))
     }
 
     /// Applies a whole import: every removal and every file land under one lock, one version bump
@@ -274,7 +306,7 @@ impl Tenant {
         *overlay = next;
         drop(overlay);
         self.persist_tombstones()?;
-        Ok(Applied { version: self.bump("update", ""), written, deleted: removed })
+        Ok(Applied { version: self.bump("update", "", UpdateKind::Module), written, deleted: removed })
     }
 
     /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
@@ -309,7 +341,7 @@ impl Tenant {
         }
         self.forget_on_disk(path)?;
         self.persist_tombstones()?;
-        Ok(self.bump("delete", path))
+        Ok(self.bump("delete", path, UpdateKind::Module))
     }
 
     fn persist_tombstones(&self) -> io::Result<()> {
@@ -319,7 +351,7 @@ impl Tenant {
         std::fs::write(dir.join("deleted.json"), serde_json::to_vec(&list)?)
     }
 
-    fn bump(&self, kind: &str, path: &str) -> u64 {
+    fn bump(&self, event: &str, path: &str, kind: UpdateKind) -> u64 {
         let mut v = self.version.load(Ordering::Relaxed);
         loop {
             let next = now_millis().max(v + 1);
@@ -331,8 +363,11 @@ impl Tenant {
                 Err(cur) => v = cur,
             }
         }
-        let _ =
-            self.events.send(format!(r#"{{"type":"{kind}","path":{},"version":{v}}}"#, serde_json::to_string(path).unwrap_or_default()));
+        let _ = self.events.send(format!(
+            r#"{{"type":"{event}","path":{},"kind":"{}","version":{v}}}"#,
+            serde_json::to_string(path).unwrap_or_default(),
+            kind.as_str()
+        ));
         v
     }
 
@@ -484,15 +519,15 @@ mod tests {
     #[test]
     fn quota_bounds_the_overlay_after_the_write() {
         let t = tenant(10, None);
-        t.write("a", vec![0; 6]).unwrap();
-        let err = t.write("b", vec![0; 5]).unwrap_err();
+        t.write("a", vec![0; 6], UpdateKind::Module).unwrap();
+        let err = t.write("b", vec![0; 5], UpdateKind::Module).unwrap_err();
         assert!(matches!(err, WriteError::Quota { quota: 10, after: 11 }), "{err}");
         assert!(err.to_string().contains("quota"));
         assert_eq!(t.overlay_stats(), (1, 6));
-        t.write("a", vec![0; 10]).unwrap();
-        assert!(t.write("a", vec![0; 11]).is_err());
+        t.write("a", vec![0; 10], UpdateKind::Module).unwrap();
+        assert!(t.write("a", vec![0; 11], UpdateKind::Module).is_err());
         t.delete("a").unwrap();
-        t.write("b", vec![0; 10]).unwrap();
+        t.write("b", vec![0; 10], UpdateKind::Module).unwrap();
         assert_eq!(t.overlay_stats(), (1, 10));
     }
 
@@ -508,12 +543,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let big = INLINE_LIMIT as usize + 1;
         let t = tenant(2 * big as u64 - 1, Some(dir.clone()));
-        t.write("big", vec![0; big]).unwrap();
+        t.write("big", vec![0; big], UpdateKind::Module).unwrap();
         assert!(matches!(t.data("big"), Some(FileData::Disk(_, n)) if n == big as u64));
-        assert!(matches!(t.write("big2", vec![0; big]), Err(WriteError::Quota { .. })));
+        assert!(matches!(t.write("big2", vec![0; big], UpdateKind::Module), Err(WriteError::Quota { .. })));
         assert!(!dir.join("files").join("big2").exists());
         assert_eq!(t.overlay_stats(), (1, big as u64));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_stylesheet_extension_swaps_without_the_compiler() {
+        for path in ["src/styles/tokens.css", "a.scss", "a.sass", "SRC/A.CSS"] {
+            assert_eq!(UpdateKind::from_path(path), UpdateKind::Css, "{path}");
+        }
+        for path in ["src/pages/index.astro", "src/lib/x.ts", "package.json", "src/styles", "a.css/b"] {
+            assert_eq!(UpdateKind::from_path(path), UpdateKind::Module, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_update_event_carries_the_kind() {
+        let t = tenant(u64::MAX, None);
+        let mut events = t.events.subscribe();
+        t.write("src/styles/a.css", b"a{}".to_vec(), UpdateKind::from_path("src/styles/a.css")).unwrap();
+        t.write("src/x.astro", b"<p/>".to_vec(), UpdateKind::Style).unwrap();
+        t.delete("src/styles/a.css").unwrap();
+        let seen: Vec<String> = (0..3).map(|_| events.try_recv().unwrap()).collect();
+        assert!(seen[0].contains(r#""type":"update","path":"src/styles/a.css","kind":"css""#), "{}", seen[0]);
+        assert!(seen[1].contains(r#""kind":"style""#), "{}", seen[1]);
+        assert!(seen[2].contains(r#""type":"delete","path":"src/styles/a.css","kind":"module""#), "{}", seen[2]);
     }
 
     #[test]
