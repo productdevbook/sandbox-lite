@@ -23,6 +23,13 @@ A daemon is not a stateless front end over the data directory. Each one holds:
 - **An SSE channel per tenant** (`tokio::sync::broadcast`, 64 slots) that only
   that daemon's own writes publish to.
 
+Conversations are the exception, and the only shared state here. With a
+`--data-dir`, `Chats` holds nothing: every load, save, list and delete goes
+straight to `<data-dir>/<id>/chats/*.json` (`src/http/chats.rs`), so a chat
+started on one node is readable on the other as soon as that node has the
+tenant. Two nodes saving the same chat id is last-writer-wins like any other
+file. With `--no-persist` they are per-node memory and are not shared at all.
+
 So with two daemons, A and B, sharing `--data-dir`:
 
 | | What happens |
@@ -34,6 +41,8 @@ So with two daemons, A and B, sharing `--data-dir`:
 | A writes again after B has restored | B does not see it. The restore happens once, on the miss. |
 | `DELETE /api/tenants/acme` on A | The directory goes; B keeps serving the tenant it already holds in memory. |
 | `POST /api/bases/theme/reload` on A | Only A re-reads the base. B keeps the copy it loaded. |
+| `POST /api/t/acme/chat` on A, then `GET /api/t/acme/chats` on B | B lists it: conversations are read from the shared data directory on every call, not cached. |
+| `POST /api/tenants/acme/import` on A | A's overlay and the data directory change; B's overlay does not, exactly as for a single write. |
 | `/api/stats`, `/metrics` on B | B's own tenants, cache and subscribers. Neither number is a cluster total. |
 
 The version being per node also means a browser that moves from A to B
@@ -89,6 +98,10 @@ What still bites:
 - **`POST /api/bases` and `POST /api/bases/{name}/reload` are per node.** Call
   them on every node, or give every node `--watch-bases N` over a shared base
   directory.
+- **`--chats-per-tenant` is enforced per call, against the shared directory.**
+  Two nodes saving conversations for one tenant at the same time can each
+  evict what the other just wrote; the cap holds, which conversation survives
+  is a race.
 
 ## Configuration 2: one node per base
 
@@ -119,4 +132,5 @@ Not implemented, listed so nobody has to rediscover it:
    follows.
 
 Until then: route stickily, keep one tenant on one node, and treat
-`--data-dir` as durability rather than as shared state.
+`--data-dir` as durability rather than as shared state — conversations being
+the one thing it does share.
