@@ -40,8 +40,9 @@ and parses JSON/YAML; the resulting JavaScript runs in the visitor's browser on
 the tenant origin, using Astro's own runtime bundled as `/__sl/astro.js`.
 
 Whoever can call `/api/*` owns every tenant: create, delete, read and write any
-file, drive the chat endpoint. There are no users, roles or per-tenant
-credentials on the API side.
+file, drive the chat endpoint. They also decide what the daemon reads off the
+host as a base project, bounded only by `--bases` (below). There are no users,
+roles or per-tenant credentials on the API side.
 
 ## What the daemon enforces
 
@@ -54,9 +55,22 @@ credentials on the API side.
   cannot leave it.
 - **Tenant ids** are validated by `valid_id` (same rule as the host label) and
   are used as directory names under `--data-dir`.
-- **Base projects** are read once at startup. `node_modules`, `.git`, `dist`,
-  `.astro`, `.vercel`, `.netlify` and `.output` are skipped, and so is anything
-  that is not a regular file or directory (symbolic links are not followed).
+- **Base projects** are read at startup, and again on
+  `POST /api/bases/{name}/reload` or a `--watch-bases` tick. `node_modules`,
+  `.git`, `dist`, `.astro`, `.vercel`, `.netlify` and `.output` are skipped,
+  and so is anything that is not a regular file or directory (symbolic links
+  are not followed) — by the reload and the poll exactly as by the first read,
+  since all three walk the same function.
+- **Adding a base at runtime** (`POST /api/bases` with `{"name", "path"}`) is
+  an operator-only surface behind `--api-token`, and nothing else gates it.
+  The name must pass `valid_id`. The path is canonicalized, must be a
+  directory, and must resolve inside `--bases` when that flag is set — which
+  refuses a symbolic link out of it, since the link is resolved before the
+  check. **Without `--bases` there is no containment at all**: any directory
+  the daemon's user can read becomes a base, and every file in it is then
+  served to whoever can open a preview on a tenant created from it (see
+  "Tenant files are public to anyone who can open the preview"). Set `--bases`
+  on any daemon whose API is reachable by anything but your own backend.
 - **Request bodies** on the editor/API router are capped at 64 MiB
   (`DefaultBodyLimit`). No tenant-host handler reads a request body.
 - **Compiled source** is bounded three ways before it reaches oxc,
@@ -195,6 +209,9 @@ that router answers `401` unless the request carries
 - It is the only thing gating `POST /api/tenants/{id}/import`, which writes a
   whole file tree into a tenant in one request, and
   `GET /api/t/{id}/export`, which returns one.
+- It is the only thing gating `POST /api/bases`, which reads a directory of
+  the host into memory, and `POST /api/bases/{name}/reload`, which re-reads
+  one and makes every tenant on it reload.
 - It does nothing for tenant hosts.
 
 ### `--preview-secret S` (`require_preview_token`, `src/http/mod.rs`)
@@ -321,7 +338,8 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 1. Previews on their own registrable domain; wildcard DNS for it; `--domain`
    set to that name.
 2. Editor and `/api/*` reachable only from your backend, on a hostname the
-   proxy does not expose; `--api-token` set as well.
+   proxy does not expose; `--api-token` set as well; `--bases` set, so a base
+   added over the API cannot come from anywhere else on the host.
 3. `--preview-secret` set; links built from `preview_token` with your scheme
    and host; the TLS proxy sends `x-forwarded-proto: https` so the cookie is
    `Secure`.

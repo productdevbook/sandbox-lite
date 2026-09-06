@@ -14,7 +14,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use super::{AppState, State, mime};
 use crate::metrics::{BaseSize, KINDS, STATUSES, Snapshot, render};
-use crate::store::{Tenant, WriteError, clean_path};
+use crate::store::{Base, Tenant, WriteError, clean_path, valid_id};
 use crate::transform::{Kind, is_source};
 
 pub async fn editor() -> Html<&'static str> {
@@ -147,17 +147,62 @@ pub async fn metrics(AxState(st): AxState<State>) -> Response {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
+fn base_json(b: &Base) -> Value {
+    json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes(), "root": b.root })
+}
+
 pub async fn bases(AxState(st): AxState<State>) -> Json<Value> {
-    Json(Value::Array(
-        st.store.bases().iter().map(|b| json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes(), "root": b.root })).collect(),
-    ))
+    Json(Value::Array(st.store.bases().iter().map(|b| base_json(b)).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct AddBaseReq {
+    name: String,
+    path: String,
+}
+
+/// Adds a base project from a directory on the host. Operator-only: with `--bases` set the path
+/// must resolve inside it, and without it any readable directory will do — see SECURITY.md.
+pub async fn add_base(AxState(st): AxState<State>, Json(req): Json<AddBaseReq>) -> Response {
+    if !valid_id(&req.name) {
+        return err(StatusCode::BAD_REQUEST, "base name must be lowercase letters, digits and dashes");
+    }
+    if st.store.base(&req.name).is_some() {
+        return err(StatusCode::CONFLICT, format!("base '{}' already exists; reload it instead", req.name));
+    }
+    let root = match st.store.base_root(std::path::Path::new(&req.path)) {
+        Ok(root) => root,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let name = req.name.clone();
+    let loaded = tokio::task::spawn_blocking(move || Base::load(&name, &root)).await;
+    match loaded {
+        Ok(Ok(base)) => (StatusCode::CREATED, Json(base_json(&st.store.add_base(base)))).into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, format!("cannot load base '{}': {e}", req.name)),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Re-reads one base and re-points every tenant on it, each of which gets an `update` event.
+pub async fn reload_base(AxState(st): AxState<State>, Path(name): Path<String>) -> Response {
+    let (st2, n) = (st.clone(), name.clone());
+    match tokio::task::spawn_blocking(move || st2.store.reload_base(&n)).await {
+        Ok(Ok(Some((base, tenants)))) => {
+            let mut body = base_json(&base);
+            body["tenants"] = json!(tenants);
+            Json(body).into_response()
+        }
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, format!("unknown base '{name}'")),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot reload base '{name}': {e}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 fn tenant_json(st: &AppState, t: &Tenant) -> Value {
     let (files, bytes) = t.overlay_stats();
     json!({
         "id": t.id,
-        "base": t.base.name,
+        "base": t.base().name,
         "version": t.version(),
         "overlay_files": files,
         "overlay_bytes": bytes,

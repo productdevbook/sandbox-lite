@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
+use xxhash_rust::xxh3::xxh3_64;
 
 const INLINE_LIMIT: u64 = 256 * 1024;
 const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", ".astro", ".vercel", ".netlify", ".output"];
@@ -32,8 +33,7 @@ impl FileData {
         }
     }
 
-    fn from_disk(path: &Path) -> io::Result<FileData> {
-        let len = std::fs::metadata(path)?.len();
+    fn from_file(path: &Path, len: u64) -> io::Result<FileData> {
         if len <= INLINE_LIMIT { Ok(FileData::Mem(std::fs::read(path)?.into())) } else { Ok(FileData::Disk(path.to_path_buf(), len)) }
     }
 }
@@ -41,6 +41,8 @@ impl FileData {
 pub struct Base {
     pub name: String,
     pub root: PathBuf,
+    /// What `stamp(root)` returned for the tree this base was read from; a poll compares it.
+    pub stamp: u64,
     files: BTreeMap<String, FileData>,
 }
 
@@ -48,8 +50,13 @@ impl Base {
     pub fn load(name: &str, root: &Path) -> io::Result<Base> {
         let root = root.canonicalize()?;
         let mut files = BTreeMap::new();
-        walk(&root, &root, &mut files, true)?;
-        Ok(Base { name: name.to_string(), root, files })
+        let mut stamps = BTreeMap::new();
+        walk(&root, &root, true, &mut |rel: String, path: &Path, md: &std::fs::Metadata| {
+            stamps.insert(rel.clone(), file_stamp(md));
+            files.insert(rel, FileData::from_file(path, md.len())?);
+            Ok(())
+        })?;
+        Ok(Base { name: name.to_string(), root, stamp: hash_stamps(&stamps), files })
     }
 
     pub fn get(&self, path: &str) -> Option<&FileData> {
@@ -65,24 +72,54 @@ impl Base {
     }
 }
 
+type Visit<'a> = &'a mut dyn FnMut(String, &Path, &std::fs::Metadata) -> io::Result<()>;
+
 /// Base projects skip build output and dependencies; a tenant's own overlay must come back whole.
-fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, FileData>, skip_build_dirs: bool) -> io::Result<()> {
+/// `DirEntry::metadata` does not follow symbolic links, so a link is neither descended nor taken.
+fn walk(root: &Path, dir: &Path, skip_build_dirs: bool, visit: Visit<'_>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
+        let md = entry.metadata()?;
+        if md.is_dir() {
             if skip_build_dirs && SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            walk(root, &path, out, skip_build_dirs)?;
-        } else if ft.is_file() {
+            walk(root, &path, skip_build_dirs, &mut *visit)?;
+        } else if md.is_file() {
             let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-            out.insert(rel, FileData::from_disk(&path)?);
+            visit(rel, &path, &md)?;
         }
     }
     Ok(())
+}
+
+fn file_stamp(md: &std::fs::Metadata) -> (u128, u64) {
+    let mtime = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    (mtime, md.len())
+}
+
+fn hash_stamps(stamps: &BTreeMap<String, (u128, u64)>) -> u64 {
+    let mut buf = Vec::with_capacity(stamps.len() * 32);
+    for (path, (mtime, len)) in stamps {
+        buf.extend_from_slice(path.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&mtime.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+    }
+    xxh3_64(&buf)
+}
+
+/// The name, mtime and size of every file `Base::load` would take, hashed in path order. Two walks
+/// of an unchanged tree agree; a rewrite that keeps both the size and the mtime does not show up.
+pub fn stamp(root: &Path) -> io::Result<u64> {
+    let mut stamps = BTreeMap::new();
+    walk(root, root, true, &mut |rel: String, _: &Path, md: &std::fs::Metadata| {
+        stamps.insert(rel, file_stamp(md));
+        Ok(())
+    })?;
+    Ok(hash_stamps(&stamps))
 }
 
 pub fn clean_path(raw: &str) -> Option<String> {
@@ -175,7 +212,7 @@ impl From<io::Error> for WriteError {
 
 pub struct Tenant {
     pub id: String,
-    pub base: Arc<Base>,
+    base: RwLock<Arc<Base>>,
     overlay: RwLock<BTreeMap<String, Option<FileData>>>,
     version: AtomicU64,
     pub events: broadcast::Sender<String>,
@@ -199,7 +236,28 @@ pub struct Applied {
 impl Tenant {
     fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>, quota: u64) -> Tenant {
         let (events, _) = broadcast::channel(64);
-        Tenant { id, base, overlay: RwLock::new(BTreeMap::new()), version: AtomicU64::new(now_millis()), events, dir, quota }
+        Tenant {
+            id,
+            base: RwLock::new(base),
+            overlay: RwLock::new(BTreeMap::new()),
+            version: AtomicU64::new(now_millis()),
+            events,
+            dir,
+            quota,
+        }
+    }
+
+    pub fn base(&self) -> Arc<Base> {
+        self.base.read().unwrap().clone()
+    }
+
+    /// Points the tenant at a freshly loaded copy of its base and tells its previews to reload: the
+    /// overlay is untouched, so an edited file still wins over the new base copy.
+    pub fn set_base(&self, base: Arc<Base>) -> u64 {
+        *self.base.write().unwrap() = base;
+        // Every file in the tenant may have changed underneath, so the preview reloads rather
+        // than swapping a stylesheet.
+        self.bump("update", "", UpdateKind::Module)
     }
 
     pub fn version(&self) -> u64 {
@@ -216,7 +274,7 @@ impl Tenant {
         match overlay.get(path) {
             Some(Some(d)) => Some(d.clone()),
             Some(None) => None,
-            None => self.base.get(path).cloned(),
+            None => self.base.read().unwrap().get(path).cloned(),
         }
     }
 
@@ -234,7 +292,8 @@ impl Tenant {
 
     pub fn list(&self) -> Vec<Entry> {
         let overlay = self.overlay.read().unwrap();
-        let mut out: BTreeMap<String, (u64, bool)> = self.base.files.iter().map(|(p, d)| (p.clone(), (d.size(), false))).collect();
+        let base = self.base.read().unwrap();
+        let mut out: BTreeMap<String, (u64, bool)> = base.files.iter().map(|(p, d)| (p.clone(), (d.size(), false))).collect();
         for (p, d) in overlay.iter() {
             match d {
                 Some(d) => {
@@ -280,7 +339,7 @@ impl Tenant {
         let mut next: BTreeMap<String, Option<FileData>> =
             overlay.iter().filter(|(p, d)| keep(p, d)).map(|(p, d)| (p.clone(), d.clone())).collect();
         for path in deleted.iter().filter(|p| !incoming.contains(p.as_str())) {
-            match self.base.get(path) {
+            match self.base.read().unwrap().get(path) {
                 Some(_) => next.insert(path.clone(), None),
                 None => next.remove(path),
             };
@@ -333,7 +392,7 @@ impl Tenant {
     pub fn delete(&self, path: &str) -> io::Result<u64> {
         {
             let mut overlay = self.overlay.write().unwrap();
-            if self.base.get(path).is_some() {
+            if self.base.read().unwrap().get(path).is_some() {
                 overlay.insert(path.to_string(), None);
             } else {
                 overlay.remove(path);
@@ -389,7 +448,10 @@ impl Tenant {
         let files = dir.join("files");
         let mut loaded = BTreeMap::new();
         if files.is_dir() {
-            walk(&files, &files, &mut loaded, false)?;
+            walk(&files, &files, false, &mut |rel: String, path: &Path, md: &std::fs::Metadata| {
+                loaded.insert(rel, FileData::from_file(path, md.len())?);
+                Ok(())
+            })?;
         }
         let mut overlay = self.overlay.write().unwrap();
         for (p, d) in loaded {
@@ -413,16 +475,77 @@ pub struct Store {
     bases: RwLock<HashMap<String, Arc<Base>>>,
     tenants: RwLock<HashMap<String, Arc<Tenant>>>,
     data_dir: Option<PathBuf>,
+    bases_dir: Option<PathBuf>,
     tenant_quota: u64,
 }
 
 impl Store {
     pub fn new(data_dir: Option<PathBuf>, tenant_quota: u64) -> Store {
-        Store { bases: RwLock::new(HashMap::new()), tenants: RwLock::new(HashMap::new()), data_dir, tenant_quota }
+        Store { bases: RwLock::new(HashMap::new()), tenants: RwLock::new(HashMap::new()), data_dir, bases_dir: None, tenant_quota }
     }
 
-    pub fn add_base(&self, base: Base) {
-        self.bases.write().unwrap().insert(base.name.clone(), Arc::new(base));
+    /// `--bases`: the directory a base added through the API must live under.
+    pub fn with_bases_dir(mut self, dir: Option<PathBuf>) -> Store {
+        self.bases_dir = dir;
+        self
+    }
+
+    pub fn add_base(&self, base: Base) -> Arc<Base> {
+        let base = Arc::new(base);
+        self.bases.write().unwrap().insert(base.name.clone(), base.clone());
+        base
+    }
+
+    /// Where `POST /api/bases` may read a project from. With `--bases` set the path must resolve
+    /// inside it — canonicalized first, so a symbolic link out of the directory is refused too.
+    /// Without the flag any readable directory on the host is allowed, which is why the route is
+    /// operator-only (see SECURITY.md).
+    pub fn base_root(&self, path: &Path) -> Result<PathBuf, String> {
+        let root = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
+        if !root.is_dir() {
+            return Err(format!("{} is not a directory", root.display()));
+        }
+        if let Some(dir) = &self.bases_dir {
+            let dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+            if !root.starts_with(&dir) {
+                return Err(format!("path must be inside --bases ({})", dir.display()));
+            }
+        }
+        Ok(root)
+    }
+
+    /// Re-reads a base from its own root and points every tenant on it at the result. Each of those
+    /// tenants gets a version bump and one `update` event, so open previews reload; the transform
+    /// cache needs nothing, being keyed by content. `None` means there is no such base.
+    pub fn reload_base(&self, name: &str) -> io::Result<Option<(Arc<Base>, Vec<String>)>> {
+        let Some(old) = self.base(name) else { return Ok(None) };
+        let fresh = self.add_base(Base::load(name, &old.root)?);
+        let mut repointed = Vec::new();
+        for t in self.tenants() {
+            if t.base().name == name {
+                t.set_base(fresh.clone());
+                repointed.push(t.id.clone());
+            }
+        }
+        Ok(Some((fresh, repointed)))
+    }
+
+    /// One walk per base, comparing `stamp` against what the loaded copy was read from; the names
+    /// reloaded come back. Reading a root fails loudly and leaves the loaded copy in place — a base
+    /// directory being replaced wholesale should not empty every tenant's site.
+    pub fn reload_changed_bases(&self) -> Vec<String> {
+        let mut reloaded = Vec::new();
+        for base in self.bases() {
+            match stamp(&base.root) {
+                Ok(s) if s == base.stamp => continue,
+                Ok(_) => match self.reload_base(&base.name) {
+                    Ok(_) => reloaded.push(base.name.clone()),
+                    Err(e) => eprintln!("watch: cannot reload base {}: {e}", base.name),
+                },
+                Err(e) => eprintln!("watch: cannot read base {} at {}: {e}", base.name, base.root.display()),
+            }
+        }
+        reloaded
     }
 
     pub fn base(&self, name: &str) -> Option<Arc<Base>> {
@@ -440,7 +563,9 @@ impl Store {
             return Err("tenant id must be lowercase letters, digits and dashes".into());
         }
         let base = self.base(base_name).ok_or_else(|| format!("unknown base '{base_name}'"))?;
-        if self.tenants.read().unwrap().contains_key(id) {
+        // `tenant` rather than the map: a tenant another node created under the same --data-dir
+        // exists, and creating over its directory would hide the files already in it
+        if self.tenant(id).is_some() {
             return Err(format!("tenant '{id}' already exists"));
         }
         let dir = self.data_dir.as_ref().map(|d| d.join(id));
@@ -454,8 +579,33 @@ impl Store {
         Ok(tenant)
     }
 
+    /// A miss falls back to `--data-dir`: with two daemons sharing one, a tenant created on the
+    /// other node is not in this node's map until something asks for it. What this does not do is
+    /// refresh a tenant already in memory — it never sees the other node's later writes
+    /// (`docs/multi-node.md`).
     pub fn tenant(&self, id: &str) -> Option<Arc<Tenant>> {
-        self.tenants.read().unwrap().get(id).cloned()
+        if let Some(t) = self.tenants.read().unwrap().get(id).cloned() {
+            return Some(t);
+        }
+        let restored = Arc::new(self.read_tenant(id).ok()?);
+        Some(self.tenants.write().unwrap().entry(id.to_string()).or_insert(restored).clone())
+    }
+
+    /// Builds a tenant from `<data-dir>/<id>` without registering it. Every reason it cannot —
+    /// no `--data-dir`, no such directory, a base this node has not loaded — is an `Err`.
+    fn read_tenant(&self, id: &str) -> Result<Tenant, String> {
+        let data_dir = self.data_dir.as_ref().ok_or("no --data-dir")?;
+        if !valid_id(id) {
+            return Err(format!("'{id}' is not a valid tenant id"));
+        }
+        let dir = data_dir.join(id);
+        let meta = std::fs::read(dir.join("tenant.json")).map_err(|e| format!("tenant.json: {e}"))?;
+        let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap_or_default();
+        let base_name = meta.get("base").and_then(|b| b.as_str()).unwrap_or("");
+        let base = self.base(base_name).ok_or_else(|| format!("base '{base_name}' is not loaded"))?;
+        let tenant = Tenant::new(id.to_string(), base, Some(dir.clone()), self.tenant_quota);
+        tenant.restore_overlay(&dir).map_err(|e| e.to_string())?;
+        Ok(tenant)
     }
 
     pub fn tenants(&self) -> Vec<Arc<Tenant>> {
@@ -485,23 +635,17 @@ impl Store {
         let mut n = 0;
         for entry in std::fs::read_dir(data_dir)? {
             let entry = entry?;
-            let dir = entry.path();
-            let Ok(meta) = std::fs::read(dir.join("tenant.json")) else { continue };
-            let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap_or_default();
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if !valid_id(&id) {
-                eprintln!("data dir entry '{id}' is not a valid tenant id, skipping");
+            if !entry.path().join("tenant.json").is_file() {
                 continue;
             }
-            let base_name = meta.get("base").and_then(|b| b.as_str()).unwrap_or("");
-            let Some(base) = self.base(base_name) else {
-                eprintln!("tenant {id}: base '{base_name}' is not loaded, skipping");
-                continue;
-            };
-            let tenant = Tenant::new(id.clone(), base, Some(dir.clone()), self.tenant_quota);
-            tenant.restore_overlay(&dir)?;
-            self.tenants.write().unwrap().insert(id, Arc::new(tenant));
-            n += 1;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            match self.read_tenant(&id) {
+                Ok(tenant) => {
+                    self.tenants.write().unwrap().insert(id, Arc::new(tenant));
+                    n += 1;
+                }
+                Err(e) => eprintln!("data dir entry '{id}': {e}, skipping"),
+            }
         }
         Ok(n)
     }
@@ -512,8 +656,121 @@ mod tests {
     use super::*;
 
     fn tenant(quota: u64, dir: Option<PathBuf>) -> Tenant {
-        let base = Base { name: "b".into(), root: PathBuf::from("."), files: BTreeMap::new() };
+        let base = Base { name: "b".into(), root: PathBuf::from("."), stamp: 0, files: BTreeMap::new() };
         Tenant::new("t".into(), Arc::new(base), dir, quota)
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sandbox-lite-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed(path: PathBuf, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    const PAGE: &str = "src/pages/index.astro";
+
+    #[test]
+    fn reload_re_points_every_tenant_on_the_base() {
+        let root = temp("reload");
+        seed(root.join("theme").join(PAGE), "<h1>one</h1>\n");
+        let store = Store::new(None, 1 << 20);
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        store.add_base(Base::load("other", &root.join("theme")).unwrap());
+        let t = store.create_tenant("acme", "theme").unwrap();
+        let untouched = store.create_tenant("bakery", "other").unwrap();
+        t.write("src/pages/mine.astro", b"<h1>mine</h1>".to_vec(), UpdateKind::Module).unwrap();
+        let (version, other_version) = (t.version(), untouched.version());
+        let mut events = t.events.subscribe();
+
+        seed(root.join("theme").join(PAGE), "<h1>two</h1>\n");
+        let (base, repointed) = store.reload_base("theme").unwrap().unwrap();
+
+        assert_eq!(repointed, vec!["acme".to_string()], "only tenants on that base are re-pointed");
+        assert_eq!(t.read_text(PAGE).as_deref(), Some("<h1>two</h1>\n"));
+        assert_eq!(t.base().name, base.name);
+        assert!(Arc::ptr_eq(&t.base(), &base), "the tenant holds the fresh base, not a copy of the old one");
+        assert_eq!(t.read_text("src/pages/mine.astro").as_deref(), Some("<h1>mine</h1>"), "the overlay survives a reload");
+        assert!(t.version() > version, "an open preview reloads on the new version");
+        assert_eq!(untouched.version(), other_version, "a tenant on another base is not disturbed");
+        let event = events.try_recv().unwrap();
+        assert!(event.contains(r#""type":"update""#), "{event}");
+        assert!(events.try_recv().is_err(), "one event per tenant per reload");
+        assert!(store.reload_base("nope").unwrap().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_watcher_notices_a_changed_file_and_ignores_skipped_directories() {
+        let root = temp("watch");
+        seed(root.join("theme").join(PAGE), "<h1>one</h1>\n");
+        let store = Store::new(None, 1 << 20);
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        let t = store.create_tenant("acme", "theme").unwrap();
+        assert!(store.reload_changed_bases().is_empty(), "an untouched tree is not reloaded");
+
+        seed(root.join("theme/node_modules/pkg/index.js"), "export const x = 1;\n");
+        seed(root.join("theme/dist/index.html"), "<html></html>\n");
+        assert!(store.reload_changed_bases().is_empty(), "what Base::load skips, the poll skips");
+
+        seed(root.join("theme").join(PAGE), "<h1>two, and longer</h1>\n");
+        assert_eq!(store.reload_changed_bases(), vec!["theme".to_string()]);
+        assert_eq!(t.read_text(PAGE).as_deref(), Some("<h1>two, and longer</h1>\n"));
+        assert!(store.reload_changed_bases().is_empty(), "the reloaded base is the new stamp");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two `Store`s over one `--data-dir` are the two daemons of `docs/multi-node.md`.
+    #[test]
+    fn a_tenant_created_on_one_node_is_served_by_the_other() {
+        let root = temp("multi-node");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let base = || Base::load("theme", &root.join("theme")).unwrap();
+        let (a, b) = (Store::new(Some(root.join("data")), 1 << 20), Store::new(Some(root.join("data")), 1 << 20));
+        a.add_base(base());
+        b.add_base(base());
+        let ta = a.create_tenant("acme", "theme").unwrap();
+        ta.write(PAGE, b"<h1>from a</h1>".to_vec(), UpdateKind::Module).unwrap();
+
+        assert!(b.tenants().is_empty(), "node b learned nothing from node a's write");
+        let tb = b.tenant("acme").unwrap();
+        assert_eq!(tb.read_text(PAGE).as_deref(), Some("<h1>from a</h1>"), "the miss restored the tenant from the data dir");
+        assert_eq!(b.tenants().len(), 1);
+        assert!(Arc::ptr_eq(&tb, &b.tenant("acme").unwrap()), "a restored tenant is registered, not rebuilt per request");
+        assert!(b.tenant("nobody").is_none());
+        assert!(b.create_tenant("acme", "theme").is_err(), "creating over another node's tenant would hide its files");
+
+        // the gap docs/multi-node.md names: node b holds the tenant now, and nothing tells it that
+        // node a wrote again. Sticky routing per tenant is what keeps this from being reachable.
+        ta.write(PAGE, b"<h1>from a, later</h1>".to_vec(), UpdateKind::Module).unwrap();
+        assert_eq!(tb.read_text(PAGE).as_deref(), Some("<h1>from a</h1>"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_base_added_at_runtime_stays_inside_bases() {
+        let root = temp("base-root");
+        std::fs::create_dir_all(root.join("bases/theme")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        seed(root.join("bases/notadir"), "x");
+        let store = Store::new(None, 0).with_bases_dir(Some(root.join("bases")));
+
+        assert_eq!(store.base_root(&root.join("bases/theme")).unwrap(), root.join("bases/theme").canonicalize().unwrap());
+        assert!(store.base_root(&root.join("elsewhere")).is_err(), "outside --bases");
+        assert!(store.base_root(&root.join("bases/../elsewhere")).is_err(), "a traversal out of --bases");
+        assert!(store.base_root(&root.join("bases/missing")).is_err(), "no such directory");
+        assert!(store.base_root(&root.join("bases/notadir")).is_err(), "a file is not a base");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("elsewhere"), root.join("bases/link")).unwrap();
+            assert!(store.base_root(&root.join("bases/link")).is_err(), "a symlink out of --bases is resolved and refused");
+        }
+        assert!(Store::new(None, 0).base_root(&root.join("elsewhere")).is_ok(), "without --bases any directory is allowed");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
