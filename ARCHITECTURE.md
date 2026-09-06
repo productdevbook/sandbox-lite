@@ -141,7 +141,7 @@ What `compile` does per kind and extension:
 | `.ts` `.tsx` `.jsx` `.mts` | oxc transform (`src/transform/js.rs`): TypeScript stripped, JSX compiled |
 | `.js` `.mjs` | served as-is when it parses as ESM, otherwise transformed |
 | `.css` | a module that registers the text in `globalThis.__sl_css`, with relative `url()` and `@import` targets rewritten to `/__sl/raw/…` (`src/transform/css.rs`) |
-| `.scss` `.sass` | grass over the tenant's file tree (`src/transform/scss.rs`), then as `.css` |
+| `.scss` `.sass` | grass over a snapshot of the tenant's file tree, on its own thread with a deadline (`src/transform/scss.rs`), then as `.css` |
 | `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`) |
 | `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
@@ -231,6 +231,33 @@ partials it `@use`s, and those are other files, the fingerprint is part of the
 cache key of every Sass-consuming module: editing any Sass file changes the
 key of all of them. Coarse, and correct.
 
+### Sass limits
+
+grass compiles synchronously and offers neither cancellation nor a resource
+budget: `@while true {}` never returns. So every compile runs on a thread of
+its own with a deadline (`--sass-timeout-ms`, default 5000) and the request
+gives up on it rather than joining it. The compiler sees a `Snapshot`: the
+tenant's file list with `FileData` handles, which copies no file content but
+makes the file set `'static`, so the thread may outlive the request that
+started it — and it fixes the file set for the whole compile, so nothing the
+tenant writes mid-compile can change what an `@use` resolves to.
+
+Sizes are capped on the way in and on the way out: 1 MiB per file, 4 MiB read
+per compilation, 4 MiB of CSS produced. A file over a cap is hidden from the
+compiler rather than failed through `Fs::read`, whose `io::Error` grass turns
+into a panic; the reason is kept and becomes the error the request gets.
+
+Compiles are keyed by source, directory and syntax. Requests that arrive while
+one is running wait on it instead of starting a second, and once a compile has
+passed its deadline every later request for the same source is refused until
+the abandoned thread ends: a runaway stylesheet costs one thread, not one per
+request. Eight threads may compile at once, which is the bound on distinct
+runaway sources too. `/api/stats` counts them under `sass`.
+
+None of this stops an abandoned compile — it keeps its core and keeps
+allocating until it returns on its own. Only a child process with rlimits
+would, and that is the design discussion in issue #26.
+
 ## Versions, browser cache and SSE
 
 The version does three jobs:
@@ -311,7 +338,7 @@ src/transform/mod.rs   Engine, cache, Built, serve-time splice
 src/transform/astro.rs astro_codegen wrapper
 src/transform/js.rs    oxc transform and import scanning
 src/transform/css.rs   CSS-as-module, relative URL rewriting
-src/transform/scss.rs  grass over the tenant tree, fingerprint
+src/transform/scss.rs  grass over a tenant snapshot, size and time limits, fingerprint
 src/transform/glob.rs  import.meta.glob detection and expansion
 src/transform/markdown.rs, content.rs   Markdown pages and collections
 src/transform/mdx.rs   MDX pages and entries through satteri-mdxjs

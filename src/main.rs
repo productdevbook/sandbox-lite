@@ -10,7 +10,7 @@ mod proptests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Args {
     listen: String,
@@ -20,6 +20,7 @@ struct Args {
     domain: String,
     cdn: String,
     cache_mb: usize,
+    sass_timeout_ms: u64,
     model: String,
     api_token: Option<String>,
     preview_secret: Option<String>,
@@ -29,7 +30,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET and SANDBOX_LITE_TENANT_QUOTA_MB are read as defaults for those flags.",
+        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --sass-timeout-ms N  deadline for one Sass compile, after which the request fails (default 5000)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET and SANDBOX_LITE_TENANT_QUOTA_MB are read as defaults for those flags.",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -44,6 +45,7 @@ fn parse_args() -> Args {
         domain: "localhost".into(),
         cdn: "https://esm.sh".into(),
         cache_mb: 64,
+        sass_timeout_ms: transform::scss::DEFAULT_TIMEOUT_MS,
         model: "claude-fable-5-1".into(),
         api_token: std::env::var("SANDBOX_LITE_API_TOKEN").ok().filter(|v| !v.is_empty()),
         preview_secret: std::env::var("SANDBOX_LITE_PREVIEW_SECRET").ok().filter(|v| !v.is_empty()),
@@ -69,6 +71,7 @@ fn parse_args() -> Args {
             "--no-persist" => args.data_dir = None,
             "--cdn" => args.cdn = value(),
             "--cache-mb" => args.cache_mb = value().parse().unwrap_or_else(|_| usage()),
+            "--sass-timeout-ms" => args.sass_timeout_ms = value().parse().unwrap_or_else(|_| usage()),
             "--model" => args.model = value(),
             "--api-token" => args.api_token = Some(value()),
             "--preview-secret" => args.preview_secret = Some(value()),
@@ -142,7 +145,11 @@ async fn main() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
     let state = Arc::new(http::AppState {
         store,
-        engine: transform::Engine::new(transform::Config { cdn: args.cdn.clone(), cache_bytes: args.cache_mb << 20 }),
+        engine: transform::Engine::new(transform::Config {
+            cdn: args.cdn.clone(),
+            cache_bytes: args.cache_mb << 20,
+            sass_timeout: Duration::from_millis(args.sass_timeout_ms),
+        }),
         domain: args.domain.clone(),
         port,
         model: args.model.clone(),

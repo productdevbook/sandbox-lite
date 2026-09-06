@@ -56,6 +56,7 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "overlay_bytes": overlay_bytes,
         "bases": st.store.bases().iter().map(|b| json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes() })).collect::<Vec<_>>(),
         "cache": st.engine.stats(),
+        "sass": st.engine.sass_stats(),
         "ai": st.api_key.is_some(),
         "preview_auth": st.preview_secret.is_some(),
         "model": st.model,

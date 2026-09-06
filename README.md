@@ -155,6 +155,7 @@ tenant. Every write shows up in the preview as it happens.
 --no-persist         keep edits in memory only
 --cdn URL            where bare npm imports resolve in the browser (default https://esm.sh)
 --cache-mb N         transform cache budget (default 64)
+--sass-timeout-ms N  deadline for one Sass compile (default 5000)
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
 --preview-secret S   tenant hosts require a per-tenant token derived from S
