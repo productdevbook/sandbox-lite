@@ -55,12 +55,28 @@ roles or per-tenant credentials on the API side.
   cannot leave it.
 - **Tenant ids** are validated by `valid_id` (same rule as the host label) and
   are used as directory names under `--data-dir`.
+- **Deleting a tenant** (`DELETE /api/tenants/{id}`) resolves it the way every
+  other tenant route does — this daemon's memory first, then `<data-dir>/<id>`
+  — and removes both. A tenant the daemon can serve but has not loaded is
+  deleted rather than answered `404` and then restored by the next request
+  (issue #74). What goes is the whole directory: the overlay files, the
+  tombstone list and the tenant's conversations. `204` means the bytes are gone
+  from that data directory; a second daemon that already holds the tenant in
+  memory keeps serving its own copy (`docs/multi-node.md`).
 - **Base projects** are read at startup, and again on
   `POST /api/bases/{name}/reload` or a `--watch-bases` tick. `node_modules`,
   `.git`, `dist`, `.astro`, `.vercel`, `.netlify` and `.output` are skipped,
   and so is anything that is not a regular file or directory (symbolic links
   are not followed) — by the reload and the poll exactly as by the first read,
-  since all three walk the same function.
+  since all three walk the same function. The top of the tree is held to the
+  same rule: the `--bases` scan takes an entry only when the entry itself is a
+  directory (`Store::bases_in_dir` reads `DirEntry::file_type`, which does not
+  resolve a link), so a symbolic link sitting in `--bases` is skipped whatever
+  it points at and named on stderr. Each root it does take, and each
+  `--base NAME=PATH`, then goes through `Store::base_root` — the containment
+  `POST /api/bases` applies — so a base outside `--bases` is refused however it
+  arrives: a `--base` outside it stops startup, an entry of the scan that
+  resolves out of it is skipped and named on stderr (issue #73).
 - **Adding a base at runtime** (`POST /api/bases` with `{"name", "path"}`) is
   an operator-only surface behind `--api-token`, and nothing else gates it.
   The name must pass `valid_id`. The path is canonicalized, must be a
@@ -172,7 +188,8 @@ roles or per-tenant credentials on the API side.
   (default 24) is how many turns of one conversation reach the model — older
   turns are folded into a stored summary, and are cut from the request even
   when that summary could not be written. `/api/stats` reports what the chats
-  directory holds across every tenant.
+  directory holds across every tenant it has loaded (`Store::tenants` is this
+  daemon's memory, not a census of `--data-dir`).
 - **The screenshot tool** runs `--chrome-jobs` browsers at once (default 1).
   A call that waits 10 s without a slot is answered "busy" rather than queued,
   and one whose browser overruns its 20 s deadline is killed and reaped before

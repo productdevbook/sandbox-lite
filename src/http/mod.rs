@@ -358,6 +358,14 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
+    async fn delete(app: &axum::Router, uri: &str) -> (StatusCode, String) {
+        let req = Request::builder().method("DELETE").uri(uri);
+        let res = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
     #[tokio::test]
     async fn bases_are_added_and_reloaded_over_the_api() {
         let root = std::env::temp_dir().join(format!("sandbox-lite-api-bases-{}", std::process::id()));
@@ -386,6 +394,62 @@ mod tests {
         assert_eq!(t.read_text("src/pages/index.astro").unwrap().as_deref(), Some("<h1>two</h1>\n"));
         assert!(t.version() > version);
         assert_eq!(post(&app, "/api/bases/nope/reload", "").await.0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #73: the two ways a `--bases` sub-directory becomes a base, on one path that is a
+    /// symbolic link out of the directory. Neither takes it.
+    #[tokio::test]
+    async fn a_symlink_in_the_bases_directory_is_refused_at_startup_and_over_the_api() {
+        let root = std::env::temp_dir().join(format!("sandbox-lite-api-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bases/theme")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(root.join("outside/secret.txt"), "SECRET\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside"), root.join("bases/sneaky")).unwrap();
+        let store = Store::new(None, 1 << 20).with_bases_dir(Some(root.join("bases")));
+
+        // startup: what main.rs loads from --bases
+        let scanned: Vec<String> = store.bases_in_dir().unwrap().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(scanned, vec!["theme".to_string()], "the link is not a base at startup");
+
+        // and the same path over POST /api/bases
+        let app = app(state_for(store, None, None));
+        let body = format!(r#"{{"name":"sneaky","path":{}}}"#, serde_json::to_string(&root.join("bases/sneaky")).unwrap());
+        let (status, body) = post(&app, "/api/bases", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(get(&app, "/api/bases", None).await.1, "[]", "no base was loaded either way");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #74: this node never loaded the tenant — the other one created it — so the delete used
+    /// to answer 404 and leave every byte where it was.
+    #[tokio::test]
+    async fn deleting_a_tenant_this_node_never_loaded_removes_its_files() {
+        let root = std::env::temp_dir().join(format!("sandbox-lite-api-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let page = root.join("theme/src/pages/index.astro");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, "<h1>one</h1>\n").unwrap();
+        let data = root.join("data");
+        let base = || crate::store::Base::load("theme", &root.join("theme")).unwrap();
+        let other = Store::new(Some(data.clone()), 1 << 20);
+        other.add_base(base());
+        other.create_tenant("acme", "theme").unwrap().write("secret.txt", b"SECRET".to_vec(), crate::store::UpdateKind::Module).unwrap();
+
+        let store = Store::new(Some(data.clone()), 1 << 20);
+        store.add_base(base());
+        let app = app(state_for(store, None, None));
+        assert_eq!(get(&app, "/api/tenants", None).await.1, "[]", "this node holds no tenant in memory");
+
+        assert_eq!(delete(&app, "/api/tenants/acme").await.0, StatusCode::NO_CONTENT);
+        assert!(!data.join("acme").exists(), "the tenant's directory is gone");
+        assert_eq!(get(&app, "/api/t/acme/files", None).await.0, StatusCode::NOT_FOUND, "and nothing restores it");
+        let fresh = Store::new(Some(data.clone()), 1 << 20);
+        fresh.add_base(base());
+        assert_eq!(fresh.restore().unwrap(), 0, "a fresh daemon over the same data dir does not bring it back");
+        assert_eq!(delete(&app, "/api/tenants/acme").await.0, StatusCode::NOT_FOUND, "a tenant nothing holds is still a 404");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
