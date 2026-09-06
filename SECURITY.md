@@ -146,6 +146,18 @@ credentials on the API side.
   a write that would take the tenant's edited files past it is refused with
   `413` before anything reaches disk or memory, and the chat `write_file` tool
   gets the same error. Rewriting a file is charged only for the difference.
+- **Conversations** are outside that quota, so they have their own two limits:
+  `--chats-per-tenant` (default 50) drops a tenant's least recently updated
+  conversation when a save would take it past the cap, and `--chat-window`
+  (default 24) is how many turns of one conversation reach the model — older
+  turns are folded into a stored summary, and are cut from the request even
+  when that summary could not be written. `/api/stats` reports what the chats
+  directory holds across every tenant.
+- **The screenshot tool** runs `--chrome-jobs` browsers at once (default 1).
+  A call that waits 10 s without a slot is answered "busy" rather than queued,
+  and one whose browser overruns its 20 s deadline is killed and reaped before
+  its profile directory and PNG are removed. `sandbox_lite_screenshots_*`
+  counts what is running, what was refused and what was killed.
 
 The daemon sets no CORS, CSP, `X-Frame-Options` or `Referrer-Policy` headers.
 Cross-origin reads between tenant hosts are blocked by the browser's
@@ -173,7 +185,8 @@ that router answers `401` unless the request carries
 - The editor page keeps the token in `localStorage` (`sl_api_token`) on the
   editor origin.
 - It gates spending: every `POST /api/t/{id}/chat` can make up to 16 calls to
-  the Anthropic API with the daemon's `ANTHROPIC_API_KEY`.
+  the Anthropic API with the daemon's `ANTHROPIC_API_KEY`, and one more when
+  the conversation has to be summarized.
 - It is the only thing gating `POST /api/tenants/{id}/import`, which writes a
   whole file tree into a tenant in one request, and
   `GET /api/t/{id}/export`, which returns one.
@@ -244,8 +257,10 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
   every tool result — the file listing, the contents of any file the model
   reads (up to 200 KiB per file, any path in the tenant), and `check`
   diagnostics. `write_file` and `delete_file` take effect on the tenant
-  immediately, without confirmation. Without the key the endpoint answers
-  `503` and nothing is sent.
+  immediately, without confirmation. A conversation that has passed
+  `--chat-window` costs one further call, which sends the turns being folded
+  away and takes back the summary that replaces them. Without the key the
+  endpoint answers `503` and nothing is sent.
 - **CDN, in the visitor's browser.** Bare imports (`react`, `dayjs`) resolve to
   `--cdn` (default `https://esm.sh`) with the version range from
   `package.json`; React and Preact client entrypoints come from the same CDN.

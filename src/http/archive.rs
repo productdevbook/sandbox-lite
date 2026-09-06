@@ -235,6 +235,7 @@ mod tests {
             preview_secret: None,
             cookie_samesite: crate::http::SameSite::Lax,
             chrome: None,
+            shots: crate::http::ai::Shots::default(),
             started: Instant::now(),
         });
         Fixture { app: crate::http::app(state.clone()), state, root }

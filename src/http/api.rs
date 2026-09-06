@@ -71,6 +71,18 @@ fn module_stats(st: &AppState) -> Vec<Value> {
         .collect()
 }
 
+/// Conversations and the bytes they hold across every tenant. They are outside the tenant quota,
+/// so `overlay_bytes` does not see them and this is the only place the chats directory is counted.
+fn chat_stats(st: &AppState) -> Value {
+    let (conversations, bytes) = st.store.tenants().iter().map(|t| st.chats.usage(t)).fold((0, 0), |(n, b), (cn, cb)| (n + cn, b + cb));
+    json!({
+        "conversations": conversations,
+        "bytes": bytes,
+        "max_per_tenant": st.chats.cap(),
+        "window_turns": st.chats.window(),
+    })
+}
+
 pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
     let tenants = st.store.tenants();
     let overlay_bytes: u64 = tenants.iter().map(|t| t.overlay_stats().1).sum();
@@ -85,6 +97,8 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "cache": st.engine.stats(),
         "sass": st.engine.sass_stats(),
         "compiles": st.engine.compile_stats(),
+        "chats": chat_stats(&st),
+        "screenshots": st.shots.stats(),
         "modules": module_stats(&st),
         "ai": st.api_key.is_some(),
         "preview_auth": st.preview_secret.is_some(),
@@ -100,6 +114,7 @@ fn snapshot(st: &AppState) -> Snapshot {
     let cache = st.engine.stats();
     let sass = st.engine.sass_stats();
     let compiles = st.engine.compile_stats();
+    let shots = st.shots.stats();
     Snapshot {
         uptime_seconds: st.started.elapsed().as_secs(),
         rss_bytes: rss_kb().map(|kb| kb * 1024),
@@ -119,6 +134,9 @@ fn snapshot(st: &AppState) -> Snapshot {
         compiles_queued: compiles.queued as u64,
         compiles_limit: compiles.limit as u64,
         compiles_refused: compiles.refused,
+        shots_running: shots.running as u64,
+        shots_busy: shots.busy,
+        shots_timeouts: shots.timeouts,
         requests: st.metrics.requests(),
         compile: st.metrics.compiles(),
     }

@@ -122,6 +122,9 @@ pub struct Snapshot {
     pub compiles_queued: u64,
     pub compiles_limit: u64,
     pub compiles_refused: u64,
+    pub shots_running: u64,
+    pub shots_busy: u64,
+    pub shots_timeouts: u64,
     pub requests: [[u64; STATUSES.len()]; KINDS.len()],
     pub compile: [HistogramSnapshot; KINDS.len()],
 }
@@ -194,6 +197,22 @@ pub fn render(s: &Snapshot) -> String {
         "counter",
         "Compiles refused with 503 after waiting for a permit.",
         s.compiles_refused,
+    );
+
+    scalar(&mut out, "sandbox_lite_screenshots_running", "gauge", "Headless Chrome screenshots in flight.", s.shots_running);
+    scalar(
+        &mut out,
+        "sandbox_lite_screenshots_busy_total",
+        "counter",
+        "Screenshot tool calls answered 'busy' because every slot was taken for the whole wait.",
+        s.shots_busy,
+    );
+    scalar(
+        &mut out,
+        "sandbox_lite_screenshots_timeouts_total",
+        "counter",
+        "Screenshots whose browser overran its deadline and was killed.",
+        s.shots_timeouts,
     );
 
     family(&mut out, "sandbox_lite_module_requests_total", "counter", "Requests answered by the preview module endpoint.");
@@ -287,6 +306,9 @@ mod tests {
             compiles_queued: 5,
             compiles_limit: 8,
             compiles_refused: 6,
+            shots_running: 1,
+            shots_busy: 5,
+            shots_timeouts: 6,
             requests: m.requests(),
             compile: m.compiles(),
         };
@@ -353,6 +375,15 @@ sandbox_lite_compiles_limit 8
 # HELP sandbox_lite_compiles_refused_total Compiles refused with 503 after waiting for a permit.
 # TYPE sandbox_lite_compiles_refused_total counter
 sandbox_lite_compiles_refused_total 6
+# HELP sandbox_lite_screenshots_running Headless Chrome screenshots in flight.
+# TYPE sandbox_lite_screenshots_running gauge
+sandbox_lite_screenshots_running 1
+# HELP sandbox_lite_screenshots_busy_total Screenshot tool calls answered 'busy' because every slot was taken for the whole wait.
+# TYPE sandbox_lite_screenshots_busy_total counter
+sandbox_lite_screenshots_busy_total 5
+# HELP sandbox_lite_screenshots_timeouts_total Screenshots whose browser overran its deadline and was killed.
+# TYPE sandbox_lite_screenshots_timeouts_total counter
+sandbox_lite_screenshots_timeouts_total 6
 # HELP sandbox_lite_module_requests_total Requests answered by the preview module endpoint.
 # TYPE sandbox_lite_module_requests_total counter
 sandbox_lite_module_requests_total{kind="module",status="200"} 3
@@ -458,6 +489,9 @@ sandbox_lite_compile_seconds_count{kind="url"} 0
             compiles_queued: 0,
             compiles_limit: 1,
             compiles_refused: 0,
+            shots_running: 0,
+            shots_busy: 0,
+            shots_timeouts: 0,
             requests: m.requests(),
             compile: m.compiles(),
         };
