@@ -59,6 +59,35 @@ credentials on the API side.
   that is not a regular file or directory (symbolic links are not followed).
 - **Request bodies** on the editor/API router are capped at 64 MiB
   (`DefaultBodyLimit`). No tenant-host handler reads a request body.
+- **Compiled source** is bounded three ways before it reaches oxc,
+  `astro_codegen`, `satteri-mdxjs` or `grass`, all of which are
+  recursive-descent and so can overflow a thread stack — which aborts the whole
+  daemon, since the release profile sets `panic = "abort"`. The three apply to
+  the extensions those parsers read: `.astro`, `.ts`, `.tsx`, `.jsx`, `.mts`,
+  `.js`, `.mjs`, `.mdx`, `.scss`, `.sass`.
+  - **Size** is capped by `--max-source-kb` (default 64 KiB).
+  - **Nesting** is capped at 2000 (`MAX_NESTING_DEPTH`) — the deepest run of
+    unclosed `(`, `[`, `{` or of markdown blockquote markers, counted on the
+    bytes before any parser sees them.
+  - **Stack**: every compile runs on a thread whose stack is sized from the
+    size cap (`Engine::parser_stack_bytes`, 256 MiB at the default), which
+    covers the recursion the nesting scan does not model — chained unary `-`
+    for oxc, `<<` for `astro_codegen`. Raising `--max-source-kb` raises the
+    stack with it. The reservation is virtual address space; only the pages a
+    compile touches become resident.
+
+  Past either cap the build answers with a compile diagnostic. `.md`, `.css`,
+  `.json`, images and `?raw`/`?url` requests are not capped: none of them
+  recurse over the source.
+
+  Two parsed sources do not reach grass or oxc through `Engine::build`, and get
+  the bounds where they are loaded instead:
+  - `src/content.config.ts`, read by the content route — past the size or the
+    nesting cap it is left unparsed and the collection falls back to the
+    directory layout.
+  - Sass partials, which grass reads itself and compiles on its own thread
+    (see below) rather than on the one `Engine::build` reserved. Each is
+    refused past the nesting cap, and that thread gets a 64 MiB stack.
 - **Host matching** is exact: `a.b.<domain>` and `evil-<domain>` are not tenant
   hosts.
 - **Sass compilation** is bounded (`src/transform/scss.rs`). grass runs

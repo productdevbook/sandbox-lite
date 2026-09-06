@@ -166,6 +166,7 @@ so it can look at the layout it just changed instead of guessing.
 --no-persist         keep edits in memory only
 --cdn URL            where bare npm imports resolve in the browser (default https://esm.sh)
 --cache-mb N         transform cache budget (default 64)
+--max-source-kb N    largest .astro/.ts/.js/.mdx/.scss file the compilers accept (default 64)
 --sass-timeout-ms N  deadline for one Sass compile (default 5000)
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*

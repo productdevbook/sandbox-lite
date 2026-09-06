@@ -113,8 +113,8 @@ pub fn slugify(text: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-pub fn collection_json(tenant: &Tenant, name: &str) -> Value {
-    let def = config(tenant).remove(name).unwrap_or_default();
+pub fn collection_json(tenant: &Tenant, name: &str, max_config_bytes: usize) -> Value {
+    let def = config(tenant, max_config_bytes).remove(name).unwrap_or_default();
     let entries = match &def.loader {
         Some(Loader::Glob { patterns, base }) => glob_entries(tenant, name, patterns, base),
         Some(Loader::File { path }) => file_entries(tenant, name, path),
@@ -262,8 +262,17 @@ const CONFIG_PATHS: [&str; 6] = [
     "src/content/config.mjs",
 ];
 
-pub fn config(tenant: &Tenant) -> BTreeMap<String, Definition> {
-    CONFIG_PATHS.iter().find_map(|p| tenant.read_text(p)).map(|src| parse_config(&src)).unwrap_or_default()
+/// The config goes to oxc, which recurses over it. This is the one parsed source the content route
+/// reaches without going through `Engine::build`, so the size and nesting caps are applied here;
+/// past either, it is left unparsed and the collection falls back to the directory layout, as it
+/// does when there is no config at all.
+pub fn config(tenant: &Tenant, max_bytes: usize) -> BTreeMap<String, Definition> {
+    CONFIG_PATHS
+        .iter()
+        .find_map(|p| tenant.read_text(p))
+        .filter(|src| src.len() <= max_bytes && super::nesting_depth(src.as_bytes()) <= super::MAX_NESTING_DEPTH)
+        .map(|src| parse_config(&src))
+        .unwrap_or_default()
 }
 
 pub fn parse_config(source: &str) -> BTreeMap<String, Definition> {

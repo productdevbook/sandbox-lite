@@ -26,6 +26,11 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// pathological, and it is what keeps a tenant from turning distinct runaway sources into threads.
 const MAX_THREADS: usize = 8;
 
+/// The compile runs here rather than on the stack `Engine::build` reserved, so this thread needs
+/// its own. grass costs about 8 KiB per nesting level and the loader refuses anything past
+/// `MAX_NESTING_DEPTH`, which puts the deepest stylesheet it will accept well inside this.
+const STACK: usize = 64 << 20;
+
 fn norm(path: &Path) -> String {
     normalize(&path.to_string_lossy())
 }
@@ -88,6 +93,12 @@ impl grass::Fs for Snapshot {
         let name = norm(path);
         match self.files.get(&name).map(FileData::read) {
             Some(Ok(bytes)) => {
+                let depth = super::nesting_depth(&bytes);
+                if depth > super::MAX_NESTING_DEPTH {
+                    let limit = super::MAX_NESTING_DEPTH;
+                    self.deny(format!("{name} nests {depth} deep, over the {limit} level Sass nesting limit"));
+                    return Ok(Vec::new());
+                }
                 self.read.fetch_add(bytes.len(), Ordering::Relaxed);
                 Ok(bytes.to_vec())
             }
@@ -144,7 +155,12 @@ impl Flights {
             options = options.input_syntax(grass::InputSyntax::Sass);
         }
         let css = match grass::from_string(source, &options) {
-            Ok(css) => css,
+            // A file the limits hid reads as empty, which can still compile. The CSS that comes
+            // back is then not the tenant's stylesheet, so say why rather than serve it.
+            Ok(css) => match fs.refusal() {
+                Some(reason) => return Err(self.refuse(reason)),
+                None => css,
+            },
             Err(e) => return self.failed(fs, e.to_string()),
         };
         if css.len() > MAX_OUTPUT {
@@ -212,6 +228,11 @@ impl Sass {
         if source.len() > MAX_FILE {
             return Err(self.0.refuse(format!("Sass source is {} bytes, over the {MAX_FILE} byte limit", source.len())));
         }
+        let depth = super::nesting_depth(source.as_bytes());
+        if depth > super::MAX_NESTING_DEPTH {
+            let limit = super::MAX_NESTING_DEPTH;
+            return Err(self.0.refuse(format!("Sass source nests {depth} deep, over the {limit} level limit")));
+        }
         let mut h = Vec::with_capacity(source.len() + dir.len() + 2);
         h.push(u8::from(indented));
         h.extend_from_slice(dir.as_bytes());
@@ -249,7 +270,7 @@ impl Sass {
         if start {
             let fs = Snapshot::of(tenant, source.len());
             let (inner, f, dir, source) = (self.0.clone(), flight.clone(), dir.to_string(), source.to_string());
-            let spawned = std::thread::Builder::new().name("sass".into()).spawn(move || {
+            let spawned = std::thread::Builder::new().name("sass".into()).stack_size(STACK).spawn(move || {
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.run(&fs, &dir, source, indented)))
                     .unwrap_or_else(|_| inner.failed(&fs, "the Sass compiler panicked".to_string()));
                 inner.finish(key, &f, out);
@@ -357,6 +378,26 @@ mod tests {
         let sass = Sass::new(Duration::from_millis(super::DEFAULT_TIMEOUT_MS));
         let e = sass.compile(&t, "src/styles", "@use 'big';\n.a { color: red }", false).unwrap_err();
         assert!(e.contains("over the") && e.contains("byte Sass file limit"), "{e}");
+    }
+
+    /// Issue #25: `Engine::build` bounds the stylesheet it was asked for, but not the partials
+    /// grass then goes and reads, and grass runs on its own thread rather than the one `build`
+    /// reserved. Deep nesting has to be refused where the file is loaded.
+    #[test]
+    fn refuses_a_deeply_nested_import() {
+        let t = tenant(&[("src/styles/_deep.scss", "a{".repeat(20_000))]);
+        let sass = Sass::new(Duration::from_millis(super::DEFAULT_TIMEOUT_MS));
+        let e = sass.compile(&t, "src/styles", "@use 'deep';\n.a { color: red }", false).unwrap_err();
+        assert!(e.contains("level Sass nesting limit"), "{e}");
+    }
+
+    #[test]
+    fn refuses_a_deeply_nested_source() {
+        let t = tenant(&[]);
+        let sass = Sass::new(Duration::from_millis(super::DEFAULT_TIMEOUT_MS));
+        let e = sass.compile(&t, "src", &"a{".repeat(20_000), false).unwrap_err();
+        assert!(e.contains("over the") && e.contains("level limit"), "{e}");
+        assert_eq!(sass.stats().refused, 1);
     }
 
     #[test]
