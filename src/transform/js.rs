@@ -5,7 +5,7 @@ use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
-use oxc_transformer::{TransformOptions, Transformer};
+use oxc_transformer::{TransformOptions, Transformer, TypeScriptOptions};
 
 use super::{BuildError, Diag};
 
@@ -18,16 +18,30 @@ pub struct SpecRef {
 }
 
 pub fn transform(path: &str, source: &str) -> Result<String, BuildError> {
-    let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    transform_with(path, source, source_type, &TransformOptions::default())
+}
+
+/// Transforms one `<script>` block of a `.vue` or `.svelte` file.
+///
+/// A binding the template alone uses looks unreferenced here, so an unused import is not dead.
+pub fn transform_sfc_script(path: &str, source: &str) -> Result<String, BuildError> {
+    let options = TransformOptions {
+        typescript: TypeScriptOptions { only_remove_type_imports: true, ..TypeScriptOptions::default() },
+        ..TransformOptions::default()
+    };
+    transform_with(path, source, SourceType::ts(), &options)
+}
+
+fn transform_with(path: &str, source: &str, source_type: SourceType, options: &TransformOptions) -> Result<String, BuildError> {
+    let allocator = Allocator::default();
     let ret = Parser::new(&allocator, source, source_type).parse();
     if !ret.errors.is_empty() {
         return Err(oxc_errors(path, source, &ret.errors));
     }
     let mut program = ret.program;
     let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
-    let options = TransformOptions::default();
-    let out = Transformer::new(&allocator, Path::new(path), &options).build_with_scoping(scoping, &mut program);
+    let out = Transformer::new(&allocator, Path::new(path), options).build_with_scoping(scoping, &mut program);
     if !out.errors.is_empty() {
         return Err(oxc_errors(path, source, &out.errors));
     }

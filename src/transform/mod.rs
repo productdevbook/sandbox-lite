@@ -6,6 +6,7 @@ pub mod js;
 pub mod markdown;
 pub mod mdx;
 pub mod scss;
+pub mod sfc;
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -419,7 +420,7 @@ impl Engine {
                         })?;
                         Ok(Built::js(css::to_module(path, &compiled, dirname(path))))
                     }
-                    "vue" | "svelte" => Ok(Built::js(sfc_loader(&ext, path, &text()))),
+                    "vue" | "svelte" => Ok(Built::js(sfc_loader(&ext, path, &sfc::strip_types(&ext, path, &text())?))),
                     "json" => Ok(Built::js(format!("export default JSON.parse({});\n", json_str(&text())))),
                     "md" => Ok(Built::scanned(markdown::page_module(path, &text()))),
                     "mdx" => Ok(Built::scanned(mdx::page_module(path, &text())?)),
@@ -475,7 +476,8 @@ impl Engine {
 }
 
 /// No Rust compiler exists for `.vue` or `.svelte`, so the file is served as a module that
-/// compiles its source in the browser and re-exports the component.
+/// compiles its source in the browser and re-exports the component. The source it carries has
+/// been through `sfc::strip_types`, so its `<script>` blocks are JavaScript.
 fn sfc_loader(ext: &str, path: &str, source: &str) -> String {
     format!(
         "import {{ compileComponent }} from \"/__sl/shim/{ext}-loader.js\";\nexport default await compileComponent({}, {}, import.meta.url);\n",

@@ -1,7 +1,12 @@
-<script>
-  let { label, start = 0 } = $props();
-  let delta = $state(0);
-  let n = $derived(start + delta);
+<script lang="ts">
+  interface Props {
+    label: string;
+    start?: number;
+  }
+
+  let { label, start = 0 }: Props = $props();
+  let delta: number = $state(0);
+  let n: number = $derived(start + delta);
 </script>
 
 <div class="counter" data-count={n}>

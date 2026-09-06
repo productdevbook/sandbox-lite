@@ -46,7 +46,8 @@ and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
 CDN pinned to the versions in `package.json`; React, Preact, Vue and Svelte
 islands (`client:load` and friends hydrate with the framework's own runtime,
 whether the component is a file in `src/` or one imported from a package, and
-`.vue`/`.svelte` single-file components are compiled in the browser);
+`.vue`/`.svelte` single-file components are compiled in the browser, with the
+TypeScript in their `<script>` blocks stripped by the daemon first);
 `<script>` tags, `public/` files and live reload.
 
 ## What it costs
@@ -320,7 +321,7 @@ src/main.rs            CLI, startup
 src/store.rs           base projects, tenant overlays, versions, SSE fan-out, persistence
 src/resolve.rs         import specifier → URL
 src/routes.rs          src/pages → route table
-src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), import.meta.glob, markdown, mdx (satteri-mdxjs), content collections, cache
+src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), sfc (Vue/Svelte script blocks), import.meta.glob, markdown, mdx (satteri-mdxjs), content collections, cache
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop, stream framing, saved conversations
 src/check.rs           the `check` subcommand
 src/metrics.rs         atomic counters and the Prometheus text-format renderer behind /metrics
@@ -328,7 +329,7 @@ assets/                shell.html, shell.js, live.js, editor.html, astro.js and 
 examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections, endpoints); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         React islands hydrated with client:load, one local and one imported from npm
-examples/vue           a Vue SFC compiled in the browser and hydrated with client:load
+examples/vue           a TypeScript Vue SFC compiled in the browser and hydrated with client:load
 examples/svelte        the same for a Svelte 5 component
 scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
@@ -341,13 +342,16 @@ e2e/                   Playwright suite for the browser side: every example page
   framework needs a `server` module exposing `check` and
   `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 40 lines) and a
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
-- **TypeScript inside a `.vue` or `.svelte` file.** There is no Rust compiler
-  for either format, so the daemon serves the component as a loader module that
-  runs `@vue/compiler-sfc` or `svelte/compiler` in the browser and imports the
-  result as a blob module. A blob has no import map, so the loader rewrites
+- **Type-driven Vue macros.** There is no Rust compiler for `.vue` or
+  `.svelte`, so the daemon serves the component as a loader module that runs
+  `@vue/compiler-sfc` or `svelte/compiler` in the browser and imports the result
+  as a blob module. Every `<script lang="ts">` block is stripped to JavaScript
+  by the daemon before that, which leaves `defineProps<Props>()`,
+  `defineEmits`, `defineModel`, `defineSlots` and `<script setup generic="…">`
+  with no type to compile — they are refused with a diagnostic asking for the
+  runtime form. A blob has no import map either, so the loader rewrites
   `vue`/`svelte` imports to the CDN and relative ones against the component's
-  own URL: `./Other.vue` works, `./other` (no extension) does not, and
-  `<script lang="ts">` reaches the browser as TypeScript and fails to parse.
+  own URL: `./Other.vue` works, `./other` (no extension) does not.
 - **Non-`GET` requests.** A visitor navigates, so only an endpoint's `GET` (or
   `ALL`) handler ever runs and the request carries no body. `src/middleware.ts`
   is not loaded, and `astro:actions` answers `SERVICE_UNAVAILABLE`.
