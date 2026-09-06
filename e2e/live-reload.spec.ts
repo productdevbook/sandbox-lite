@@ -71,3 +71,48 @@ test('an edit to the frontmatter still reloads', async ({ daemon, page }) => {
   await expect(page.locator('h1')).toHaveText('Design that reloads.', { timeout: 5_000 });
   expect(await marker(page), 'the page was reloaded').toBeUndefined();
 });
+
+// Issue #62: a `module` event lost on a stream that stays open — a backgrounded tab, a network blip —
+// left the page running the JS it had. The next style-only write was then correctly classified
+// `style`, swapped in place, and the page went on showing new CSS over stale markup indefinitely.
+// Dropping exactly one message from the open EventSource is that failure, reproduced.
+test('a page that missed a module event reloads instead of swapping the next style in', async ({ daemon, page }) => {
+  const site = await daemon.tenant('live-gap', 'starter');
+  await page.goto(site.url('/'));
+  await expect(page.locator('h1')).toHaveText('Design that ships.');
+  await mark(page);
+
+  await page.evaluate(() => {
+    const es = (window as any).__sl_es as EventSource;
+    const deliver = es.onmessage!.bind(es);
+    (window as any).__slDropped = false;
+    es.onmessage = (e: MessageEvent) => {
+      if (!(window as any).__slDropped && JSON.parse(e.data).kind === 'module') {
+        (window as any).__slDropped = true;
+        es.onmessage = deliver;
+        return;
+      }
+      deliver(e);
+    };
+  });
+
+  const index = await site.read('src/pages/index.astro');
+  const edited = index.replace('const headline = "Design that ships.";', 'const headline = "Design that self-corrects.";');
+  expect(edited).not.toBe(index);
+  await site.write('src/pages/index.astro', edited);
+
+  // the event that would have reloaded the page never reached it, so the page still holds the old JS
+  await expect.poll(() => page.evaluate(() => (window as any).__slDropped), { timeout: 5_000 }).toBe(true);
+  expect(await marker(page), 'the dropped event reloaded the page after all').toBe('kept');
+  await expect(page.locator('h1')).toHaveText('Design that ships.');
+
+  // a style-only write follows a version this page never rendered, so it reloads rather than swapping
+  const card = await site.read('src/components/Card.astro');
+  const restyled = card.replace('.card { background: var(--card);', '.card { background: rgb(0, 128, 0);');
+  expect(restyled).not.toBe(card);
+  await site.write('src/components/Card.astro', restyled);
+
+  await expect(page.locator('h1')).toHaveText('Design that self-corrects.', { timeout: 5_000 });
+  expect(await marker(page), 'the page swapped the style in over stale markup').toBeUndefined();
+  await expect(page.locator('article.card').first()).toHaveCSS('background-color', 'rgb(0, 128, 0)');
+});

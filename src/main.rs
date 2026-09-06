@@ -189,6 +189,14 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    let failed = store.failed_tenants();
+    if !failed.is_empty() {
+        eprintln!(
+            "{} tenants could not be restored and answer 500 until they are fixed; see /api/stats and sandbox_lite_tenants_failed: {}",
+            failed.len(),
+            failed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     let port = args.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(80);
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
     let metrics = Arc::new(metrics::Metrics::default());

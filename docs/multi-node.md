@@ -37,14 +37,15 @@ So with two daemons, A and B, sharing `--data-dir`:
 | `PUT /api/t/acme/file/src/pages/index.astro` on A | A's overlay and `<data-dir>/acme/files/…` both change. B's overlay does not. |
 | A preview open against B | B still serves its own copy of the file, at its own version. It gets no event, so it does not reload. |
 | `GET /api/t/acme/files` on B | B's view: the files it knows about, at B's version. |
-| A tenant created on A, then a request for it on B | B has no such tenant in memory, so it restores one from `<data-dir>/acme` and serves it (`Store::tenant`). |
+| A tenant created on A, then a request for it on B | B has no such tenant in memory, so it restores one from `<data-dir>/acme` and serves it (`Store::resolve`). |
+| The same, but on a base B has not loaded | B cannot build a tenant from the directory. It answers 500 naming the base rather than 404 "unknown tenant", and counts the id under `tenants_failed` in `/api/stats` and `sandbox_lite_tenants_failed` in `/metrics`, so the gap is visible instead of reading as a tenant that never existed. |
 | A writes again after B has restored | B does not see it. The restore happens once, on the miss. |
 | `DELETE /api/tenants/acme` on A | The directory goes, whether or not A had the tenant loaded — a node deletes what the data directory holds, not only what its map does. B keeps serving the tenant it already holds in memory; a B that had not loaded it has nothing left to restore. |
 | Creating `acme` on B while A's `acme` is on disk | Refused. The directory is what says the tenant exists, so B says so too, even when it cannot build a tenant from it because A's base is not loaded here. |
 | `POST /api/bases/theme/reload` on A | Only A re-reads the base. B keeps the copy it loaded. |
 | `POST /api/t/acme/chat` on A, then `GET /api/t/acme/chats` on B | B lists it: conversations are read from the shared data directory on every call, not cached. |
 | `POST /api/tenants/acme/import` on A | A's overlay and the data directory change; B's overlay does not, exactly as for a single write. |
-| `/api/stats`, `/metrics` on B | B's own tenants, cache and subscribers. Neither number is a cluster total. The chats figures are counters B keeps as it saves and evicts, seeded from the directory the first time it touches a tenant, so what A writes afterwards is not in them either. |
+| `/api/stats`, `/metrics` on B | B's own tenants, cache and subscribers — `tenants_failed` included, which counts the directories B could not load and says nothing about A. The chats figures are counters B keeps as it saves and evicts, seeded from the directory the first time it touches a tenant, so what A writes afterwards is not in them either. Neither number is a cluster total. |
 
 The version being per node also means a browser that moves from A to B
 mid-session gets a lower `?v=` than it had. That is harmless — the daemon never

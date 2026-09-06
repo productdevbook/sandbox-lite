@@ -58,8 +58,10 @@ same base share the base's memory; a tenant costs its overlay.
 Each tenant has a **version**, a `u64` of milliseconds since the epoch at
 creation. `write` and `delete` call `bump`, which sets it to
 `max(now, previous + 1)` — strictly increasing — and sends
-`{"type":"update"|"delete","path":…,"kind":…,"version":N}` on the tenant's
-`tokio::sync::broadcast` channel (64 slots). Both SSE endpoints
+`{"type":"update"|"delete","path":…,"kind":…,"version":N,"prev":P}` on the tenant's
+`tokio::sync::broadcast` channel (64 slots). `prev` is the version the event
+follows, and it is what lets a client tell a message it missed from one it did
+not — see "CSS without a reload". Both SSE endpoints
 (`/api/t/{id}/events`, `/__sl/events`) subscribe to that channel and open with
 an `event: hello` carrying the current version.
 
@@ -87,11 +89,24 @@ With a `--data-dir`, the overlay is persisted as
 `<data-dir>/<id>/tenant.json` (`{"base": name}`), `<data-dir>/<id>/files/<path>`
 and `<data-dir>/<id>/deleted.json` (the tombstones). Every write goes to disk;
 files over 256 KiB are then kept only there. `Store::restore` rebuilds tenants
-at startup with a fresh version and skips any whose base is not loaded.
-`Store::tenant` falls back to the same read on a miss, so a tenant another
+at startup with a fresh version and skips any it cannot build one from — a base
+this node has not loaded, an unreadable `tenant.json`. Skipping is right; being
+silent about it was not (issue #61), so each skipped id and its reason is kept
+in `Store::failed`, reported by `Store::failed_tenants` and rendered as
+`tenants_failed` and `failed_tenants` in `/api/stats`, the
+`sandbox_lite_tenants_failed` gauge in `/metrics`, a line on stderr at startup
+and a banner in the editor's header.
+
+`Store::resolve` falls back to the same read on a miss, so a tenant another
 daemon created under a shared `--data-dir` is restored the first time this one
 is asked for it; a tenant already in memory is never re-read, which is the
-limit `docs/multi-node.md` sets out. `--no-persist` keeps everything in memory.
+limit `docs/multi-node.md` sets out. It answers `NoTenant::Unknown` when
+neither the map nor the data directory holds the id and `NoTenant::Failed(why)`
+when `<data-dir>/<id>` is there and would not load — recording it the way
+`restore` does — so the HTTP layer can answer 404 for a tenant that never
+existed and 500 with the reason for one that could not be loaded. `Store::tenant`
+is `resolve(…).ok()`, for the callers that only need to know whether it is here.
+`--no-persist` keeps everything in memory.
 
 Because that fallback makes the data directory as much a source of tenants as
 the map, the two operations that decide whether a tenant exists consult both:
@@ -518,6 +533,13 @@ The version does three jobs:
   restart, since restored tenants get a fresh version. A swap sets
   `window.__sl.version` to the version it applied, so a later reconnect does
   not read the page as stale.
+- **Gap detection.** Each event's `prev` is the version it follows, and
+  `live.js` swaps only when `prev` is the version the page last rendered. A
+  message dropped on a connection that stayed open — a backgrounded tab, a
+  lagging stream — leaves the page behind that chain, and the next event
+  reloads it instead of swapping (issue #62). Without this, a lost `module`
+  event left the page running stale JS and every later style-only write was
+  swapped in over it, indefinitely.
 - **Editor refresh.** The editor subscribes to `/api/t/{id}/events` to reload
   its file list and the open file.
 
@@ -540,7 +562,8 @@ two of them.
   keyed `<file>?<index>` and re-imported from
   `?astro&type=style&index=<i>&lang.css`.
 - Anything else reloads: a `module` kind, a `delete`, a `write_many`'s empty
-  path, a `kind` the client does not know, a page showing the error overlay
+  path, an event whose `prev` is not the version the page rendered, a `kind` the
+  client does not know, a page showing the error overlay
   (`<body data-sl-overlay>`), a block the page does not have, or a failed swap.
 
 `Engine::update_kind` decides. It compares the JS the incoming bytes compile to
@@ -608,7 +631,15 @@ source file under `src/` — `is_source`: `.astro`, `.ts`, `.tsx`, `.js`,
 the `.vue` type errors above reachable from the command line. It prints
 diagnostics and a census — islands, glob calls,
 Sass, MDX, endpoints, `@astrojs/*` integrations, bare imports — and exits 1 on
-compile errors, 2 when a directory cannot be loaded. `/api/t/{id}/check` and
+compile errors, 2 when a directory cannot be loaded.
+
+The endpoint count is `routes::build` on that same tenant filtered to
+`kind == "endpoint"`, not a second rule over the file names: counting
+`src/pages/**.ts|.js` by hand missed `.mjs` and `.mts` and counted
+`_`-prefixed files the router skips, so a project written in `.mjs` censused as
+"endpoints 0" (issue #76). The MDX count stays wider than the route table on
+purpose — every `.mdx` file in the tree, because a collection entry is MDX the
+preview must support as much as a page is. `/api/t/{id}/check` and
 `/__sl/check` run the same loop (`api::check_tenant`) on a live tenant; the
 error page uses the latter as its fallback.
 

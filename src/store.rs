@@ -411,20 +411,20 @@ impl Tenant {
         Ok(self.bump("delete", path, UpdateKind::Module))
     }
 
+    /// The event carries `prev`, the version it follows, as well as the one it makes. A client that
+    /// holds some other version has missed a message, and `live.js` reloads rather than swapping
+    /// (issue #62) — a lost `module` event would otherwise leave it swapping CSS over stale JS.
     fn bump(&self, event: &str, path: &str, kind: UpdateKind) -> u64 {
-        let mut v = self.version.load(Ordering::Relaxed);
-        loop {
-            let next = now_millis().max(v + 1);
-            match self.version.compare_exchange(v, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => {
-                    v = next;
-                    break;
-                }
-                Err(cur) => v = cur,
+        let mut prev = self.version.load(Ordering::Relaxed);
+        let v = loop {
+            let next = now_millis().max(prev + 1);
+            match self.version.compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break next,
+                Err(cur) => prev = cur,
             }
-        }
+        };
         let _ = self.events.send(format!(
-            r#"{{"type":"{event}","path":{},"kind":"{}","version":{v}}}"#,
+            r#"{{"type":"{event}","path":{},"kind":"{}","version":{v},"prev":{prev}}}"#,
             serde_json::to_string(path).unwrap_or_default(),
             kind.as_str()
         ));
@@ -681,9 +681,23 @@ fn stage_delete(staged: &mut Staged, overlay: &BTreeMap<String, Option<FileData>
     staged.tombstones(&list)
 }
 
+/// Why a tenant is not here. A caller that cannot tell the two apart reports a customer's site that
+/// this node could not load as one that never existed (issue #61).
+#[derive(Debug)]
+pub enum NoTenant {
+    /// Neither the map nor `--data-dir` holds it.
+    Unknown,
+    /// `<data-dir>/<id>` is there and a tenant could not be built from it; the reason is the string.
+    Failed(String),
+}
+
 pub struct Store {
     bases: RwLock<HashMap<String, Arc<Base>>>,
     tenants: RwLock<HashMap<String, Arc<Tenant>>>,
+    /// Tenant ids whose data directory is on disk and would not load, and why: `restore` fills it at
+    /// startup and `resolve` on a later miss. Reported by `/api/stats`, `/metrics` and the editor,
+    /// because a tenant that answers 404 while the daemon reports itself healthy is invisible.
+    failed: RwLock<BTreeMap<String, String>>,
     data_dir: Option<PathBuf>,
     bases_dir: Option<PathBuf>,
     tenant_quota: u64,
@@ -691,7 +705,14 @@ pub struct Store {
 
 impl Store {
     pub fn new(data_dir: Option<PathBuf>, tenant_quota: u64) -> Store {
-        Store { bases: RwLock::new(HashMap::new()), tenants: RwLock::new(HashMap::new()), data_dir, bases_dir: None, tenant_quota }
+        Store {
+            bases: RwLock::new(HashMap::new()),
+            tenants: RwLock::new(HashMap::new()),
+            failed: RwLock::new(BTreeMap::new()),
+            data_dir,
+            bases_dir: None,
+            tenant_quota,
+        }
     }
 
     /// `--bases`: the directory a base added through the API must live under.
@@ -822,12 +843,37 @@ impl Store {
     /// other node is not in this node's map until something asks for it. What this does not do is
     /// refresh a tenant already in memory — it never sees the other node's later writes
     /// (`docs/multi-node.md`).
-    pub fn tenant(&self, id: &str) -> Option<Arc<Tenant>> {
+    ///
+    /// A directory that is there and will not load is `NoTenant::Failed`, not `Unknown`, and is
+    /// remembered so `/api/stats`, `/metrics` and the editor can report it.
+    pub fn resolve(&self, id: &str) -> Result<Arc<Tenant>, NoTenant> {
         if let Some(t) = self.tenants.read().unwrap().get(id).cloned() {
-            return Some(t);
+            return Ok(t);
         }
-        let restored = Arc::new(self.read_tenant(id).ok()?);
-        Some(self.tenants.write().unwrap().entry(id.to_string()).or_insert(restored).clone())
+        if self.tenant_dir(id).is_none() {
+            return Err(NoTenant::Unknown);
+        }
+        match self.read_tenant(id) {
+            Ok(t) => {
+                self.failed.write().unwrap().remove(id);
+                let restored = Arc::new(t);
+                Ok(self.tenants.write().unwrap().entry(id.to_string()).or_insert(restored).clone())
+            }
+            Err(e) => {
+                self.failed.write().unwrap().insert(id.to_string(), e.clone());
+                Err(NoTenant::Failed(e))
+            }
+        }
+    }
+
+    pub fn tenant(&self, id: &str) -> Option<Arc<Tenant>> {
+        self.resolve(id).ok()
+    }
+
+    /// The tenants whose data directory this node could not build a tenant from, id and reason, in
+    /// id order. Empty is the healthy answer; anything in it is a site answering nothing.
+    pub fn failed_tenants(&self) -> Vec<(String, String)> {
+        self.failed.read().unwrap().iter().map(|(id, e)| (id.clone(), e.clone())).collect()
     }
 
     /// `<data-dir>/<id>` when that directory is there: the bytes a tenant is, whether or not this
@@ -877,6 +923,7 @@ impl Store {
     /// error: it answered 204 and the tenant comes back at the next restore.
     pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
         let dropped = self.tenants.write().unwrap().remove(id);
+        self.failed.write().unwrap().remove(id);
         let dir = dropped.as_ref().and_then(|t| t.dir.clone()).or_else(|| self.tenant_dir(id));
         let mut held = dropped.is_some();
         if let Some(dir) = dir {
@@ -904,10 +951,14 @@ impl Store {
             let id = entry.file_name().to_string_lossy().into_owned();
             match self.read_tenant(&id) {
                 Ok(tenant) => {
+                    self.failed.write().unwrap().remove(&id);
                     self.tenants.write().unwrap().insert(id, Arc::new(tenant));
                     n += 1;
                 }
-                Err(e) => eprintln!("data dir entry '{id}': {e}, skipping"),
+                Err(e) => {
+                    eprintln!("data dir entry '{id}': {e}, skipping");
+                    self.failed.write().unwrap().insert(id, e);
+                }
             }
         }
         Ok(n)
@@ -1167,6 +1218,63 @@ mod tests {
         assert!(seen[0].contains(r#""type":"update","path":"src/styles/a.css","kind":"css""#), "{}", seen[0]);
         assert!(seen[1].contains(r#""kind":"style""#), "{}", seen[1]);
         assert!(seen[2].contains(r#""type":"delete","path":"src/styles/a.css","kind":"module""#), "{}", seen[2]);
+    }
+
+    /// Issue #61: a tenant whose directory is there and will not load used to leave nothing behind
+    /// but a line on stderr — the site answered 404 and the daemon called itself healthy.
+    #[test]
+    fn a_tenant_that_cannot_be_restored_is_counted_and_named() {
+        let root = temp("restore-failure");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let store = Store::new(Some(data.clone()), 1 << 20);
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        store.create_tenant("acme", "theme").unwrap();
+        // a tenant another node created on a base this one has not loaded
+        seed(data.join("bakery/tenant.json"), r#"{"base":"missing"}"#);
+        seed(data.join("bakery/files").join(PAGE), "<h1>bakery</h1>\n");
+
+        let fresh = Store::new(Some(data.clone()), 1 << 20);
+        fresh.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        assert_eq!(fresh.restore().unwrap(), 1, "the good tenant is restored");
+
+        let failed = fresh.failed_tenants();
+        assert_eq!(failed.len(), 1, "the one that would not load is counted, not dropped: {failed:?}");
+        assert_eq!(failed[0].0, "bakery");
+        assert!(failed[0].1.contains("missing"), "the reason names the base: {}", failed[0].1);
+
+        // never existed and could not be loaded stay apart
+        assert!(matches!(fresh.resolve("bakery"), Err(NoTenant::Failed(_))));
+        assert!(matches!(fresh.resolve("nobody"), Err(NoTenant::Unknown)));
+        assert!(fresh.resolve("acme").is_ok());
+
+        // and a miss on a later request records the same way
+        let cold = Store::new(Some(data.clone()), 1 << 20);
+        assert!(cold.failed_tenants().is_empty());
+        assert!(matches!(cold.resolve("bakery"), Err(NoTenant::Failed(_))));
+        assert_eq!(cold.failed_tenants().len(), 1);
+
+        // deleting it closes the gap rather than leaving a phantom failure behind
+        assert!(fresh.remove_tenant("bakery").unwrap());
+        assert!(fresh.failed_tenants().is_empty());
+        assert!(matches!(fresh.resolve("bakery"), Err(NoTenant::Unknown)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #62: the client can only refuse a swap it should not apply if every event says which
+    /// version it follows.
+    #[test]
+    fn every_event_names_the_version_it_follows() {
+        let t = tenant(u64::MAX, None);
+        let mut events = t.events.subscribe();
+        let start = t.version();
+        let a = t.write("src/styles/a.css", b"a{}".to_vec(), UpdateKind::Css).unwrap();
+        let b = t.write("src/x.astro", b"<p/>".to_vec(), UpdateKind::Style).unwrap();
+        let c = t.delete("src/styles/a.css").unwrap();
+        let seen: Vec<String> = (0..3).map(|_| events.try_recv().unwrap()).collect();
+        assert!(seen[0].contains(&format!(r#""version":{a},"prev":{start}"#)), "{}", seen[0]);
+        assert!(seen[1].contains(&format!(r#""version":{b},"prev":{a}"#)), "{}", seen[1]);
+        assert!(seen[2].contains(&format!(r#""version":{c},"prev":{b}"#)), "{}", seen[2]);
     }
 
     #[test]
