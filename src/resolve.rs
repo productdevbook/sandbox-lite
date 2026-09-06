@@ -1,7 +1,7 @@
 use crate::store::Tenant;
 
 pub const SHIM_PREFIX: &str = "/__sl/shim/";
-const EXTS: &[&str] = &["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", ".json", ".astro", ".md", ".mdx"];
+const EXTS: &[&str] = &["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", ".json", ".astro", ".md", ".mdx", ".vue", ".svelte"];
 const INDEX: &[&str] = &["/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.astro"];
 
 pub struct Resolver<'a> {
@@ -171,6 +171,22 @@ pub fn renderers(tenant: &Tenant, cdn: &str) -> Vec<RendererCfg> {
             client: Some(format!("{}/@astrojs/preact@{r}/client.js?deps=preact@{preact}", cdn.trim_end_matches('/'))),
         });
     }
+    // Vue and Svelte SFCs are compiled in the browser, so both entrypoints are shims of ours:
+    // @astrojs/vue's client.js imports a Vite virtual module and @astrojs/svelte's is uncompiled runes.
+    if range("@astrojs/vue").is_some() {
+        out.push(RendererCfg {
+            name: "@astrojs/vue".into(),
+            server: shim_url("renderer-vue"),
+            client: Some(shim_url("renderer-vue-client")),
+        });
+    }
+    if range("@astrojs/svelte").is_some() {
+        out.push(RendererCfg {
+            name: "@astrojs/svelte".into(),
+            server: shim_url("renderer-svelte"),
+            client: Some(shim_url("renderer-svelte-client")),
+        });
+    }
     if let Some(text) = tenant.read_text("sandbox-lite.json")
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text))
         && let Some(list) = json.get("renderers").and_then(|r| r.as_array())
@@ -189,6 +205,17 @@ pub fn renderers(tenant: &Tenant, cdn: &str) -> Vec<RendererCfg> {
         }
     }
     out
+}
+
+/// `@vue/compiler-sfc` must match the `vue` it compiles for, and an Astro project never lists it.
+pub fn vue_compiler_url(tenant: &Tenant, cdn: &str) -> String {
+    let deps = package_deps(tenant);
+    let range = deps.iter().find(|(n, _)| n == "@vue/compiler-sfc").or_else(|| deps.iter().find(|(n, _)| n == "vue"));
+    let spec = match range {
+        Some((_, r)) if !r.is_empty() && !r.contains(':') && !r.starts_with("file") => format!("@vue/compiler-sfc@{r}"),
+        _ => "@vue/compiler-sfc".to_string(),
+    };
+    format!("{}/{spec}", cdn.trim_end_matches('/'))
 }
 
 pub fn tenant_site(tenant: &Tenant) -> Option<String> {

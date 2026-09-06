@@ -1,0 +1,9 @@
+---
+import Layout from "../layouts/Layout.astro";
+import Counter from "../components/Counter.vue";
+---
+<Layout title="Vue islands">
+  <h1>Vue in the preview</h1>
+  <p class="lede">The single-file component below is compiled by <code>@vue/compiler-sfc</code> in your browser, rendered to HTML with <code>@vue/server-renderer</code>, then hydrated with <code>client:load</code>.</p>
+  <Counter client:load label="Visitors today" start={41} />
+</Layout>

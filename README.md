@@ -41,10 +41,10 @@ in-process with Astro's `satteri-mdxjs`, rendered with Astro's JSX runtime);
 dynamic routes with `getStaticPaths` and `paginate`;
 `import.meta.glob` (eager and lazy, `import:`/`query:` options); `import.meta.env`
 and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
-CDN pinned to the versions in `package.json`; React and Preact islands
-(`client:load` and friends hydrate with the framework's own client entrypoint,
-whether the component is a file in `src/` or a component imported from a
-package);
+CDN pinned to the versions in `package.json`; React, Preact, Vue and Svelte
+islands (`client:load` and friends hydrate with the framework's own runtime,
+whether the component is a file in `src/` or one imported from a package, and
+`.vue`/`.svelte` single-file components are compiled in the browser);
 `<script>` tags, `public/` files and live reload.
 
 ## What it costs
@@ -243,12 +243,12 @@ Tenant host (`<id>.<domain>`):
 | Path | |
 |---|---|
 | `/` and any page path | shell HTML that renders the matching `src/pages` route in the browser |
-| `/__sl/m/<path>?v=N` | compiled ES module (`.astro`, `.ts`, `.tsx`, `.css`, `.scss`, `.json`, `.md`, `.mdx`, images; `?raw`, `?url`) |
+| `/__sl/m/<path>?v=N` | compiled ES module (`.astro`, `.ts`, `.tsx`, `.css`, `.scss`, `.json`, `.md`, `.mdx`, `.vue`, `.svelte`, images; `?raw`, `?url`) |
 | `/__sl/m/<file>.astro?astro&type=style&index=i` | one scoped `<style>` block of a component |
 | `/__sl/m/<file>.astro?astro&type=script&index=i` | one hoisted `<script>` of a component |
 | `/__sl/raw/<path>` | file as-is (assets, `@import`ed CSS) |
 | `/__sl/routes.json` | route table built from `src/pages`, in Astro priority order |
-| `/__sl/renderers.json` | framework renderers to register, derived from `package.json` (`@astrojs/react`, `@astrojs/preact`) or `sandbox-lite.json` |
+| `/__sl/renderers.json` | framework renderers to register, derived from `package.json` (`@astrojs/react`, `@astrojs/preact`, `@astrojs/vue`, `@astrojs/svelte`) or `sandbox-lite.json` |
 | `/__sl/content/<collection>` | `{entries, dates}` — the collection's entries and the schema's date fields; Markdown arrives rendered, MDX entries render through their compiled module |
 | `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, …; `astro-jsx-runtime.js` is Astro's JSX runtime and `astro:jsx` renderer |
 | `/__sl/astro.js` | Astro's runtime + container API, bundled once per Astro version |
@@ -294,6 +294,8 @@ assets/                shell.html, shell.js, live.js, editor.html, astro.js and 
 examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         React islands hydrated with client:load, one local and one imported from npm
+examples/vue           a Vue SFC compiled in the browser and hydrated with client:load
+examples/svelte        the same for a Svelte 5 component
 scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
 e2e/                   Playwright suite for the browser side: every example page, live reload, hydration, the error overlay
@@ -301,10 +303,17 @@ e2e/                   Playwright suite for the browser side: every example page
 
 ## What the preview does not do
 
-- **Vue, Svelte and Solid islands.** Only React and Preact renderers ship;
-  another framework needs a `server` module exposing `check` and
+- **Solid islands.** React, Preact, Vue and Svelte renderers ship; another
+  framework needs a `server` module exposing `check` and
   `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 40 lines) and a
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
+- **TypeScript inside a `.vue` or `.svelte` file.** There is no Rust compiler
+  for either format, so the daemon serves the component as a loader module that
+  runs `@vue/compiler-sfc` or `svelte/compiler` in the browser and imports the
+  result as a blob module. A blob has no import map, so the loader rewrites
+  `vue`/`svelte` imports to the CDN and relative ones against the component's
+  own URL: `./Other.vue` works, `./other` (no extension) does not, and
+  `<script lang="ts">` reaches the browser as TypeScript and fails to parse.
 - **Endpoints.** `src/pages/*.ts` endpoints show an "unsupported route" page.
 - **Less/Stylus.** Sass works; other preprocessors are passed through untouched.
 - **`content.config.ts` loaders.** The config is read statically, never
