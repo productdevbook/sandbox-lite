@@ -70,7 +70,8 @@ machine at all.
 Per-tenant state is the overlay (only edited files) plus a content-addressed
 transform cache shared by every tenant: two tenants with the same `Header.astro`
 share one compiled output. The cache has a byte budget (`--cache-mb`, default
-64) so the daemon's memory is bounded regardless of tenant count.
+64), so its share of the daemon's memory is bounded regardless of tenant count;
+overlays grow with what tenants write.
 
 ## Try it
 
@@ -170,7 +171,7 @@ Tenant host (`<id>.<domain>`):
 ## How a page renders
 
 1. `GET http://acme.localhost:4321/blog/hello-world` → the daemon answers with a
-   30-line shell that carries the tenant id, version and `import.meta.env`.
+   short shell page that carries the tenant id, version and `import.meta.env`.
 2. `shell.js` fetches `routes.json`, matches the path, and `import()`s
    `/__sl/m/src/pages/blog/[slug].astro?v=…`.
 3. The daemon compiles that file with `astro_codegen`, parses the output with
@@ -203,7 +204,7 @@ src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), impor
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop
 src/check.rs           the `check` subcommand
 assets/                shell.html, shell.js, live.js, editor.html, astro.js bundle, astro:* shims
-examples/starter       a dependency-free Astro 7 site used as the default base
+examples/starter       a dependency-free Astro 7 site; the base CI's smoke test and bench/mem.sh use
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         a React island hydrated with client:load
 scripts/build-runtime.sh   regenerates assets/astro.js for a new Astro version
@@ -224,8 +225,11 @@ bench/mem.sh           the memory measurement above
   theme; custom loaders are ignored.
 - **`astro.config.*`** is not executed. `site` can be set in `sandbox-lite.json`
   (`{"site": "https://example.com", "imports": {"react": "https://esm.sh/react@19"}}`).
-- **Authentication.** The editor and `/api/*` trust every caller; put them
-  behind your product's own auth and expose only the tenant hosts to customers.
+- **Authentication.** There are no users: `--api-token` is one shared bearer
+  token for `/api/*`, and `--preview-secret` gates tenant hosts with per-tenant
+  links; both are off by default. Put the editor and `/api/*` behind your
+  product's own auth and expose only the tenant hosts to customers. See
+  `SECURITY.md`.
 - **Production builds.** This is the preview. Ship with `astro build` as usual;
   the compiled output is the same compiler, so what you see is what builds.
 

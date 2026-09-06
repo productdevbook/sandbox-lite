@@ -1,0 +1,198 @@
+# Security
+
+This document describes what sandbox-lite enforces, what it leaves to the
+operator, and how to report a vulnerability. Every statement below is about the
+code in `src/` and `assets/` as it is; where the README is looser, this
+document wins.
+
+## Reporting a vulnerability
+
+Report privately through GitHub's vulnerability reporting for this repository:
+<https://github.com/productdevbook/sandbox-lite/security/advisories/new>
+(Security tab → Advisories → Report a vulnerability). Do not open a public
+issue for anything that lets one tenant read or write another tenant, reach the
+editor or API from a preview host, or read files outside a tenant's tree.
+
+Include the commit (`git rev-parse HEAD` — there are no tagged releases; `main`
+is the only supported line), the flags the daemon was started with, and a
+reproduction as requests: `Host` header, path, body, and the tenant files
+involved.
+
+## What runs where
+
+One process, one listener (`--listen`, default `127.0.0.1:4321`). The `Host`
+header of each request decides which of two routers answers
+(`dispatch` and `tenant_from_host` in `src/http/mod.rs`):
+
+| Host | Router | Contents |
+|---|---|---|
+| `<id>.<domain>` — exactly one label before `--domain`, and the label is a valid tenant id (1–63 bytes of `a-z`, `0-9`, `-`, no leading or trailing dash) | tenant | the shell page, `public/` files and everything under `/__sl/` for that tenant |
+| anything else — the bare domain, the daemon's IP address, a name with two labels, a missing `Host` header | editor / API | `/` (the editor), `/health`, `/api/*` |
+
+So the editor and the API are not only "on the bare domain": they answer on
+every hostname that does not parse as a tenant host. Put the daemon behind a
+proxy that only forwards the hostnames you intend, and treat every request
+that reaches the editor/API router as coming from your own backend.
+
+Tenant files never run inside the daemon. The daemon compiles `.astro`
+(astro_codegen), TypeScript/JSX (oxc), Sass (grass), Markdown (pulldown-cmark)
+and parses JSON/YAML; the resulting JavaScript runs in the visitor's browser on
+the tenant origin, using Astro's own runtime bundled as `/__sl/astro.js`.
+
+Whoever can call `/api/*` owns every tenant: create, delete, read and write any
+file, drive the chat endpoint. There are no users, roles or per-tenant
+credentials on the API side.
+
+## What the daemon enforces
+
+- **Paths.** Every file path taken from a request — `/api/t/{id}/file/{path}`,
+  `/__sl/m/{path}`, `/__sl/raw/{path}`, the page fallback that serves
+  `public/`, and the paths the chat tools receive — goes through `clean_path`
+  (`src/store.rs`): the leading `/` is dropped, empty and `.` segments are
+  removed, and the path is rejected if it is empty, contains `\` or a NUL
+  byte, or has any `..` segment. Paths are relative to the tenant tree and
+  cannot leave it.
+- **Tenant ids** are validated by `valid_id` (same rule as the host label) and
+  are used as directory names under `--data-dir`.
+- **Base projects** are read once at startup. `node_modules`, `.git`, `dist`,
+  `.astro`, `.vercel`, `.netlify` and `.output` are skipped, and so is anything
+  that is not a regular file or directory (symbolic links are not followed).
+- **Request bodies** on the editor/API router are capped at 64 MiB
+  (`DefaultBodyLimit`). No tenant-host handler reads a request body.
+- **Host matching** is exact: `a.b.<domain>` and `evil-<domain>` are not tenant
+  hosts.
+- **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly; SameSite=Lax`
+  and no `Domain` attribute, so it is a host-only session cookie for that one
+  tenant host. `Secure` is added only when the request carried
+  `x-forwarded-proto: https`.
+
+The daemon sets no CORS, CSP, `X-Frame-Options` or `Referrer-Policy` headers.
+Cross-origin reads between tenant hosts are blocked by the browser's
+same-origin policy because no CORS headers are sent; framing and navigation
+between hosts are not restricted.
+
+## The two authentication flags
+
+Both are off unless set. `SANDBOX_LITE_API_TOKEN` and
+`SANDBOX_LITE_PREVIEW_SECRET` are read as defaults (empty values are ignored).
+The Docker image sets neither, so a container started without environment
+variables is fully open on `0.0.0.0:4321`.
+
+### `--api-token TOKEN` (`require_api_token`, `src/http/mod.rs`)
+
+Wraps the editor/API router. `/` and `/health` are exempt; everything else on
+that router answers `401` unless the request carries
+`Authorization: Bearer TOKEN` or `?token=TOKEN`.
+
+- It is one shared secret. There is no way to hand a caller access to a single
+  tenant through the API.
+- The query form exists because `EventSource` cannot set headers (the editor
+  uses it for `/api/t/{id}/events`); a token in a URL ends up in proxy and
+  access logs.
+- The editor page keeps the token in `localStorage` (`sl_api_token`) on the
+  editor origin.
+- It gates spending: every `POST /api/t/{id}/chat` can make up to 16 calls to
+  the Anthropic API with the daemon's `ANTHROPIC_API_KEY`.
+- It does nothing for tenant hosts.
+
+### `--preview-secret S` (`require_preview_token`, `src/http/mod.rs`)
+
+Wraps the whole tenant router: the shell, `public/` files and every `/__sl/`
+endpoint, including `/__sl/raw/`, `/__sl/events` and `/__sl/check`.
+
+- The per-tenant token is `preview_token(S, id)`: the first 32 hex characters
+  of a BLAKE3 keyed hash of the tenant id, with the key derived from `S`. It
+  is a pure function of the secret and the id: it never expires and cannot be
+  revoked for one tenant. Rotating `S` invalidates every tenant's link at once.
+- `GET http://<id>.<domain>/any/path?sl_token=<token>`: a wrong token answers
+  `403`; the right one answers `303` to the same path with the parameter
+  removed and sets the `sl_t` cookie described above. Later requests are
+  accepted when the cookie equals the token, otherwise `403`.
+- `/api/tenants` returns each tenant's `preview_token` and a ready-made
+  `preview` link, so anyone with API access can open every preview.
+- The `preview` link the API builds is
+  `http://<id>.<domain>:<port>/?sl_token=…` — plain `http` and the daemon's
+  own listen port, whatever proxy is in front. Behind TLS, build the link
+  yourself from `preview_token`.
+- It does nothing for the editor/API router.
+
+## Tenant files are public to anyone who can open the preview
+
+`/__sl/raw/<path>` returns any file of the tenant (base project plus overlay)
+as-is, and `/__sl/m/<path>?raw` returns it as a module. That includes `.env`,
+`package.json`, `sandbox-lite.json` and every source file. Only the shell's
+`import.meta.env` is filtered to `PUBLIC_*` keys; the `.env` file itself is
+not. The compiled output of every page and component is served too, because
+that is what the browser renders.
+
+Do not put secrets in base projects or tenant trees. With `--preview-secret`
+the audience is "whoever has the tenant's link"; without it, the audience is
+the network.
+
+## Put previews on their own registrable domain
+
+Tenant JavaScript runs on `<id>.<domain>`. The daemon's own cookie is
+host-only, but cookies set by the operator's other services are governed by
+browser rules, not by the daemon:
+
+- A cookie set with `Domain=example.com` is sent by the browser with every
+  request a page on `acme.preview.example.com` makes to `*.example.com`, and
+  is readable through `document.cookie` unless it is `HttpOnly`.
+- `SameSite=Lax` and `SameSite=Strict` compare registrable domains.
+  `acme.preview.example.com` and `app.example.com` are the same site, so
+  `SameSite` does not stop a tenant page from making credentialed requests to
+  `app.example.com`.
+
+The consequence: never set a cookie whose `Domain=` covers the preview hosts,
+and, because the second point holds even for host-only cookies on your
+product's domain, run previews on a separate registrable domain
+(`example-preview.net`, not `preview.example.com`) or on a name registered on
+the Public Suffix List. Keep the editor and the API off that domain: the
+editor stores the API token in `localStorage` and embeds tenant previews in an
+`<iframe>`, which is safe only while the two are different origins.
+
+## What leaves the machine
+
+- **Anthropic API.** When `ANTHROPIC_API_KEY` is set, `POST /api/t/{id}/chat`
+  sends to `https://api.anthropic.com/v1/messages`: the conversation the
+  caller supplies, a system prompt containing the tenant id and base name, and
+  every tool result — the file listing, the contents of any file the model
+  reads (up to 200 KiB per file, any path in the tenant), and `check`
+  diagnostics. `write_file` and `delete_file` take effect on the tenant
+  immediately, without confirmation. Without the key the endpoint answers
+  `503` and nothing is sent.
+- **CDN, in the visitor's browser.** Bare imports (`react`, `dayjs`) resolve to
+  `--cdn` (default `https://esm.sh`) with the version range from
+  `package.json`; React and Preact client entrypoints come from the same CDN.
+  `sandbox-lite.json` `imports` can map a specifier to any URL, and tenant
+  code can import any absolute URL directly. Tailwind's browser build is
+  always loaded from `https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4`
+  (hard-coded in `assets/shell.js`); `--cdn` does not change that.
+
+## Limits that do not exist
+
+- No rate limiting on any route.
+- Compilation is CPU work per request; `/__sl/check` and `/api/t/{id}/check`
+  build every source file of a tenant on every call — a cache hit for an
+  unchanged file, a compile for a changed one.
+- The transform cache is bounded by `--cache-mb`; tenant overlays are not. A
+  caller with API access can create any number of tenants and write files of
+  up to 64 MiB each. With persistence every write goes to disk under
+  `--data-dir`, and files over 256 KiB are kept only there and re-read on
+  demand; with `--no-persist`, every written file is held in memory whatever
+  its size.
+- Tenant code is limited only by the visitor's browser.
+
+## Deployment checklist
+
+1. Previews on their own registrable domain; wildcard DNS for it; `--domain`
+   set to that name.
+2. Editor and `/api/*` reachable only from your backend, on a hostname the
+   proxy does not expose; `--api-token` set as well.
+3. `--preview-secret` set; links built from `preview_token` with your scheme
+   and host; the TLS proxy sends `x-forwarded-proto: https` so the cookie is
+   `Secure`.
+4. No secrets in base projects or tenant files.
+5. Your own limits on tenant count, write volume and request rate.
+6. `ANTHROPIC_API_KEY` only if the chat endpoint is wanted, knowing what it
+   sends and that the API token is the only thing gating it.

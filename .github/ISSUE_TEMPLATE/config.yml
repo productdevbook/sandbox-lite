@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/productdevbook/sandbox-lite/security/advisories/new
+    about: Private report through GitHub security advisories. See SECURITY.md.

@@ -1,0 +1,52 @@
+name: Bug
+description: Something the daemon or the preview does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bug report is a scenario: the inputs, then the wrong outcome. Vulnerabilities go through SECURITY.md, not here.
+  - type: textarea
+    id: scenario
+    attributes:
+      label: What happened
+      description: The request or action, and what came back. Include the Host header and path for preview requests, and the daemon's stderr if it printed anything.
+      placeholder: |
+        PUT /api/t/acme/file/src/pages/index.astro with the file below, then GET http://acme.localhost:4321/ shows "Render failed: …"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Files to reproduce it
+      description: The smallest tenant files that trigger it, or the base project (one of examples/*, or a link to the theme) plus the edit.
+      render: text
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `sandbox-lite check`
+      description: Run `./target/release/sandbox-lite check <project dir>` on the project and paste the output, if the bug is about compiling or rendering.
+      render: text
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse HEAD` (there are no tagged releases).
+    validations:
+      required: true
+  - type: input
+    id: flags
+    attributes:
+      label: How the daemon was started
+      placeholder: ./target/release/sandbox-lite --domain preview.example.com --api-token … --preview-secret …
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      description: Pages render in the browser, so this matters for preview bugs.
