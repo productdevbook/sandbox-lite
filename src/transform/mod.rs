@@ -8,9 +8,10 @@ pub mod mdx;
 pub mod scss;
 pub mod sfc;
 
+use std::any::Any;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -227,6 +228,7 @@ pub struct Config {
     pub cache_bytes: usize,
     pub max_source_bytes: usize,
     pub sass_timeout: Duration,
+    pub compile_timeout: Duration,
     pub max_compiles: usize,
 }
 
@@ -237,6 +239,7 @@ impl Default for Config {
             cache_bytes: 64 << 20,
             max_source_bytes: 64 << 10,
             sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
+            compile_timeout: Duration::from_millis(DEFAULT_COMPILE_TIMEOUT_MS),
             max_compiles: default_max_compiles(),
         }
     }
@@ -263,6 +266,17 @@ struct Cache {
 /// instead of holding the connection open.
 const COMPILE_QUEUE_WAIT: Duration = Duration::from_secs(5);
 
+/// How long one compile may run before the request gives up on it. A whole `.astro` file of the
+/// example projects compiles in single-digit milliseconds, and the Sass inside one has its own
+/// five-second deadline, so ten seconds is three orders of magnitude of headroom over anything
+/// written by hand and still bounds what one request can hold.
+pub const DEFAULT_COMPILE_TIMEOUT_MS: u64 = 10_000;
+
+/// Compile threads that may be running past their deadline before compilation is refused outright.
+/// Each one keeps a core and a `parser_stack_bytes()` reservation until it returns on its own, and
+/// nothing can take those back, so past this the honest answer to a new compile is 503.
+const MAX_RUNAWAY_COMPILES: usize = 8;
+
 /// Compiles that may run at once when nothing says otherwise. A compile is CPU-bound and holds a
 /// `parser_stack_bytes()` reservation while it runs, so more of them than cores buys queueing.
 pub fn default_max_compiles() -> usize {
@@ -275,6 +289,8 @@ pub struct CompileStats {
     pub queued: usize,
     pub limit: usize,
     pub refused: u64,
+    pub runaway: usize,
+    pub timeouts: u64,
 }
 
 #[derive(Default)]
@@ -287,12 +303,29 @@ struct GateState {
 /// address space on a thread of its own and tokio's blocking pool would let 512 of those exist
 /// together, so without this the ceiling is the OS rather than a decision.
 struct Gate {
-    limit: usize,
+    limit: AtomicUsize,
     wait: Duration,
+    max_runaway: usize,
     state: Mutex<GateState>,
     free: Condvar,
     refused: AtomicU64,
+    runaway: AtomicUsize,
+    timeouts: AtomicU64,
 }
+
+/// A compile that is still running, and whether the request that started it has given up on it.
+struct Flight {
+    done: Mutex<Option<Outcome>>,
+    ready: Condvar,
+    state: AtomicU8,
+}
+
+/// What a compile thread hands back: the build, or the panic payload to resume on the waiter.
+type Outcome = Result<Result<Built, BuildError>, Box<dyn Any + Send>>;
+
+const RUNNING: u8 = 0;
+const RUNAWAY: u8 = 1;
+const SETTLED: u8 = 2;
 
 struct Permit<'a>(&'a Gate);
 
@@ -306,13 +339,29 @@ impl Drop for Permit<'_> {
 }
 
 impl Gate {
-    fn new(limit: usize, wait: Duration) -> Gate {
-        Gate { limit, wait, state: Mutex::new(GateState::default()), free: Condvar::new(), refused: AtomicU64::new(0) }
+    fn new(limit: usize, wait: Duration, max_runaway: usize) -> Gate {
+        Gate {
+            limit: AtomicUsize::new(limit),
+            wait,
+            max_runaway,
+            state: Mutex::new(GateState::default()),
+            free: Condvar::new(),
+            refused: AtomicU64::new(0),
+            runaway: AtomicUsize::new(0),
+            timeouts: AtomicU64::new(0),
+        }
     }
 
     fn stats(&self) -> CompileStats {
         let state = self.state.lock().unwrap();
-        CompileStats { running: state.running, queued: state.queued, limit: self.limit, refused: self.refused.load(Ordering::Relaxed) }
+        CompileStats {
+            running: state.running,
+            queued: state.queued,
+            limit: self.limit.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+            runaway: self.runaway.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+        }
     }
 
     /// `None` when this thread is already compiling under a permit: a `?type=style` build asks for
@@ -321,8 +370,16 @@ impl Gate {
         if COMPILING.get() {
             return Ok(None);
         }
+        let runaway = self.runaway.load(Ordering::Relaxed);
+        if runaway >= self.max_runaway {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "{runaway} compiles are still running past their deadline and cannot be interrupted; not starting another"
+            ));
+        }
+        let limit = self.limit.load(Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
-        if state.running >= self.limit {
+        if state.running >= limit {
             let deadline = Instant::now() + self.wait;
             state.queued += 1;
             loop {
@@ -330,11 +387,11 @@ impl Gate {
                     state.queued -= 1;
                     drop(state);
                     self.refused.fetch_add(1, Ordering::Relaxed);
-                    let (n, ms) = (self.limit, self.wait.as_millis());
-                    return Err(format!("{n} compiles are already running and this one waited {ms} ms for a slot"));
+                    let ms = self.wait.as_millis();
+                    return Err(format!("{limit} compiles are already running and this one waited {ms} ms for a slot"));
                 };
                 state = self.free.wait_timeout(state, left).unwrap().0;
-                if state.running < self.limit {
+                if state.running < limit {
                     state.queued -= 1;
                     break;
                 }
@@ -342,6 +399,25 @@ impl Gate {
         }
         state.running += 1;
         Ok(Some(Permit(self)))
+    }
+
+    /// A compile passed its deadline. The permit goes back to the pool the moment the request
+    /// returns; the thread cannot be stopped, so it is counted here until it ends on its own. Both
+    /// this and `settled` take the gate's lock, so a compile that finishes in the same instant as
+    /// the deadline is either counted and uncounted or neither.
+    fn overran(&self, state: &AtomicU8) {
+        let _lock = self.state.lock().unwrap();
+        if state.compare_exchange(RUNNING, RUNAWAY, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            self.runaway.fetch_add(1, Ordering::Relaxed);
+            self.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn settled(&self, state: &AtomicU8) {
+        let _lock = self.state.lock().unwrap();
+        if state.swap(SETTLED, Ordering::Relaxed) == RUNAWAY {
+            self.runaway.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -365,7 +441,12 @@ impl Drop for Compiling {
 /// emptied rather than evicted one by one: a forgotten entry costs a page reload, nothing more.
 const LAST_JS_ENTRIES: usize = 4096;
 
-pub struct Engine {
+/// A handle, not the engine itself: a compile that overruns its deadline is abandoned rather than
+/// joined, so the thread running it must keep everything it may still touch alive.
+#[derive(Clone)]
+pub struct Engine(Arc<EngineInner>);
+
+pub struct EngineInner {
     pub cfg: Config,
     cache: Mutex<Cache>,
     /// The JS each `.astro` module last compiled to, so a write can be told apart from an edit that
@@ -376,18 +457,30 @@ pub struct Engine {
     metrics: Arc<Metrics>,
 }
 
+impl std::ops::Deref for Engine {
+    type Target = EngineInner;
+
+    fn deref(&self) -> &EngineInner {
+        &self.0
+    }
+}
+
 impl Engine {
     pub fn new(cfg: Config, metrics: Arc<Metrics>) -> Engine {
+        let gate = Gate::new(cfg.max_compiles.max(1), COMPILE_QUEUE_WAIT, MAX_RUNAWAY_COMPILES);
+        Engine::with_gate(cfg, metrics, gate)
+    }
+
+    fn with_gate(cfg: Config, metrics: Arc<Metrics>, gate: Gate) -> Engine {
         let sass = scss::Sass::new(cfg.sass_timeout);
-        let gate = Gate::new(cfg.max_compiles.max(1), COMPILE_QUEUE_WAIT);
-        Engine {
+        Engine(Arc::new(EngineInner {
             cfg,
             cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }),
             last_js: Mutex::new(HashMap::new()),
             sass,
             gate,
             metrics,
-        }
+        }))
     }
 
     pub fn parser_stack_bytes(&self) -> usize {
@@ -442,12 +535,12 @@ impl Engine {
         }
     }
 
-    pub fn build(&self, tenant: &Tenant, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
+    pub fn build(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
         let data = tenant
             .read(path)
             .map_err(|e| BuildError::compile(format!("{path}: {e}"), vec![]))?
             .ok_or_else(|| BuildError::not_found(path))?;
-        let built = self.build_bytes(tenant, path, kind, &data)?;
+        let built = self.build_bytes(tenant, path, kind, data)?;
         self.remember(tenant, path, kind, &built);
         Ok(built)
     }
@@ -455,7 +548,7 @@ impl Engine {
     /// `build` of a source the tenant may not hold yet. The cache is content-addressed, so building
     /// the bytes of a write before it lands is the compile the next module request would have paid
     /// for anyway.
-    fn build_bytes(&self, tenant: &Tenant, path: &str, kind: Kind, data: &[u8]) -> Result<Arc<Built>, BuildError> {
+    fn build_bytes(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, data: Arc<[u8]>) -> Result<Arc<Built>, BuildError> {
         let site = crate::resolve::tenant_site(tenant).map_err(|e| BuildError::compile(e, vec![]))?;
         let mut h = Vec::with_capacity(data.len() + path.len() + 32);
         h.extend_from_slice(kind.tag().as_bytes());
@@ -464,25 +557,92 @@ impl Engine {
         h.push(0);
         h.extend_from_slice(site.as_deref().unwrap_or("").as_bytes());
         h.push(0);
-        if scss::is_sass_path(path) || (path.ends_with(".astro") && scss::uses_sass(&String::from_utf8_lossy(data))) {
+        if scss::is_sass_path(path) || (path.ends_with(".astro") && scss::uses_sass(&String::from_utf8_lossy(&data))) {
             h.extend_from_slice(&scss::fingerprint(tenant).to_le_bytes());
         }
-        h.extend_from_slice(data);
+        h.extend_from_slice(&data);
         let key = xxh3_128(&h);
         if let Some(b) = self.cached(key) {
             return Ok(b);
         }
+        self.within_caps(path, kind, &data)?;
         let _permit = self.gate.enter().map_err(|e| BuildError::busy(format!("{path}: {e}")))?;
         let started = Instant::now();
-        let spawned = self.on_parser_stack(|| {
-            let _compiling = Compiling::enter();
-            self.compile(tenant, path, kind, data, site.as_deref())
-        });
+        let compiled = self.bounded(tenant, path, kind, data, site);
         self.metrics.compiled(kind, started.elapsed());
-        let compiled = spawned.map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
         let built = Arc::new(compiled?);
         self.insert(key, built.clone());
         Ok(built)
+    }
+
+    /// The size and nesting caps, before a compile takes a permit or a thread: a source that cannot
+    /// be compiled has no business queueing for the right to try.
+    fn within_caps(&self, path: &str, kind: Kind, data: &[u8]) -> Result<(), BuildError> {
+        let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("").to_ascii_lowercase();
+        if kind != Kind::Module || !parses_source(&ext) {
+            return Ok(());
+        }
+        let max = self.cfg.max_source_bytes;
+        if data.len() > max {
+            let text = format!("file too large to compile: {} KiB, limit {} KiB", data.len() / 1024, max / 1024);
+            return Err(refused(path, text, "raise --max-source-kb, or split the file"));
+        }
+        let depth = nesting_depth(data);
+        if depth > MAX_NESTING_DEPTH {
+            let text = format!("source nests {depth} deep, limit {MAX_NESTING_DEPTH}");
+            return Err(refused(path, text, "unbalanced brackets are the usual cause"));
+        }
+        Ok(())
+    }
+
+    /// One compile, on a thread of its own, with a wall-clock deadline. `astro_codegen`, oxc and
+    /// satteri-mdxjs are synchronous and offer no cancellation, so a compile that overruns is
+    /// abandoned rather than joined: the request is answered with a diagnostic, the gate permit goes
+    /// back to the pool the moment this returns, and the thread is counted under `runaway` until it
+    /// ends on its own. The thread outlives the request, so everything it may touch is owned — an
+    /// `Engine` handle, the tenant, the source bytes.
+    ///
+    /// A `?type=style` or `?type=script` build asks for its module from inside its own compile. That
+    /// inner build runs here on the stack and under the deadline its parent already has, which is
+    /// what keeps one request to one thread and one permit.
+    fn bounded(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, data: Arc<[u8]>, site: Option<String>) -> Result<Built, BuildError> {
+        if ON_PARSER_STACK.get() {
+            let _compiling = Compiling::enter();
+            return self.compile(tenant, path, kind, &data, site.as_deref());
+        }
+        let flight = Arc::new(Flight { done: Mutex::new(None), ready: Condvar::new(), state: AtomicU8::new(RUNNING) });
+        let (engine, t, owned, mine) = (self.clone(), tenant.clone(), path.to_string(), flight.clone());
+        let spawned = std::thread::Builder::new().name("compile".into()).stack_size(self.parser_stack_bytes()).spawn(move || {
+            ON_PARSER_STACK.set(true);
+            let _compiling = Compiling::enter();
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compile(&t, &owned, kind, &data, site.as_deref())));
+            *mine.done.lock().unwrap() = Some(out);
+            mine.ready.notify_all();
+            engine.gate.settled(&mine.state);
+        });
+        if let Err(e) = spawned {
+            return Err(BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]));
+        }
+        #[cfg(test)]
+        SPAWNED.set(SPAWNED.get() + 1);
+        let deadline = Instant::now() + self.cfg.compile_timeout;
+        let mut done = flight.done.lock().unwrap();
+        loop {
+            if let Some(out) = done.take() {
+                drop(done);
+                return out.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+            done = flight.ready.wait_timeout(done, left).unwrap().0;
+        }
+        drop(done);
+        self.gate.overran(&flight.state);
+        let ms = self.cfg.compile_timeout.as_millis();
+        Err(refused(
+            path,
+            format!("compile did not finish within {ms} ms"),
+            "the compilers cannot be interrupted, so the thread was left to run out; raise --compile-timeout-ms, or split the file",
+        ))
     }
 
     /// Only ever called for content the tenant holds, so a fingerprint here is one a page could
@@ -505,19 +665,19 @@ impl Engine {
     /// `<style>` blocks, so those swap instead. Everything else reloads, and so does anything this
     /// cannot prove: an `.astro` file nothing has built yet, one that no longer compiles, one whose
     /// hoisted `<script>` changed.
-    pub fn update_kind(&self, tenant: &Tenant, path: &str, bytes: &[u8]) -> UpdateKind {
+    pub fn update_kind(&self, tenant: &Arc<Tenant>, path: &str, bytes: &[u8]) -> UpdateKind {
         if !path.ends_with(".astro") {
             return UpdateKind::from_path(path);
         }
         let before = self.last_js.lock().unwrap().get(&(tenant.id.clone(), path.to_string())).copied();
         let Some(before) = before else { return UpdateKind::Module };
-        match self.build_bytes(tenant, path, Kind::Module, bytes) {
+        match self.build_bytes(tenant, path, Kind::Module, Arc::from(bytes)) {
             Ok(built) if module_fingerprint(&built) == before => UpdateKind::Style,
             _ => UpdateKind::Module,
         }
     }
 
-    fn compile(&self, tenant: &Tenant, path: &str, kind: Kind, data: &[u8], site: Option<&str>) -> Result<Built, BuildError> {
+    fn compile(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, data: &[u8], site: Option<&str>) -> Result<Built, BuildError> {
         let text = || String::from_utf8_lossy(data).into_owned();
         match kind {
             Kind::Url => Ok(Built::js(format!("export default {};\n", json_str(&format!("/__sl/raw/{path}"))))),
@@ -540,18 +700,6 @@ impl Engine {
             }
             Kind::Module => {
                 let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("").to_ascii_lowercase();
-                if parses_source(&ext) {
-                    let max = self.cfg.max_source_bytes;
-                    if data.len() > max {
-                        let text = format!("file too large to compile: {} KiB, limit {} KiB", data.len() / 1024, max / 1024);
-                        return Err(refused(path, text, "raise --max-source-kb, or split the file"));
-                    }
-                    let depth = nesting_depth(data);
-                    if depth > MAX_NESTING_DEPTH {
-                        let text = format!("source nests {depth} deep, limit {MAX_NESTING_DEPTH}");
-                        return Err(refused(path, text, "unbalanced brackets are the usual cause"));
-                    }
-                }
                 match ext.as_str() {
                     "astro" => {
                         let dir = dirname(path);
@@ -621,7 +769,7 @@ impl Engine {
         }
     }
 
-    pub fn serve(&self, tenant: &Tenant, path: &str, kind: Kind, resolver: &Resolver) -> Result<(String, &'static str), BuildError> {
+    pub fn serve(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, resolver: &Resolver) -> Result<(String, &'static str), BuildError> {
         let built = self.build(tenant, path, kind)?;
         let mut edits: Vec<(usize, usize, String)> =
             built.specs.iter().chain(&built.component_paths).map(|s| (s.start, s.end, resolver.resolve(path, &s.spec))).collect();
@@ -751,7 +899,7 @@ mod tests {
         Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, Arc::new(crate::metrics::Metrics::default()))
     }
 
-    fn served(engine: &Engine, tenant: &Tenant) -> String {
+    fn served(engine: &Engine, tenant: &Arc<Tenant>) -> String {
         engine.serve(tenant, PAGE_PATH, Kind::Module, &Resolver::new(tenant, "https://esm.sh", 7).unwrap()).unwrap().0
     }
 
@@ -765,9 +913,14 @@ mod tests {
         tenant(&[(path, source)])
     }
 
-    /// The queue deadline is not a flag, so tests reach past `Engine::new` to shorten it.
+    /// Neither the queue deadline nor the runaway cap is a flag, so tests build the gate directly.
     fn engine_gated(cfg: Config, limit: usize, wait: Duration) -> Engine {
-        Engine { gate: Gate::new(limit, wait), ..Engine::new(cfg, Arc::new(crate::metrics::Metrics::default())) }
+        engine_bounded(cfg, limit, wait, MAX_RUNAWAY_COMPILES)
+    }
+
+    fn engine_bounded(cfg: Config, limit: usize, wait: Duration, max_runaway: usize) -> Engine {
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        Engine::with_gate(cfg, metrics, Gate::new(limit, wait, max_runaway))
     }
 
     fn capped(max_source_bytes: usize) -> Config {
@@ -966,7 +1119,7 @@ mod tests {
             assert_eq!(e.status, 503, "{}", e.message);
             assert_eq!(SPAWNED.get(), 0, "a refused compile reserves no stack");
             let stats = engine.compile_stats();
-            assert_eq!((stats.limit, stats.queued, stats.refused), (2, 0, 1));
+            assert_eq!((stats.limit, stats.queued, stats.refused, stats.runaway), (2, 0, 1, 0));
             let stacks: usize = busy.into_iter().map(|h| h.join().unwrap()).sum();
             assert_eq!(stacks, 2, "three concurrent compiles, two stacks");
         });
@@ -991,9 +1144,54 @@ mod tests {
         let t = tenant(&[("src/hit.ts", "export const x = 1;\n"), ("src/miss.ts", "export const y = 2;\n")]);
         let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
         engine.build(&t, "src/hit.ts", Kind::Module).unwrap();
-        let closed = Engine { gate: Gate::new(0, Duration::from_millis(50)), ..engine };
-        assert!(closed.build(&t, "src/hit.ts", Kind::Module).is_ok());
-        assert_eq!(build_err(closed.build(&t, "src/miss.ts", Kind::Module)).status, 503);
+        engine.gate.limit.store(0, Ordering::Relaxed);
+        assert!(engine.build(&t, "src/hit.ts", Kind::Module).is_ok());
+        assert_eq!(build_err(engine.build(&t, "src/miss.ts", Kind::Module)).status, 503);
+    }
+
+    /// A stylesheet that grass will not finish inside the deadline. Sass has a deadline of its own,
+    /// so this test keeps that one long: what is under test is the compile deadline around it.
+    fn slow_source() -> String {
+        "@for $i from 1 through 300000 { $unused: $i * 2; }".to_string()
+    }
+
+    /// Issue #63: one tenant's file must not remove a permit from the pool for as long as it runs.
+    /// `astro_codegen`, oxc and satteri-mdxjs cannot be interrupted, so the thread is abandoned —
+    /// but the permit comes back with the answer, and the next tenant compiles on it.
+    #[test]
+    fn a_compile_past_its_deadline_gives_its_permit_back() {
+        let slow = tenant_with("src/slow.scss", &slow_source());
+        let ordinary = tenant_with("src/page.astro", "<p>hi</p>\n");
+        let cfg = Config { compile_timeout: Duration::from_millis(200), ..capped(CAP) };
+        let engine = engine_gated(cfg, 1, Duration::from_millis(50));
+
+        let started = Instant::now();
+        let e = build_err(engine.build(&slow, "src/slow.scss", Kind::Module));
+        assert!(e.message.contains("compile did not finish within 200 ms"), "{}", e.message);
+        assert_eq!(e.diagnostics.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5), "the request waited {:?}", started.elapsed());
+
+        let stats = engine.compile_stats();
+        assert_eq!((stats.running, stats.runaway, stats.timeouts), (0, 1, 1), "the permit is back and the thread is counted");
+        // The gate holds one permit and the runaway thread is still burning a core on it.
+        assert!(engine.build(&ordinary, "src/page.astro", Kind::Module).is_ok());
+    }
+
+    /// Nothing can take a runaway's core back, so past the cap the honest answer is 503 rather than
+    /// another abandoned thread.
+    #[test]
+    fn compilation_is_refused_once_too_many_runaways_pile_up() {
+        let t = tenant(&[("src/a.scss", slow_source().as_str()), ("src/b.scss", &format!("{} // b", slow_source()))]);
+        let cfg = Config { compile_timeout: Duration::from_millis(200), ..capped(CAP) };
+        let engine = engine_bounded(cfg, 4, Duration::from_millis(50), 1);
+
+        assert!(build_err(engine.build(&t, "src/a.scss", Kind::Module)).message.contains("did not finish"));
+        assert_eq!(engine.compile_stats().runaway, 1);
+
+        let e = build_err(engine.build(&t, "src/b.scss", Kind::Module));
+        assert_eq!(e.status, 503);
+        assert!(e.message.contains("past their deadline"), "{}", e.message);
+        assert_eq!(engine.compile_stats().refused, 1);
     }
 
     const CARD: &str = "---\nconst n = 1;\n---\n<p>{n}</p>\n<style>p{color:red}</style>\n<script>console.log(1)</script>\n";

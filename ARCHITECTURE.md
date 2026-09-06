@@ -244,7 +244,7 @@ What `compile` does per kind and extension:
 | `.js` `.mjs` | served as-is when it parses as ESM, otherwise transformed |
 | `.css` | a module that registers the text in `globalThis.__sl_css`, with relative `url()` and `@import` targets rewritten to `/__sl/raw/…` (`src/transform/css.rs`) |
 | `.scss` `.sass` | grass over a snapshot of the tenant's file tree, on its own thread with a deadline (`src/transform/scss.rs`), then as `.css` |
-| `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`) |
+| `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`); headings are collected and their slugs uniquified by the same `content::Slugs` `.mdx` uses, so `getHeadings()` agrees across the two |
 | `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
 | `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source — its `<script lang="ts">` blocks already stripped to JavaScript by `transform::sfc` — to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser |
@@ -347,15 +347,43 @@ let 512 of those exist together. So a miss takes one of `--max-compiles`
 permits first (default: one per core, never fewer than one). A build that
 finds none free waits five seconds for one and is then refused with 503 rather
 than queueing without end. `/api/stats` reports the permits held, the builds
-waiting, the limit and the refusals under `compiles`; `/metrics` has the same
-four.
+waiting, the limit, the refusals, and the two deadline counters below under
+`compiles`; `/metrics` has the same six.
 
 Two builds take no permit. A cache hit is not a compile, so a warm daemon
 serving cached modules never queues. And a `?type=style` or `?type=script`
 build asks for the module from inside its own compile: that inner build runs
-under the permit — and on the stack — its parent is already holding, which a
-thread-local marks for each. A second permit there would deadlock as soon as
-the gate was full.
+under the permit — and on the stack, and under the deadline — its parent is
+already holding, which a thread-local marks for each. A second permit there
+would deadlock as soon as the gate was full.
+
+### How long one compile may run
+
+A permit is only a bound if something takes it back. `astro_codegen`, oxc and
+satteri-mdxjs are synchronous and offer no cancellation, so every compile runs
+on a thread of its own with a wall-clock deadline (`--compile-timeout-ms`,
+default 10000, or `SANDBOX_LITE_COMPILE_TIMEOUT_MS`) and the request gives up
+on it rather than joining it — the same shape Sass has used since #35. Past
+the deadline the request is answered with a diagnostic, the permit goes back
+to the pool, and the thread is left to run out: it keeps its core and its
+`parser_stack_bytes()` reservation until it returns on its own, and is counted
+under `compiles.runaway` in `/api/stats` and `/metrics` while it does. Eight
+runaways is the cap; past that a compile is refused with 503 rather than
+starting a ninth abandoned thread. The thread outlives the request, so it owns
+everything it may still touch — an `Engine` handle, the tenant, the source
+bytes — which is why `Engine` is a handle to a shared `EngineInner`.
+
+The size and nesting caps are checked before the permit and before the thread:
+a source that cannot be compiled has no business queueing for the right to try.
+
+Issue #63 is why the deadline exists. Heading ids in `.mdx` were assigned by
+rescanning the ids already given out, which is O(n³) in the headings of one
+file: 64 KiB of `# a` — under the size cap, and with no bracket or blockquote
+for `nesting_depth` to count — was about forty minutes of one core, and enough
+such files refused every other tenant's compiles for as long as they ran. That
+particular cost is gone (`content::Slugs` carries a per-slug counter, so ids
+are O(1) amortised and a page is linear in its headings), but the deadline is
+what bounds the next shape nobody has thought of.
 
 ### Why resolution and `import.meta.glob` happen at serve time
 
@@ -434,8 +462,9 @@ request. Eight threads may compile at once, which is the bound on distinct
 runaway sources too. `/api/stats` counts them under `sass`.
 
 None of this stops an abandoned compile — it keeps its core and keeps
-allocating until it returns on its own. Only a child process with rlimits
-would, and that is the design discussion in issue #26.
+allocating until it returns on its own, and the same is true of a compile
+abandoned by `--compile-timeout-ms`. Only a child process with rlimits would,
+and that is the design discussion in issue #26.
 
 ## Versions, browser cache and SSE
 

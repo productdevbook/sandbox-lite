@@ -146,6 +146,8 @@ fn snapshot(st: &AppState) -> Snapshot {
         compiles_queued: compiles.queued as u64,
         compiles_limit: compiles.limit as u64,
         compiles_refused: compiles.refused,
+        compiles_runaway: compiles.runaway as u64,
+        compiles_timeouts: compiles.timeouts,
         shots_running: shots.running as u64,
         shots_busy: shots.busy,
         shots_timeouts: shots.timeouts,
@@ -326,7 +328,7 @@ pub async fn events(AxState(st): AxState<State>, Path(id): Path<String>) -> Resp
     }
 }
 
-pub fn check_tenant(st: &AppState, t: &Tenant) -> Value {
+pub fn check_tenant(st: &AppState, t: &Arc<Tenant>) -> Value {
     let mut diagnostics = Vec::new();
     let mut files = 0;
     for e in t.list() {

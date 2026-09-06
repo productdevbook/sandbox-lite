@@ -113,7 +113,7 @@ fn summarize(s: &str) -> String {
     }
 }
 
-fn file_tool(st: &AppState, t: &Tenant, name: &str, input: &Value, changes: &mut Vec<String>) -> String {
+fn file_tool(st: &AppState, t: &Arc<Tenant>, name: &str, input: &Value, changes: &mut Vec<String>) -> String {
     let path = || input.get("path").and_then(|p| p.as_str()).and_then(clean_path);
     match name {
         "list_files" => t.list().iter().map(|e| format!("{} ({} bytes)", e.path, e.size)).collect::<Vec<_>>().join("\n"),
