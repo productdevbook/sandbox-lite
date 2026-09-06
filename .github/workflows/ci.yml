@@ -45,6 +45,12 @@ jobs:
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=style&index=0' | grep -q __sl_css
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=script&index=0' | grep -q console.log
           test 200 = "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4399/health)"
+          # issue #63: 64 KiB of repeated headings was ~40 minutes of one core; it must now be a page
+          python3 -c "import sys; sys.stdout.write('# a\n' * 16000)" > headings.mdx
+          curl -sf -X PUT --data-binary @headings.mdx http://127.0.0.1:4399/api/t/ci/file/src/pages/headings.mdx
+          # to a file, not a pipe: the module is megabytes and `grep -q` would close the pipe early
+          curl -sf --max-time 60 -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/pages/headings.mdx?v=1' -o /tmp/headings.js
+          grep -q '"a-15999"' /tmp/headings.js
           curl -sf http://127.0.0.1:4399/metrics > /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_tenants gauge' /tmp/metrics.txt
           grep -qxF 'sandbox_lite_tenants 1' /tmp/metrics.txt
@@ -55,6 +61,12 @@ jobs:
           curl -sf http://127.0.0.1:4399/api/stats | grep -q '"max_per_tenant"'
           grep -qxF '# TYPE sandbox_lite_compile_seconds histogram' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_compiles_queued gauge' /tmp/metrics.txt
+          # issue #63: a compile past its deadline is abandoned, so the count of abandoned threads is reportable
+          grep -qxF '# TYPE sandbox_lite_compiles_runaway gauge' /tmp/metrics.txt
+          grep -qxF 'sandbox_lite_compiles_runaway 0' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_compiles_timeouts_total counter' /tmp/metrics.txt
+          curl -sf http://127.0.0.1:4399/api/stats \
+            | python3 -c "import json,sys; c = json.load(sys.stdin)['compiles']; assert c['runaway'] == 0 and c['timeouts'] == 0, c"
           # issue #47: the permit count is what bounds concurrent compiles, so it must never render as 0
           grep -qE '^sandbox_lite_compiles_limit [1-9][0-9]*$' /tmp/metrics.txt
           grep -qxF 'sandbox_lite_bases{base="starter"} 1' /tmp/metrics.txt

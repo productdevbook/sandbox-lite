@@ -195,6 +195,9 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 --cache-mb N         transform cache budget (default 64)
 --max-source-kb N    largest .astro/.ts/.js/.mdx/.scss/.vue/.svelte file the compilers accept (default 64)
 --sass-timeout-ms N  deadline for one Sass compile (default 5000)
+--compile-timeout-ms N
+                     deadline for one compile of any kind; past it the request gets a diagnostic
+                     and the compiler thread is abandoned (default 10000)
 --max-compiles N     compiles that may run at once (default: one per core)
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
@@ -211,6 +214,7 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 
 `SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET`,
 `SANDBOX_LITE_TENANT_QUOTA_MB`, `SANDBOX_LITE_MAX_COMPILES`,
+`SANDBOX_LITE_COMPILE_TIMEOUT_MS`,
 `SANDBOX_LITE_CHROME`, `SANDBOX_LITE_CHROME_JOBS`, `SANDBOX_LITE_CHAT_WINDOW`
 and `SANDBOX_LITE_CHATS_PER_TENANT` are read as defaults for those flags, and
 `SANDBOX_LITE_ANTHROPIC_BASE` points the chat at another Messages API

@@ -122,6 +122,8 @@ pub struct Snapshot {
     pub compiles_queued: u64,
     pub compiles_limit: u64,
     pub compiles_refused: u64,
+    pub compiles_runaway: u64,
+    pub compiles_timeouts: u64,
     pub shots_running: u64,
     pub shots_busy: u64,
     pub shots_timeouts: u64,
@@ -195,8 +197,22 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sandbox_lite_compiles_refused_total",
         "counter",
-        "Compiles refused with 503 after waiting for a permit.",
+        "Compiles refused with 503 after waiting for a permit, or because too many are past their deadline.",
         s.compiles_refused,
+    );
+    scalar(
+        &mut out,
+        "sandbox_lite_compiles_runaway",
+        "gauge",
+        "Compile threads still running past their deadline; the compilers cannot be interrupted, so these are abandoned rather than killed.",
+        s.compiles_runaway,
+    );
+    scalar(
+        &mut out,
+        "sandbox_lite_compiles_timeouts_total",
+        "counter",
+        "Compiles that overran their deadline (--compile-timeout-ms).",
+        s.compiles_timeouts,
     );
 
     scalar(&mut out, "sandbox_lite_screenshots_running", "gauge", "Headless Chrome screenshots in flight.", s.shots_running);
@@ -306,6 +322,8 @@ mod tests {
             compiles_queued: 5,
             compiles_limit: 8,
             compiles_refused: 6,
+            compiles_runaway: 7,
+            compiles_timeouts: 9,
             shots_running: 1,
             shots_busy: 5,
             shots_timeouts: 6,
@@ -372,9 +390,15 @@ sandbox_lite_compiles_queued 5
 # HELP sandbox_lite_compiles_limit Compiles that may run at once (--max-compiles).
 # TYPE sandbox_lite_compiles_limit gauge
 sandbox_lite_compiles_limit 8
-# HELP sandbox_lite_compiles_refused_total Compiles refused with 503 after waiting for a permit.
+# HELP sandbox_lite_compiles_refused_total Compiles refused with 503 after waiting for a permit, or because too many are past their deadline.
 # TYPE sandbox_lite_compiles_refused_total counter
 sandbox_lite_compiles_refused_total 6
+# HELP sandbox_lite_compiles_runaway Compile threads still running past their deadline; the compilers cannot be interrupted, so these are abandoned rather than killed.
+# TYPE sandbox_lite_compiles_runaway gauge
+sandbox_lite_compiles_runaway 7
+# HELP sandbox_lite_compiles_timeouts_total Compiles that overran their deadline (--compile-timeout-ms).
+# TYPE sandbox_lite_compiles_timeouts_total counter
+sandbox_lite_compiles_timeouts_total 9
 # HELP sandbox_lite_screenshots_running Headless Chrome screenshots in flight.
 # TYPE sandbox_lite_screenshots_running gauge
 sandbox_lite_screenshots_running 1
@@ -489,6 +513,8 @@ sandbox_lite_compile_seconds_count{kind="url"} 0
             compiles_queued: 0,
             compiles_limit: 1,
             compiles_refused: 0,
+            compiles_runaway: 0,
+            compiles_timeouts: 0,
             shots_running: 0,
             shots_busy: 0,
             shots_timeouts: 0,

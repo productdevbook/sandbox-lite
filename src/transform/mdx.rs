@@ -7,7 +7,7 @@ use satteri_mdxjs::{ElementAttributeNameCase, JsxRuntime, Options};
 use satteri_pulldown_cmark::{MDX_OPTIONS, strip_leading_bom};
 use serde_json::{Map, Value};
 
-use super::content::{Heading, slugify, split_frontmatter, yaml_to_json};
+use super::content::{Heading, Slugs, slugify, split_frontmatter, yaml_to_json};
 use super::js::{self, line_col};
 use super::markdown::page_url;
 use super::{BuildError, Diag, json_str};
@@ -36,7 +36,7 @@ pub fn compile(path: &str, source: &str) -> Result<Compiled, BuildError> {
     let mut hast = mdast_arena_to_hast_arena(&mdast);
     hast.mdx = true;
     let mut headings = Vec::new();
-    collect_headings(&mut hast, 0, &frontmatter, &mut headings);
+    collect_headings(&mut hast, 0, &frontmatter, &mut headings, &mut Slugs::default());
     let options = Options {
         jsx_runtime: Some(JsxRuntime::Automatic),
         jsx_import_source: Some("astro".into()),
@@ -60,7 +60,7 @@ fn error(path: &str, text: &str, line: u32, column: u32) -> BuildError {
     BuildError::compile(format!("{path}: {text}"), vec![diag])
 }
 
-fn collect_headings(hast: &mut Arena<Hast>, id: u32, frontmatter: &Value, out: &mut Vec<Heading>) {
+fn collect_headings(hast: &mut Arena<Hast>, id: u32, frontmatter: &Value, out: &mut Vec<Heading>, slugs: &mut Slugs) {
     if hast.get_node(id).node_type == HastNodeType::Element as u8 {
         let data = hast.get_type_data(id);
         let tag = decode_element_tag(data);
@@ -75,7 +75,13 @@ fn collect_headings(hast: &mut Arena<Hast>, id: u32, frontmatter: &Value, out: &
                 props.iter().find(|(name, _, _)| hast.get_str(*name) == "id").map(|(_, _, value)| hast.get_str(*value).to_string());
             let mut text = String::new();
             heading_text(hast, id, frontmatter, &mut text);
-            let slug = existing.clone().unwrap_or_else(|| unique(slugify(&text), out));
+            let slug = match &existing {
+                Some(id) => {
+                    slugs.claim(id);
+                    id.clone()
+                }
+                None => slugs.unique(slugify(&text)),
+            };
             if existing.is_none() {
                 let mut props = props;
                 props.push((hast.alloc_string("id"), PROP_STRING, hast.alloc_string(&slug)));
@@ -85,18 +91,8 @@ fn collect_headings(hast: &mut Arena<Hast>, id: u32, frontmatter: &Value, out: &
         }
     }
     for child in hast.get_children(id).to_vec() {
-        collect_headings(hast, child, frontmatter, out);
+        collect_headings(hast, child, frontmatter, out, slugs);
     }
-}
-
-fn unique(slug: String, taken: &[Heading]) -> String {
-    let mut candidate = slug.clone();
-    let mut n = 0;
-    while taken.iter().any(|h| h.slug == candidate) {
-        n += 1;
-        candidate = format!("{slug}-{n}");
-    }
-    candidate
 }
 
 fn heading_text(hast: &Arena<Hast>, id: u32, frontmatter: &Value, out: &mut String) {
@@ -233,5 +229,19 @@ mod tests {
         let Err(err) = compile("src/pages/bad.mdx", "---\ntitle: x\n---\n\n<Card\n") else { panic!("unclosed tag compiled") };
         assert_eq!(err.diagnostics[0].line, 5);
         assert_eq!(err.diagnostics[0].file, "src/pages/bad.mdx");
+    }
+
+    /// Issue #63: assigning ids by rescanning the headings already assigned was O(n^3), so 25.6 KB
+    /// of `# a` took 115 s of one core in release — and the 64 KiB source cap admits 2.56x that,
+    /// about forty minutes. Nothing else bounded it: `# a\n` has no bracket and no blockquote
+    /// marker, so it passes the nesting pre-scan, and it is far under the size cap.
+    #[test]
+    fn repeated_headings_are_not_cubic() {
+        let src = "# a\n".repeat(6400);
+        let t = std::time::Instant::now();
+        let c = compile("x.mdx", &src).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t.elapsed());
+        assert_eq!(c.headings.len(), 6400);
+        assert_eq!(c.headings[6399].slug, "a-6399");
     }
 }

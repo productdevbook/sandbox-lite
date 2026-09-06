@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use oxc_allocator::Allocator;
@@ -89,6 +89,7 @@ pub fn parse_markdown(src: &str) -> Result<Md, String> {
 fn render(body: &str) -> (String, Vec<Heading>) {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES | Options::ENABLE_TASKLISTS;
     let mut headings = Vec::new();
+    let mut slugs = Slugs::default();
     let mut current: Option<(u8, String)> = None;
     let events: Vec<Event> = Parser::new_ext(body, options)
         .inspect(|ev| match ev {
@@ -100,7 +101,9 @@ fn render(body: &str) -> (String, Vec<Heading>) {
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((depth, text)) = current.take() {
-                    headings.push(Heading { depth, slug: slugify(&text), text });
+                    // Issue #63: `.md` used to leave duplicate slugs alone, so `getHeadings()`
+                    // disagreed with the same page written as `.mdx`. One rule for both.
+                    headings.push(Heading { depth, slug: slugs.unique(slugify(&text)), text });
                 }
             }
             _ => {}
@@ -119,6 +122,38 @@ fn level_depth(level: HeadingLevel) -> u8 {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
+    }
+}
+
+/// The ids a page's headings get: the first heading keeps its slug, and a later heading whose slug
+/// is taken becomes `slug-1`, `slug-2`, and so on — what Astro's processor produces.
+///
+/// Issue #63: the count of `slug-n` tried so far is kept per base slug, so it never restarts at 1.
+/// Rescanning the headings already assigned made one heading cost O(i) probes of an O(i) scan and a
+/// page of n identical headings O(n^3): 64 KiB of `# a` is about forty minutes of CPU. Advancing
+/// the counter instead makes a probe O(1) and bounds the failed ones by the ids actually taken, so
+/// the page is linear in its headings.
+#[derive(Default)]
+pub struct Slugs {
+    taken: HashSet<String>,
+    next: HashMap<String, u32>,
+}
+
+impl Slugs {
+    /// An id the author wrote themselves, which no generated id may then collide with.
+    pub fn claim(&mut self, slug: &str) {
+        self.taken.insert(slug.to_string());
+    }
+
+    pub fn unique(&mut self, slug: String) -> String {
+        let mut n = self.next.get(&slug).copied().unwrap_or(0);
+        let mut candidate = slug.clone();
+        while !self.taken.insert(candidate.clone()) {
+            n += 1;
+            candidate = format!("{slug}-{n}");
+        }
+        self.next.insert(slug, n);
+        candidate
     }
 }
 
@@ -503,6 +538,25 @@ mod tests {
         assert_eq!(md.frontmatter["title"], "T");
         assert_eq!(md.headings[0].slug, "hello-world");
         assert!(md.html.contains("<h2>Hello World</h2>"));
+    }
+
+    /// Issue #63: `.md` handed `getHeadings()` the same slug twice where `.mdx` numbered them.
+    #[test]
+    fn markdown_headings_are_uniquified_like_mdx() {
+        let md = parse_markdown("## Second\n\n## Second\n\n## Second\n").unwrap();
+        let slugs: Vec<&str> = md.headings.iter().map(|h| h.slug.as_str()).collect();
+        assert_eq!(slugs, ["second", "second-1", "second-2"]);
+    }
+
+    /// The per-base-slug counter never restarts, so n identical headings cost n probes, not n^2 —
+    /// and it still may not hand out an id something else already holds.
+    #[test]
+    fn slugs_advance_without_rescanning_and_skip_what_is_taken() {
+        let mut slugs = Slugs::default();
+        slugs.claim("a-1");
+        let out: Vec<String> = (0..4).map(|_| slugs.unique("a".to_string())).collect();
+        assert_eq!(out, ["a", "a-2", "a-3", "a-4"]);
+        assert_eq!(slugs.unique("b".to_string()), "b");
     }
 
     fn glob(patterns: &[&str], base: &str) -> Loader {
