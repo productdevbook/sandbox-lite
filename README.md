@@ -65,9 +65,31 @@ Creating a tenant, writing its edit and fetching its whole module graph took
 held 1008 entries in 568 kB (1000 unique edited pages plus the 8 shared modules
 every tenant reuses), 7993 hits to 1008 misses. The binary is 13.8 MB.
 
-For comparison, one `astro dev` process for the same starter project is a
-Node.js process of several hundred MB; a thousand of them do not fit on a
-machine at all.
+### The same project, the other way
+
+`bench/vs-astro-dev.sh` runs the comparison on one machine: `npm install` plus
+`astro dev` for one tenant, then the daemon serving the same project.
+
+| | `astro dev`, one per tenant | sandbox-lite, one for all |
+|---|---|---|
+| dependencies | 4.1 s install, 166 MB of `node_modules` **per tenant** | none — the browser fetches packages from a CDN, already built |
+| server ready | 3.0 s | 8 ms |
+| tenant ready | (the process *is* the tenant) | 6 ms |
+| first page, whole module graph | 97 ms | 51 ms (6 modules compiled) |
+| **cold → first page** | **7.2 s** | **65 ms** |
+| memory | 636 MB for that one tenant | 12 MB for the daemon and every tenant in it |
+
+The install was measured with a warm npm cache; in a fresh container it was
+18 s, which is the number that matters — that is what a hosted builder pays
+every time it starts a session. For scale: ComputeSDK's public
+[sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/dax/) times
+32 providers doing clone + install + typecheck in a fresh sandbox, and the
+fastest finishes in 33.5 s.
+
+sandbox-lite is not in that benchmark and cannot be: it has no shell and runs no
+customer code. It removes the install step rather than accelerating it, which
+only works because the compiler is a library and the runtime is the browser's.
+That trade is the whole design — see *What the preview does not do*.
 
 Per-tenant state is the overlay (only edited files) plus a content-addressed
 transform cache shared by every tenant: two tenants with the same `Header.astro`
