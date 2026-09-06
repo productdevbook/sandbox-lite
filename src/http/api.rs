@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use super::{AppState, State, mime};
-use crate::store::{Tenant, clean_path};
+use crate::store::{Tenant, WriteError, clean_path};
 use crate::transform::{Kind, is_source};
 
 pub async fn editor() -> Html<&'static str> {
@@ -134,6 +134,7 @@ pub async fn write_file(AxState(st): AxState<State>, Path((id, path)): Path<(Str
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
     match t.write(&path, body.to_vec()) {
         Ok(version) => Json(json!({ "path": path, "version": version })).into_response(),
+        Err(e @ WriteError::Quota { .. }) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

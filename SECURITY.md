@@ -61,10 +61,19 @@ credentials on the API side.
   (`DefaultBodyLimit`). No tenant-host handler reads a request body.
 - **Host matching** is exact: `a.b.<domain>` and `evil-<domain>` are not tenant
   hosts.
-- **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly; SameSite=Lax`
-  and no `Domain` attribute, so it is a host-only session cookie for that one
-  tenant host. `Secure` is added only when the request carried
-  `x-forwarded-proto: https`.
+- **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly` and no
+  `Domain` attribute, so it is a host-only session cookie for that one tenant
+  host. `--cookie-samesite` picks `SameSite=Lax` (the default; `Secure` is
+  added only when the request carried `x-forwarded-proto: https`) or
+  `SameSite=None; Secure`, which an editor on another registrable domain needs
+  before a framed preview will carry the cookie, and which browsers store only
+  over HTTPS.
+- **Connections** that have not delivered a complete request head within 30 s,
+  whether newly opened or idle between keep-alive requests, are closed.
+- **Per-tenant write volume** is capped by `--tenant-quota-mb` (default 64):
+  a write that would take the tenant's edited files past it is refused with
+  `413` before anything reaches disk or memory, and the chat `write_file` tool
+  gets the same error. Rewriting a file is charged only for the difference.
 
 The daemon sets no CORS, CSP, `X-Frame-Options` or `Referrer-Policy` headers.
 Cross-origin reads between tenant hosts are blocked by the browser's
@@ -107,7 +116,8 @@ endpoint, including `/__sl/raw/`, `/__sl/events` and `/__sl/check`.
 - `GET http://<id>.<domain>/any/path?sl_token=<token>`: a wrong token answers
   `403`; the right one answers `303` to the same path with the parameter
   removed and sets the `sl_t` cookie described above. Later requests are
-  accepted when the cookie equals the token, otherwise `403`.
+  accepted when the cookie equals the token, otherwise `403`. Both
+  comparisons, like the API token's, take constant time (`constant_time_eq`).
 - `/api/tenants` returns each tenant's `preview_token` and a ready-made
   `preview` link, so anyone with API access can open every preview.
 - The `preview` link the API builds is
@@ -175,12 +185,14 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 - Compilation is CPU work per request; `/__sl/check` and `/api/t/{id}/check`
   build every source file of a tenant on every call — a cache hit for an
   unchanged file, a compile for a changed one.
-- The transform cache is bounded by `--cache-mb`; tenant overlays are not. A
-  caller with API access can create any number of tenants and write files of
-  up to 64 MiB each. With persistence every write goes to disk under
-  `--data-dir`, and files over 256 KiB are kept only there and re-read on
-  demand; with `--no-persist`, every written file is held in memory whatever
-  its size.
+- No timeout once a request head has arrived: a body may trickle in, and a
+  response may be read slowly, for as long as the client likes.
+- The transform cache is bounded by `--cache-mb` and each tenant's overlay by
+  `--tenant-quota-mb`, but the number of tenants is not: a caller with API
+  access can create any number of them, each holding up to the quota. With
+  persistence every write goes to disk under `--data-dir`, and files over
+  256 KiB are kept only there and re-read on demand; with `--no-persist`,
+  every written file is held in memory whatever its size.
 - Tenant code is limited only by the visitor's browser.
 
 ## Deployment checklist
@@ -193,6 +205,7 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
    and host; the TLS proxy sends `x-forwarded-proto: https` so the cookie is
    `Secure`.
 4. No secrets in base projects or tenant files.
-5. Your own limits on tenant count, write volume and request rate.
+5. Your own limits on tenant count and request rate; `--tenant-quota-mb`
+   bounds each tenant's write volume, not how many tenants there are.
 6. `ANTHROPIC_API_KEY` only if the chat endpoint is wanted, knowing what it
    sends and that the API token is the only thing gating it.
