@@ -76,11 +76,24 @@ than a constant to multiply.
 
 ### The same project, the other way
 
-`bench/vs-astro-dev.sh` runs the comparison on one machine: `npm install` plus
-`astro dev` for one tenant, then the daemon serving the same project. It prints
-install time and `node_modules` size, time to a ready server, time to the first
-page, and RSS for each side. Nothing runs it in CI, so no numbers off it are
-quoted here; run it on the hardware you care about.
+`bench/vs-astro-dev.sh` runs the comparison: `npm install` plus `astro dev` for
+one tenant, then the daemon serving the same project. CI runs it on every push,
+so these are a runner's numbers — `ubuntu-latest`, `examples/starter`, at commit
+`25284b4`, in
+[run 34063605624](https://github.com/productdevbook/sandbox-lite/actions/runs/34063605624):
+
+| | `astro dev`, one per tenant | sandbox-lite, one for all |
+|---|---|---|
+| dependencies | 20.9 s install, 166 MB of `node_modules` **per tenant** | none — the browser fetches packages from a CDN, already built |
+| server ready | 2.75 s | — |
+| tenant ready | the process *is* the tenant | 4 ms |
+| first page, whole module graph | 127 ms | 40 ms (9 modules compiled) |
+| **cold → first page** | **23.8 s** | **50 ms** |
+| memory | 480 MB for that one tenant | 13 MB for the daemon and every tenant in it |
+
+A runner has a cold npm cache, which is the honest comparison: a hosted builder
+starting a session pays that install every time. Run the script yourself on the
+hardware you care about — the numbers move, the ratio does not.
 
 The shape of the difference is not a measurement, though. `astro dev` needs a
 dependency install and a Node process for every tenant; sandbox-lite needs
