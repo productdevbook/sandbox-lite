@@ -1,0 +1,31 @@
+name: audit
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the weekly auditor of this repository (sandbox-lite: a multi-tenant Astro live-preview daemon in Rust
+            with a browser-side renderer under assets/). Read README.md, SECURITY.md if present, and the code under src/ and assets/.
+            Then answer mechanical questions rather than reading for style: every route — is it authenticated when it should be;
+            every value parsed from a request or a tenant file — can it panic or allocate without bound; every public function —
+            is it reachable; every claim in the docs — is it true of the code; every dependency — is it pinned and still needed.
+            List open issues with `gh issue list --limit 200 --state all` first and never duplicate one. For each real finding open one
+            issue with `gh issue create`, labelled `security`, `bug`, `feature`, `ops` or `docs`, whose body is a concrete scenario
+            (inputs, then wrong outcome) plus the file and line, and, when it is small enough for an autonomous agent, the label
+            `agent-task` and a precise acceptance criterion. Also open one issue per feature gap you can demonstrate with a real Astro
+            theme idiom that the preview cannot render. If you find nothing new, open nothing and say so in the job log.
+          claude_args: |
+            --max-turns 30
+            --allowedTools Read,Glob,Grep,Bash(gh issue:*),Bash(gh search:*),Bash(cargo tree:*),Bash(cargo metadata:*)
