@@ -108,6 +108,35 @@ function replaceDocument(html) {
   document.close();
 }
 
+function writePage(html) {
+  const extras = headExtras();
+  replaceDocument(injectHead(html, extras.html));
+  if (extras.tailwind) {
+    const s = document.createElement("script");
+    s.src = TAILWIND_CDN;
+    document.head.appendChild(s);
+  }
+}
+
+function prettyJSON(body) {
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    return body;
+  }
+}
+
+function showResponse({ component, status, statusText, type, body }) {
+  const text = /\bjson\b/i.test(type) ? prettyJSON(body) : body;
+  replaceDocument(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(component)}</title>
+<style>body{margin:0;background:#1a1b26;color:#c0caf5;font:14px/1.5 ui-monospace,Menlo,monospace;padding:32px}
+h1{color:#7aa2f7;font-size:18px;margin:0 0 4px}p{margin:0 0 12px;color:#565f89}pre{white-space:pre-wrap;background:#16161e;padding:12px;border-radius:6px;overflow:auto}
+b{color:#9ece6a}small{color:#565f89}</style>
+<script type="module" src="/__sl/live.js"></script></head>
+<body><h1>${status} ${esc(statusText || "")}</h1><p>${esc(component)} → <b>${esc(type || "no content-type")}</b></p><pre>${esc(text)}</pre>
+<small>sandbox-lite · tenant ${esc(sl.tenant)} · the page reloads itself when a file changes</small></body></html>`);
+}
+
 function showError({ title, message, stack, diagnostics = [], routes }) {
   const diag = diagnostics
     .map((d) => `<li><b>${esc(d.file)}${d.line ? `:${d.line}:${d.column}` : ""}</b> — ${esc(d.text)}${d.hint ? `<br><i>${esc(d.hint)}</i>` : ""}</li>`)
@@ -127,12 +156,16 @@ async function main() {
   const routes = await fetchJSON(`/__sl/routes.json?v=${V}`);
   const hit = matchRoute(routes, location.pathname);
   if (!hit) return showError({ title: "404 — no matching page", message: `Nothing in src/pages matches ${location.pathname}`, routes });
-  if (hit.route.kind !== "astro" && hit.route.kind !== "md" && hit.route.kind !== "mdx") {
-    return showError({ title: "Unsupported route", message: `${hit.route.component} is a ${hit.route.kind} route. sandbox-lite renders .astro, .md and .mdx pages in the browser; endpoints are not available in the preview.` });
-  }
+  const endpoint = hit.route.kind === "endpoint";
   const astro = await import("/__sl/astro.js");
   const mod = await import(`/__sl/m/${hit.route.component}?v=${V}`);
-  if (typeof mod.default !== "function") throw new Error(`${hit.route.component} has no default export component`);
+  if (endpoint) {
+    if (typeof mod.GET !== "function" && typeof mod.ALL !== "function") {
+      return showError({ title: "Endpoint without a handler", message: `${hit.route.component} exports no GET or ALL function. The preview only issues GET requests.` });
+    }
+  } else if (typeof mod.default !== "function") {
+    throw new Error(`${hit.route.component} has no default export component`);
+  }
   let props = {};
   let params = hit.params;
   if (hit.route.params.length && typeof mod.getStaticPaths === "function") {
@@ -143,24 +176,25 @@ async function main() {
     params = entry.params;
   }
   const container = await astro.experimental_AstroContainer.create({ resolve: resolveId, astroConfig: sl.env.SITE ? { site: sl.env.SITE } : undefined });
-  await addRenderers(container);
-  const res = await container.renderToResponse(mod.default, {
+  // An endpoint renders no components, so the framework renderers are not worth fetching.
+  if (!endpoint) await addRenderers(container);
+  const res = await container.renderToResponse(endpoint ? mod : mod.default, {
     request: new Request(location.href),
     params,
     props,
     partial: false,
-    routeType: "page",
+    routeType: endpoint ? "endpoint" : "page",
   });
   const location_ = res.headers.get("location");
   if (res.status >= 300 && res.status < 400 && location_) return location.replace(location_);
-  const html = await res.text();
-  if (res.status >= 400 && !html.trim()) return showError({ title: `${res.status}`, message: `The page responded with status ${res.status} and no body` });
-  const extras = headExtras();
-  replaceDocument(injectHead(html, extras.html));
-  if (extras.tailwind) {
-    const s = document.createElement("script");
-    s.src = TAILWIND_CDN;
-    document.head.appendChild(s);
+  const type = res.headers.get("content-type") || "";
+  const body = await res.text();
+  if (endpoint && type.split(";")[0].trim().toLowerCase() !== "text/html") {
+    showResponse({ component: hit.route.component, status: res.status, statusText: res.statusText, type, body });
+  } else if (res.status >= 400 && !body.trim()) {
+    return showError({ title: `${res.status}`, message: `The page responded with status ${res.status} and no body` });
+  } else {
+    writePage(body);
   }
   console.debug(`[sandbox-lite] ${hit.route.component} rendered in ${(performance.now() - t0).toFixed(0)} ms`);
 }
