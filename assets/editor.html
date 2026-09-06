@@ -73,6 +73,7 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
 const $ = (s) => document.querySelector(s);
 const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chat: [], saving: null };
 const BINARY = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|pdf|wasm|zip)$/i;
+const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 const esc = (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 let apiToken = "";
 try { apiToken = localStorage.getItem("sl_api_token") || ""; } catch {}
@@ -147,7 +148,7 @@ async function openFile(path, silent) {
   $("#fileName").textContent = path;
   if (BINARY.test(path)) { $("#editor").value = "(binary file)"; $("#editor").disabled = true; return; }
   $("#editor").disabled = false;
-  $("#editor").value = await api("GET", `/api/t/${state.tenant}/file/${path}`);
+  $("#editor").value = await api("GET", `/api/t/${state.tenant}/file/${encPath(path)}`);
   $("#saveState").textContent = "";
 }
 
@@ -156,7 +157,7 @@ async function save() {
   if (!state.file || !state.tenant) return;
   const path = state.file, body = $("#editor").value;
   $("#saveState").textContent = "saving…";
-  try { await api("PUT", `/api/t/${state.tenant}/file/${path}`, body, true); state.dirty = false; $("#saveState").textContent = "saved"; }
+  try { await api("PUT", `/api/t/${state.tenant}/file/${encPath(path)}`, body, true); state.dirty = false; $("#saveState").textContent = "saved"; }
   catch (e) { $("#saveState").textContent = "save failed: " + e.message; }
 }
 $("#editor").addEventListener("input", () => { state.dirty = true; $("#saveState").textContent = "…"; clearTimeout(saveTimer); saveTimer = setTimeout(save, 350); });

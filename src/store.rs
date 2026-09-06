@@ -344,6 +344,10 @@ impl Store {
             let Ok(meta) = std::fs::read(dir.join("tenant.json")) else { continue };
             let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap_or_default();
             let id = entry.file_name().to_string_lossy().into_owned();
+            if !valid_id(&id) {
+                eprintln!("data dir entry '{id}' is not a valid tenant id, skipping");
+                continue;
+            }
             let base_name = meta.get("base").and_then(|b| b.as_str()).unwrap_or("");
             let Some(base) = self.base(base_name) else {
                 eprintln!("tenant {id}: base '{base_name}' is not loaded, skipping");
