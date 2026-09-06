@@ -109,8 +109,8 @@ exact.
    static, 1 for `[param]`, 2 for `[...rest]` — compared lexicographically,
    so static routes come before dynamic ones and a route sorts before any
    longer route it is a prefix of; equal keys are ordered by path. The kind is
-   `astro`, `md`, `mdx` or `endpoint`; the shell renders the first three and
-   shows an "unsupported route" page for endpoints.
+   `astro`, `md`, `mdx` or `endpoint`, taken from the last extension only, so
+   `rss.xml.ts` is the endpoint `/rss.xml`.
 4. **Page module.** The shell imports `/__sl/astro.js` and
    `/__sl/m/src/pages/blog/[slug].astro?v=<version>`. `preview::module`
    cleans the path, reads the kind from the query, and on the blocking pool
@@ -142,7 +142,13 @@ exact.
    plus `@astrojs/mdx/server.js`) is registered last; it renders MDX content.
    `container.renderToResponse(mod.default, { request, params, props })`
    produces the HTML.
-8. **Document.** A `3xx` with `Location` becomes `location.replace`.
+   An endpoint route takes the same call with the module itself and
+   `routeType: "endpoint"`, which runs its `GET` (or `ALL`) handler with an
+   `APIContext` — `request`, `params`, `props`, `url`, `site`, `redirect`,
+   `cookies`, `locals`. No renderers are registered for it: nothing renders.
+8. **Document.** A `3xx` with `Location` becomes `location.replace`. A response
+   that is not `text/html` (an endpoint's XML, JSON or text) is shown escaped in
+   a `<pre>` under its status and content-type, JSON pretty-printed.
    Otherwise every CSS string that modules registered in
    `globalThis.__sl_css` becomes a `<style data-sl=key>` (with
    `type="text/tailwindcss"` when it contains `@import "tailwindcss"` or

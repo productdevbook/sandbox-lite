@@ -38,6 +38,8 @@ and `.scss` files, compiled in-process) and Tailwind v4 (via its browser
 build); content collections (`getCollection`, `getEntry`, `render`); Markdown
 pages with `layout:`; MDX pages and MDX collection entries (compiled
 in-process with Astro's `satteri-mdxjs`, rendered with Astro's JSX runtime);
+endpoints (`src/pages/rss.xml.ts`, `src/pages/api/*.json.ts`: the `GET` handler
+runs in the browser and its `Response` is shown);
 dynamic routes with `getStaticPaths` and `paginate`;
 `import.meta.glob` (eager and lazy, `import:`/`query:` options); `import.meta.env`
 and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
@@ -288,7 +290,11 @@ Tenant host (`<id>.<domain>`):
 6. `experimental_AstroContainer.renderToResponse()` produces the HTML;
    `document.write` replaces the shell with it, so scripts, links and relative
    URLs behave like a normal page.
-7. `live.js` holds an `EventSource`; any write to the tenant reloads the page.
+7. A `.ts`/`.js` file under `src/pages` is an endpoint: the same call with
+   `routeType: "endpoint"` runs its `GET` (or `ALL`) handler with an
+   `APIContext`. An HTML response is written as a page; anything else — XML,
+   JSON, plain text — is shown with its status and content-type above the body.
+8. `live.js` holds an `EventSource`; any write to the tenant reloads the page.
 
 Error states are pages too: a compile error, a missing import, a 404 route or
 a failing `getStaticPaths` render an overlay that lists the daemon's
@@ -305,14 +311,14 @@ src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), impor
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop, stream framing, saved conversations
 src/check.rs           the `check` subcommand
 assets/                shell.html, shell.js, live.js, editor.html, astro.js and astro-jsx.js bundles, astro:* shims
-examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections); the base used by CI's smoke test and bench/mem.sh
+examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections, endpoints); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         React islands hydrated with client:load, one local and one imported from npm
 examples/vue           a Vue SFC compiled in the browser and hydrated with client:load
 examples/svelte        the same for a Svelte 5 component
 scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
-e2e/                   Playwright suite for the browser side: every example page, live reload, hydration, the error overlay
+e2e/                   Playwright suite for the browser side: every example page, endpoints, live reload, hydration, the error overlay
 ```
 
 ## What the preview does not do
@@ -328,7 +334,9 @@ e2e/                   Playwright suite for the browser side: every example page
   `vue`/`svelte` imports to the CDN and relative ones against the component's
   own URL: `./Other.vue` works, `./other` (no extension) does not, and
   `<script lang="ts">` reaches the browser as TypeScript and fails to parse.
-- **Endpoints.** `src/pages/*.ts` endpoints show an "unsupported route" page.
+- **Non-`GET` requests.** A visitor navigates, so only an endpoint's `GET` (or
+  `ALL`) handler ever runs and the request carries no body. `src/middleware.ts`
+  is not loaded, and `astro:actions` answers `SERVICE_UNAVAILABLE`.
 - **Less/Stylus.** Sass works; other preprocessors are passed through untouched.
 - **`content.config.ts` loaders.** The config is read statically, never
   executed: `glob({ pattern, base })` and `file(path)` with literal arguments
