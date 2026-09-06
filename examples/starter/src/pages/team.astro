@@ -1,0 +1,26 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { getCollection } from "astro:content";
+
+const team = (await getCollection("team")).sort((a, b) => a.data.joined.getTime() - b.data.joined.getTime());
+---
+<Layout title="Team" description="The people behind the studio">
+  <h1>Team</h1>
+  <p class="lede">Loaded from <code>src/content/team.json</code> through the <code>file()</code> loader.</p>
+  <ul class="team">
+    {team.map((m) => (
+      <li>
+        <strong>{m.data.name}</strong>
+        <span>{m.data.role} · joined {m.data.joined.toLocaleDateString("en", { dateStyle: "medium" })}</span>
+        <p>{m.data.bio}</p>
+      </li>
+    ))}
+  </ul>
+</Layout>
+
+<style>
+  .lede { color: var(--muted); }
+  .team { list-style: none; padding: 0; display: grid; gap: 18px; }
+  .team span { margin-left: 10px; color: var(--muted); font-size: 14px; }
+  .team p { margin: 4px 0 0; color: var(--muted); }
+</style>

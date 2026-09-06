@@ -1,0 +1,23 @@
+[
+  {
+    "id": "mara",
+    "name": "Mara Okafor",
+    "role": "Design lead",
+    "joined": "2019-04-02",
+    "bio": "Draws the first sketch and signs off on the last pixel."
+  },
+  {
+    "id": "deniz",
+    "name": "Deniz Yilmaz",
+    "role": "Engineering",
+    "joined": "2021-09-13",
+    "bio": "Keeps the build honest and the bundle small."
+  },
+  {
+    "id": "iris",
+    "name": "Iris Lambert",
+    "role": "Words",
+    "joined": "2023-01-30",
+    "bio": "Writes the case studies nobody skims."
+  }
+]

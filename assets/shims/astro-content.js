@@ -15,12 +15,25 @@ function reviveDates(value) {
   return value;
 }
 
+// The daemon read `z.date()` / `z.coerce.date()` out of the schema, so guessing by shape is not needed.
+function reviveFields(data, paths) {
+  for (const path of paths) {
+    const keys = path.split(".");
+    let obj = data;
+    for (let i = 0; i < keys.length - 1 && obj; i++) obj = obj[keys[i]];
+    const key = keys[keys.length - 1];
+    const value = obj?.[key];
+    if (typeof value === "string" || typeof value === "number") obj[key] = new Date(value);
+  }
+  return data;
+}
+
 function load(name) {
   if (!cache.has(name)) {
     cache.set(name, fetch(`/__sl/content/${encodeURIComponent(name)}?v=${globalThis.__sl?.version ?? ""}`).then(async (r) => {
       if (!r.ok) throw new Error(`content collection '${name}' is not available (${r.status})`);
-      const entries = await r.json();
-      for (const e of entries) e.data = reviveDates(e.data);
+      const { entries, dates } = await r.json();
+      for (const e of entries) e.data = dates ? reviveFields(e.data, dates) : reviveDates(e.data);
       return entries;
     }));
   }
