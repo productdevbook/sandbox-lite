@@ -3,10 +3,13 @@ use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 
+use super::js::SpecRef;
 use super::{BuildError, Diag, json_str};
 
 pub const INTERNAL_URL: &str = "/__sl/astro.js";
 pub const TRANSITIONS_URL: &str = "/__sl/shim/viewtransitions-css.js";
+
+const PATH_ATTRS: [&str; 2] = ["client:component-path", "server:component-path"];
 
 pub enum Script {
     Inline(String),
@@ -19,6 +22,7 @@ pub struct AstroOut {
     pub scripts: Vec<Script>,
     pub warnings: Vec<Diag>,
     pub islands: usize,
+    pub component_paths: Vec<SpecRef>,
 }
 
 pub type Preprocess<'a> = &'a dyn Fn(&str, &str) -> Result<String, String>;
@@ -80,12 +84,28 @@ pub fn compile(path: &str, source: &str, site: Option<&str>, preprocess: Preproc
     for c in r.hydrated_components.iter().chain(&r.client_only_components).chain(&r.server_components) {
         if c.specifier.starts_with('.') {
             let resolved = format!("/{}", crate::resolve::join(dir, &c.specifier));
-            for attr in ["client:component-path", "server:component-path"] {
+            for attr in PATH_ATTRS {
                 code = code.replace(&format!("\"{attr}\": \"{}\"", c.specifier), &format!("\"{attr}\": \"{resolved}\""));
             }
         }
     }
-    Ok(AstroOut { code, css: r.css, scripts, warnings: diags, islands })
+    // A package's URL depends on the tenant's package.json pins, which the cache key does not hash: `serve` resolves these.
+    let mut component_paths = Vec::new();
+    for c in r.hydrated_components.iter().chain(&r.client_only_components).chain(&r.server_components) {
+        if c.specifier.starts_with('.') || c.specifier.starts_with('/') {
+            continue;
+        }
+        for attr in PATH_ATTRS {
+            let prefix = format!("\"{attr}\": \"");
+            for (at, _) in code.match_indices(&format!("{prefix}{}\"", c.specifier)) {
+                let start = at + prefix.len();
+                component_paths.push(SpecRef { start, end: start + c.specifier.len(), spec: c.specifier.clone() });
+            }
+        }
+    }
+    component_paths.sort_by_key(|s| s.start);
+    component_paths.dedup_by_key(|s| s.start);
+    Ok(AstroOut { code, css: r.css, scripts, warnings: diags, islands, component_paths })
 }
 
 fn first_text(diags: &[Diag]) -> String {
@@ -113,4 +133,31 @@ fn convert(diags: &[Diagnostic], file: &str) -> Vec<Diag> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AstroOut, compile};
+
+    fn compiled(source: &str) -> AstroOut {
+        compile("src/pages/index.astro", source, None, &|_, src| Ok(src.to_string())).unwrap()
+    }
+
+    #[test]
+    fn package_island_paths_are_left_for_serve_time() {
+        let out = compiled(
+            "---\nimport { Chart } from \"some-widgets\";\nimport Local from \"../components/Local.tsx\";\n---\n<Chart client:load />\n<Local client:load />\n",
+        );
+        assert!(out.code.contains(r#""client:component-path": "/src/components/Local.tsx""#), "{}", out.code);
+        assert!(out.code.contains(r#""client:component-export": "Chart""#), "{}", out.code);
+        let found: Vec<(&str, &str)> = out.component_paths.iter().map(|s| (s.spec.as_str(), &out.code[s.start..s.end])).collect();
+        assert_eq!(found, vec![("some-widgets", "some-widgets")]);
+    }
+
+    #[test]
+    fn a_client_only_package_island_is_recorded_once() {
+        let out = compiled("---\nimport Widget from \"widgets\";\n---\n<Widget client:only=\"react\" />\n<Widget client:load />\n");
+        assert_eq!(out.component_paths.len(), 2, "{:?}", out.component_paths);
+        assert!(out.component_paths.iter().all(|s| &out.code[s.start..s.end] == "widgets"), "{}", out.code);
+    }
 }

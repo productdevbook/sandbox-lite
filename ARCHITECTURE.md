@@ -125,6 +125,8 @@ exact.
    register their CSS; `astro:*` as `/__sl/shim/astro-*.js`; bare specifiers
    as CDN URLs; images as `{ src, width, height, format }` modules;
    unresolvable specifiers as `/__sl/missing.js?spec=…&from=…`, which throws.
+   The `client:component-path` of an island imported from a package is
+   rewritten the same way, so the island's `component-url` is the CDN URL.
    The browser follows the graph; each request repeats step 4.
 6. **Static paths.** If the route has params and the module exports
    `getStaticPaths`, the shell calls it with its own `paginate`, keeps the
@@ -164,7 +166,7 @@ What `compile` does per kind and extension:
 
 | Input | Output |
 |---|---|
-| `.astro` | `astro_codegen` (`src/transform/astro.rs`): oxc parses, `<style lang="scss\|sass">` blocks are pre-compiled with grass, the compiler emits a module importing helpers from `/__sl/astro.js`; the CSS of each `<style>` and each hoisted `<script>` are kept aside; relative `client:component-path` values are made root-absolute |
+| `.astro` | `astro_codegen` (`src/transform/astro.rs`): oxc parses, `<style lang="scss\|sass">` blocks are pre-compiled with grass, the compiler emits a module importing helpers from `/__sl/astro.js`; the CSS of each `<style>` and each hoisted `<script>` are kept aside; relative `client:component-path` values are made root-absolute, and the byte range of every package one is recorded for `serve` |
 | `.ts` `.tsx` `.jsx` `.mts` | oxc transform (`src/transform/js.rs`): TypeScript stripped, JSX compiled |
 | `.js` `.mjs` | served as-is when it parses as ESM, otherwise transformed |
 | `.css` | a module that registers the text in `globalThis.__sl_css`, with relative `url()` and `@import` targets rewritten to `/__sl/raw/…` (`src/transform/css.rs`) |
@@ -178,8 +180,11 @@ What `compile` does per kind and extension:
 | anything else | the `/__sl/raw/` URL as a string export |
 
 A `Built` holds the compiled `body`, plus what `serve` needs later: `specs`
-(byte ranges of every import specifier, from oxc's module record), `globs`
-(byte ranges and options of every `import.meta.glob(...)` call,
+(byte ranges of every import specifier, from oxc's module record),
+`component_paths` (byte ranges of every `client:component-path` /
+`server:component-path` the compiler could not make root-absolute — a package
+or a `tsconfig` alias — so an island resolves like any other specifier),
+`globs` (byte ranges and options of every `import.meta.glob(...)` call,
 `src/transform/glob.rs`), the CSS blocks, the hoisted scripts, warnings and
 an island count.
 
@@ -216,12 +221,14 @@ written. What they resolve to is a property of the tenant, not of the file:
 - `./Header` is `Header.astro` in one tenant and `Header.tsx` in another
   (`Resolver::probe` tries extensions, then `index` files);
 - the set of files matching `./posts/*.md` is the tenant's file list;
+- `react-countup` is `https://esm.sh/react-countup@<range>` at the range that
+  tenant's `package.json` pins;
 - every emitted URL must carry the tenant's current `?v=`.
 
 None of that can live in a content-addressed entry, so `Engine::serve` does it
-on every request: it resolves each `spec` with the `Resolver`, expands each
-glob against `tenant.list()` (`glob::expand` writes hoisted
-`import * as __sl_glob<i>_<j> from "/__sl/m/<file>?v=N"` statements for
+on every request: it resolves each `spec` and each `component_path` with the
+`Resolver`, expands each glob against `tenant.list()` (`glob::expand` writes
+hoisted `import * as __sl_glob<i>_<j> from "/__sl/m/<file>?v=N"` statements for
 `eager: true`, or `() => import(...)` thunks otherwise, keyed relative to the
 importer or absolute when the pattern is), prepends
 `import.meta.env = globalThis.__sl_env || {};` when the module needs it, and
