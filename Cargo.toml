@@ -24,7 +24,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-imagesize = "0.13"
+imagesize = "0.15"
 grass = { version = "0.13", default-features = false }
 globset = "0.4"
 blake3 = "1"
