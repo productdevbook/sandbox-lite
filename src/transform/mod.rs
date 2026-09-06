@@ -7,6 +7,7 @@ pub mod markdown;
 pub mod mdx;
 pub mod scss;
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -93,6 +94,80 @@ impl Built {
 
 pub const JS: &str = "text/javascript; charset=utf-8";
 
+/// oxc, astro_codegen, satteri-mdxjs and grass are recursive-descent, so a source byte can cost a
+/// stack frame and a stack overflow aborts the process (`panic = "abort"`). The two shapes measured
+/// past 1 KiB of stack per source byte both nest on characters `nesting_depth` counts, so what is
+/// left for the stack to absorb is the recursion that scan cannot see — chained unary `-` through
+/// oxc and `<<` through astro_codegen, both around 300 bytes per source byte in a debug build. The
+/// stack is sized from the source cap rather than fixed, so raising the cap raises it too.
+const STACK_PER_SOURCE_BYTE: usize = 4000;
+const MIN_PARSER_STACK: usize = 16 << 20;
+
+/// Three orders of magnitude past what hand-written source nests to. Two parsers cost far more than
+/// the rest per level — oxc about 2 KiB and the MDX blockquote reader about 3.7 KiB, and the latter
+/// is also quadratic in time, so 64 KiB of `>` takes a quarter of an hour whether or not the stack
+/// holds. Both recurse on characters a scan can count, so they are bounded before they are called.
+const MAX_NESTING_DEPTH: usize = 2000;
+
+/// How deep the parsers will recurse, counted on the bytes themselves: unclosed `(`, `[` and `{`,
+/// and runs of markdown blockquote markers. It does not skip strings or comments, so a literal full
+/// of brackets reads as nesting — nothing written by hand comes near the limit either way.
+fn nesting_depth(source: &[u8]) -> usize {
+    let (mut open, mut quote, mut max) = (0usize, 0usize, 0usize);
+    for &b in source {
+        match b {
+            b'(' | b'[' | b'{' => open += 1,
+            b')' | b']' | b'}' => open = open.saturating_sub(1),
+            b'>' => quote += 1,
+            b' ' | b'\t' => continue,
+            _ => quote = 0,
+        }
+        max = max.max(open).max(quote);
+    }
+    max
+}
+
+/// Extensions whose module build hands the source to one of those parsers. `md` is out: markdown
+/// never overflowed at any size the cap allows, and long articles are legitimate. `css` and `json`
+/// are out too — they are embedded in a JS module as a string, never parsed.
+fn parses_source(ext: &str) -> bool {
+    matches!(ext, "astro" | "ts" | "tsx" | "jsx" | "mts" | "js" | "mjs" | "mdx" | "scss" | "sass")
+}
+
+thread_local! {
+    static ON_PARSER_STACK: Cell<bool> = const { Cell::new(false) };
+    /// Counted per calling thread so parallel tests cannot see each other's spawns.
+    #[cfg(test)]
+    static SPAWNED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Runs `f` on a thread with a stack the parsers cannot walk off. The reservation is virtual
+/// address space; only the pages a compile actually touches become resident. A `?type=style` or
+/// `?type=script` build asks for the module first, so the flag keeps that inner build on the stack
+/// this one already reserved instead of reserving a second one.
+fn with_big_stack<T: Send>(stack_bytes: usize, f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    if ON_PARSER_STACK.get() {
+        return Ok(f());
+    }
+    std::thread::scope(|scope| {
+        let body = || {
+            ON_PARSER_STACK.set(true);
+            f()
+        };
+        let handle = std::thread::Builder::new().stack_size(stack_bytes).spawn_scoped(scope, body)?;
+        #[cfg(test)]
+        SPAWNED.set(SPAWNED.get() + 1);
+        Ok(handle.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+    })
+}
+
+fn refused(path: &str, text: String, hint: &str) -> BuildError {
+    BuildError::compile(
+        format!("{path}: {text}"),
+        vec![Diag { severity: "error".into(), text, hint: hint.to_string(), file: path.to_string(), line: 0, column: 0 }],
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Module,
@@ -139,12 +214,18 @@ impl Kind {
 pub struct Config {
     pub cdn: String,
     pub cache_bytes: usize,
+    pub max_source_bytes: usize,
     pub sass_timeout: Duration,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { cdn: "https://esm.sh".into(), cache_bytes: 64 << 20, sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS) }
+        Config {
+            cdn: "https://esm.sh".into(),
+            cache_bytes: 64 << 20,
+            max_source_bytes: 64 << 10,
+            sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
+        }
     }
 }
 
@@ -174,6 +255,15 @@ impl Engine {
     pub fn new(cfg: Config) -> Engine {
         let sass = scss::Sass::new(cfg.sass_timeout);
         Engine { cfg, cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }), sass }
+    }
+
+    pub fn parser_stack_bytes(&self) -> usize {
+        self.cfg.max_source_bytes.saturating_mul(STACK_PER_SOURCE_BYTE).max(MIN_PARSER_STACK)
+    }
+
+    /// For the parsers reached outside `build` — the content config, which oxc walks.
+    pub fn on_parser_stack<T: Send>(&self, f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+        with_big_stack(self.parser_stack_bytes(), f)
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -233,7 +323,10 @@ impl Engine {
         if let Some(b) = self.cached(key) {
             return Ok(b);
         }
-        let built = Arc::new(self.compile(tenant, path, kind, &data, site.as_deref())?);
+        let compiled = self
+            .on_parser_stack(|| self.compile(tenant, path, kind, &data, site.as_deref()))
+            .map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
+        let built = Arc::new(compiled?);
         self.insert(key, built.clone());
         Ok(built)
     }
@@ -261,6 +354,18 @@ impl Engine {
             }
             Kind::Module => {
                 let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("").to_ascii_lowercase();
+                if parses_source(&ext) {
+                    let max = self.cfg.max_source_bytes;
+                    if data.len() > max {
+                        let text = format!("file too large to compile: {} KiB, limit {} KiB", data.len() / 1024, max / 1024);
+                        return Err(refused(path, text, "raise --max-source-kb, or split the file"));
+                    }
+                    let depth = nesting_depth(data);
+                    if depth > MAX_NESTING_DEPTH {
+                        let text = format!("source nests {depth} deep, limit {MAX_NESTING_DEPTH}");
+                        return Err(refused(path, text, "unbalanced brackets are the usual cause"));
+                    }
+                }
                 match ext.as_str() {
                     "astro" => {
                         let dir = dirname(path);
@@ -417,7 +522,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Config, Engine, Kind, svg_size};
+    use super::*;
     use crate::resolve::Resolver;
     use crate::store::{Base, Store, Tenant};
 
@@ -444,6 +549,23 @@ mod tests {
 
     fn served(engine: &Engine, tenant: &Tenant) -> String {
         engine.serve(tenant, PAGE_PATH, Kind::Module, &Resolver::new(tenant, "https://esm.sh", 7)).unwrap().0
+    }
+
+    const CAP: usize = 64 << 10;
+
+    fn engine_capped(max_source_bytes: usize) -> Engine {
+        Engine::new(Config { cache_bytes: 8 << 20, max_source_bytes, ..Config::default() })
+    }
+
+    fn tenant_with(path: &str, source: &str) -> Arc<Tenant> {
+        tenant(&[(path, source)])
+    }
+
+    fn build_err(r: Result<Arc<Built>, BuildError>) -> BuildError {
+        match r {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => e,
+        }
     }
 
     #[test]
@@ -485,6 +607,118 @@ mod tests {
         assert!(served(&engine, &a).contains("https://esm.sh/some-widgets@1.0.0"));
         assert!(served(&engine, &b).contains("https://esm.sh/some-widgets@2.0.0"));
         assert_eq!(engine.stats().misses, 1, "package.json is not in the cache key, so both tenants share one compile");
+    }
+
+    #[test]
+    fn cap_rejects_oversized_parsed_sources() {
+        let big = format!("export const x = [{}0];\n", "\"x\",".repeat(CAP / 4));
+        let t = tenant_with("src/big.ts", &big);
+        let e = build_err(engine_capped(CAP).build(&t, "src/big.ts", Kind::Module));
+        assert_eq!(e.status, 500);
+        assert!(e.message.contains("file too large to compile"), "{}", e.message);
+        assert_eq!(e.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn cap_leaves_unparsed_kinds_alone() {
+        let t = tenant_with("src/big.json", &format!("[{}0]", "\"x\",".repeat(CAP / 4)));
+        let e = engine_capped(CAP);
+        assert!(e.build(&t, "src/big.json", Kind::Module).is_ok());
+        assert!(e.build(&t, "src/big.json", Kind::Raw).is_ok());
+        assert!(e.build(&t, "src/big.json", Kind::Url).is_ok());
+    }
+
+    #[test]
+    fn cap_counts_bytes_not_characters() {
+        let source = format!("export const x = \"{}\";\n", "é".repeat(CAP / 2));
+        assert!(source.chars().count() < CAP && source.len() > CAP);
+        let t = tenant_with("src/wide.ts", &source);
+        assert!(engine_capped(CAP).build(&t, "src/wide.ts", Kind::Module).is_err());
+    }
+
+    /// Issue #25: on a default 2 MiB thread every one of these aborts the process. Bracket and
+    /// blockquote nesting is refused by the pre-scan; the shapes it does not model reach the parsers
+    /// on the big stack. Either way the build answers, and the process is alive for the next case.
+    #[test]
+    fn deep_nesting_answers_instead_of_aborting() {
+        for (path, source) in [
+            ("src/brackets.ts", format!("const x = {}1{}", "[".repeat(20_000), "]".repeat(20_000))),
+            ("src/unclosed.ts", format!("const x = {}", "[".repeat(20_000))),
+            ("src/quotes.mdx", ">".repeat(20_000)),
+            ("src/braces.scss", "a{".repeat(20_000)),
+        ] {
+            let t = tenant_with(path, &source);
+            let e = build_err(engine_capped(CAP).build(&t, path, Kind::Module));
+            assert!(e.message.contains("nests"), "{path}: {}", e.message);
+        }
+        for (path, source) in [
+            ("src/unary.ts", "- ".repeat(20_000)),
+            ("src/angles.astro", "<<".repeat(20_000)),
+            ("src/divs.astro", format!("{}x{}", "<div>".repeat(2_000), "</div>".repeat(2_000))),
+            ("src/jsx.mdx", format!("{}x{}", "<a>".repeat(2_000), "</a>".repeat(2_000))),
+        ] {
+            let t = tenant_with(path, &source);
+            if let Err(e) = engine_capped(CAP).build(&t, path, Kind::Module) {
+                assert!(!e.message.contains("too large") && !e.message.contains("nests"), "{path}: {}", e.message);
+            }
+        }
+    }
+
+    #[test]
+    fn nesting_depth_counts_brackets_and_blockquotes() {
+        assert_eq!(nesting_depth(b"const x = [[1], [2]];"), 2);
+        assert_eq!(nesting_depth(b"f(a) f(b) f(c)"), 1);
+        assert_eq!(nesting_depth(b"> > > quoted"), 3);
+        assert_eq!(nesting_depth(b"a >> b >>> c"), 3);
+        assert_eq!(nesting_depth(b"<div><span></span></div>"), 1);
+        assert_eq!(nesting_depth(b"))))"), 0);
+    }
+
+    #[test]
+    fn deeply_nested_astro_compiles() {
+        let source = format!("{}hi{}", "<div>".repeat(1000), "</div>".repeat(1000));
+        let t = tenant_with("src/nested.astro", &source);
+        let built = engine_capped(CAP).build(&t, "src/nested.astro", Kind::Module).unwrap();
+        assert!(built.body.contains("createComponent"));
+    }
+
+    /// `src/content.config.ts` goes to oxc from the content route, which does not go through `build`.
+    #[test]
+    fn a_content_config_past_either_limit_is_not_parsed() {
+        let good = "export const collections = { posts: defineCollection({}) };";
+        let t = tenant_with("src/content.config.ts", good);
+        assert!(!crate::transform::content::config(&t, CAP).is_empty());
+        for source in [&"a".repeat(CAP + 1), &"[".repeat(MAX_NESTING_DEPTH + 1)] {
+            let t = tenant_with("src/content.config.ts", source);
+            assert!(crate::transform::content::config(&t, CAP).is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_stack_grows_with_the_cap() {
+        assert_eq!(engine_capped(CAP).parser_stack_bytes(), CAP * STACK_PER_SOURCE_BYTE);
+        assert_eq!(engine_capped(1).parser_stack_bytes(), MIN_PARSER_STACK);
+        assert_eq!(engine_capped(usize::MAX).parser_stack_bytes(), usize::MAX);
+    }
+
+    /// A `?type=style` build asks for the module first. That inner build must not reserve a second
+    /// big stack on top of the one the outer build is already running on.
+    #[test]
+    fn a_style_build_reserves_one_stack_not_two() {
+        let t = tenant_with("src/styled.astro", "<style>p{color:red}</style><p>hi</p>");
+        let e = engine_capped(CAP);
+        SPAWNED.set(0);
+        e.build(&t, "src/styled.astro", Kind::Style(0)).unwrap();
+        assert_eq!(SPAWNED.get(), 1);
+    }
+
+    #[test]
+    fn a_script_build_reserves_one_stack_not_two() {
+        let t = tenant_with("src/scripted.astro", "<script>console.log(1)</script><p>hi</p>");
+        let e = engine_capped(CAP);
+        SPAWNED.set(0);
+        e.build(&t, "src/scripted.astro", Kind::Script(0)).unwrap();
+        assert_eq!(SPAWNED.get(), 1);
     }
 
     #[test]

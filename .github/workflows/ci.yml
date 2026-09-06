@@ -30,6 +30,16 @@ jobs:
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/pages/index.astro?v=1' | grep -q createComponent
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/routes.json' | grep -q '"/blog/\[slug\]"'
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/' | grep -q shell.js
+          # issue #25: deeply nested source must answer rather than abort the daemon
+          python3 -c "print('const x = ' + '['*20000)" > deep.ts
+          python3 -c "print('<style>p{color:red}</style><script>console.log(1)</script>' + '<div>'*1000 + 'x' + '</div>'*1000)" > deep.astro
+          curl -sf -X PUT --data-binary @deep.ts http://127.0.0.1:4399/api/t/ci/file/src/deep.ts
+          curl -sf -X PUT --data-binary @deep.astro http://127.0.0.1:4399/api/t/ci/file/src/deep.astro
+          test 500 = "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.ts?v=1')"
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?v=1' | grep -q createComponent
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=style&index=0' | grep -q __sl_css
+          curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/m/src/deep.astro?astro&type=script&index=0' | grep -q console.log
+          test 200 = "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4399/health)"
       - run: bench/mem.sh 100 4398
   e2e:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
