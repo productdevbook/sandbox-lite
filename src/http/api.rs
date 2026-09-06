@@ -84,6 +84,7 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "bases": st.store.bases().iter().map(|b| json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes() })).collect::<Vec<_>>(),
         "cache": st.engine.stats(),
         "sass": st.engine.sass_stats(),
+        "compiles": st.engine.compile_stats(),
         "modules": module_stats(&st),
         "ai": st.api_key.is_some(),
         "preview_auth": st.preview_secret.is_some(),
@@ -98,6 +99,7 @@ fn snapshot(st: &AppState) -> Snapshot {
     let tenants = st.store.tenants();
     let cache = st.engine.stats();
     let sass = st.engine.sass_stats();
+    let compiles = st.engine.compile_stats();
     Snapshot {
         uptime_seconds: st.started.elapsed().as_secs(),
         rss_bytes: rss_kb().map(|kb| kb * 1024),
@@ -113,6 +115,10 @@ fn snapshot(st: &AppState) -> Snapshot {
         sass_runaway: sass.runaway as u64,
         sass_timeouts: sass.timeouts,
         sass_refused: sass.refused,
+        compiles_running: compiles.running as u64,
+        compiles_queued: compiles.queued as u64,
+        compiles_limit: compiles.limit as u64,
+        compiles_refused: compiles.refused,
         requests: st.metrics.requests(),
         compile: st.metrics.compiles(),
     }

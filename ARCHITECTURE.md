@@ -267,6 +267,24 @@ MiB) counts `body` bytes; when exceeded, the oldest-inserted entries are
 dropped (FIFO, not LRU). `/api/stats` and `/metrics` report entries, bytes,
 hits and misses.
 
+### How many compiles run at once
+
+A cache miss reserves `parser_stack_bytes()` of stack on a thread of its own,
+and the request that asked for it sits on tokio's blocking pool, which would
+let 512 of those exist together. So a miss takes one of `--max-compiles`
+permits first (default: one per core, never fewer than one). A build that
+finds none free waits five seconds for one and is then refused with 503 rather
+than queueing without end. `/api/stats` reports the permits held, the builds
+waiting, the limit and the refusals under `compiles`; `/metrics` has the same
+four.
+
+Two builds take no permit. A cache hit is not a compile, so a warm daemon
+serving cached modules never queues. And a `?type=style` or `?type=script`
+build asks for the module from inside its own compile: that inner build runs
+under the permit — and on the stack — its parent is already holding, which a
+thread-local marks for each. A second permit there would deadlock as soon as
+the gate was full.
+
 ### Why resolution and `import.meta.glob` happen at serve time
 
 The compiled body contains the specifiers as written — `./Header`,
@@ -423,11 +441,13 @@ observation.
 
 `GET /metrics` (`api::metrics`) renders those counters plus the gauges
 `/api/stats` already had — tenants, overlay bytes, cache entries and bytes,
-SSE subscribers, RSS, uptime, one series per base, and `Sass::stats`'s running,
-runaway, timed-out and refused compilations — as Prometheus text format 0.0.4,
+SSE subscribers, RSS, uptime, one series per base, `Sass::stats`'s running,
+runaway, timed-out and refused compilations, and the compile gate's permits
+held, builds queued, limit and refusals — as Prometheus text format 0.0.4,
 written by hand. Buckets are cumulative and `_count` is read off the `+Inf`
 bucket rather than counted separately, so the two can never disagree. The same
-numbers are in `/api/stats` under `modules`, `sass` and `sse_subscribers`.
+numbers are in `/api/stats` under `modules`, `sass`, `compiles` and
+`sse_subscribers`.
 
 `require_api_token` exempts only `/` and `/health`, so `/metrics` needs the
 bearer token whenever `--api-token` is set; `http::tests` asserts both halves.

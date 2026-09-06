@@ -10,7 +10,8 @@ pub mod sfc;
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -44,6 +45,10 @@ impl BuildError {
 
     pub fn compile(message: String, diagnostics: Vec<Diag>) -> BuildError {
         BuildError { status: 500, message, diagnostics }
+    }
+
+    pub fn busy(message: String) -> BuildError {
+        BuildError { status: 503, message, diagnostics: vec![] }
     }
 }
 
@@ -139,6 +144,9 @@ fn parses_source(ext: &str) -> bool {
 
 thread_local! {
     static ON_PARSER_STACK: Cell<bool> = const { Cell::new(false) };
+    /// Set while a compile that holds a permit runs, so the module build a `Style`/`Script` compile
+    /// makes from inside it does not queue for a second one.
+    static COMPILING: Cell<bool> = const { Cell::new(false) };
     /// Counted per calling thread so parallel tests cannot see each other's spawns.
     #[cfg(test)]
     static SPAWNED: Cell<usize> = const { Cell::new(0) };
@@ -219,6 +227,7 @@ pub struct Config {
     pub cache_bytes: usize,
     pub max_source_bytes: usize,
     pub sass_timeout: Duration,
+    pub max_compiles: usize,
 }
 
 impl Default for Config {
@@ -228,6 +237,7 @@ impl Default for Config {
             cache_bytes: 64 << 20,
             max_source_bytes: 64 << 10,
             sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
+            max_compiles: default_max_compiles(),
         }
     }
 }
@@ -248,20 +258,126 @@ struct Cache {
     misses: u64,
 }
 
+/// How long a compile waits for a permit before its request is refused. Long enough to absorb the
+/// burst of module requests one page load makes, short enough that a saturated daemon says so
+/// instead of holding the connection open.
+const COMPILE_QUEUE_WAIT: Duration = Duration::from_secs(5);
+
+/// Compiles that may run at once when nothing says otherwise. A compile is CPU-bound and holds a
+/// `parser_stack_bytes()` reservation while it runs, so more of them than cores buys queueing.
+pub fn default_max_compiles() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+#[derive(Serialize, Clone, Copy)]
+pub struct CompileStats {
+    pub running: usize,
+    pub queued: usize,
+    pub limit: usize,
+    pub refused: u64,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: usize,
+    queued: usize,
+}
+
+/// One permit per compile that may run at once. Every cache miss reserves `parser_stack_bytes()` of
+/// address space on a thread of its own and tokio's blocking pool would let 512 of those exist
+/// together, so without this the ceiling is the OS rather than a decision.
+struct Gate {
+    limit: usize,
+    wait: Duration,
+    state: Mutex<GateState>,
+    free: Condvar,
+    refused: AtomicU64,
+}
+
+struct Permit<'a>(&'a Gate);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.running -= 1;
+        drop(state);
+        self.0.free.notify_one();
+    }
+}
+
+impl Gate {
+    fn new(limit: usize, wait: Duration) -> Gate {
+        Gate { limit, wait, state: Mutex::new(GateState::default()), free: Condvar::new(), refused: AtomicU64::new(0) }
+    }
+
+    fn stats(&self) -> CompileStats {
+        let state = self.state.lock().unwrap();
+        CompileStats { running: state.running, queued: state.queued, limit: self.limit, refused: self.refused.load(Ordering::Relaxed) }
+    }
+
+    /// `None` when this thread is already compiling under a permit: a `?type=style` build asks for
+    /// the module from inside `compile`, and a second permit would deadlock once the gate is full.
+    fn enter(&self) -> Result<Option<Permit<'_>>, String> {
+        if COMPILING.get() {
+            return Ok(None);
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.running >= self.limit {
+            let deadline = Instant::now() + self.wait;
+            state.queued += 1;
+            loop {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    state.queued -= 1;
+                    drop(state);
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                    let (n, ms) = (self.limit, self.wait.as_millis());
+                    return Err(format!("{n} compiles are already running and this one waited {ms} ms for a slot"));
+                };
+                state = self.free.wait_timeout(state, left).unwrap().0;
+                if state.running < self.limit {
+                    state.queued -= 1;
+                    break;
+                }
+            }
+        }
+        state.running += 1;
+        Ok(Some(Permit(self)))
+    }
+}
+
+/// Marks the thread running a permitted compile, and restores the flag on the way out so a thread
+/// that builds again afterwards queues for a permit of its own.
+struct Compiling(bool);
+
+impl Compiling {
+    fn enter() -> Compiling {
+        Compiling(COMPILING.replace(true))
+    }
+}
+
+impl Drop for Compiling {
+    fn drop(&mut self) {
+        COMPILING.set(self.0);
+    }
+}
+
 pub struct Engine {
     pub cfg: Config,
     cache: Mutex<Cache>,
     sass: scss::Sass,
+    gate: Gate,
     metrics: Arc<Metrics>,
 }
 
 impl Engine {
     pub fn new(cfg: Config, metrics: Arc<Metrics>) -> Engine {
         let sass = scss::Sass::new(cfg.sass_timeout);
+        let gate = Gate::new(cfg.max_compiles.max(1), COMPILE_QUEUE_WAIT);
         Engine {
             cfg,
             cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }),
             sass,
+            gate,
             metrics,
         }
     }
@@ -282,6 +398,10 @@ impl Engine {
 
     pub fn sass_stats(&self) -> scss::SassStats {
         self.sass.stats()
+    }
+
+    pub fn compile_stats(&self) -> CompileStats {
+        self.gate.stats()
     }
 
     fn cached(&self, key: u128) -> Option<Arc<Built>> {
@@ -332,8 +452,12 @@ impl Engine {
         if let Some(b) = self.cached(key) {
             return Ok(b);
         }
+        let _permit = self.gate.enter().map_err(|e| BuildError::busy(format!("{path}: {e}")))?;
         let started = Instant::now();
-        let spawned = self.on_parser_stack(|| self.compile(tenant, path, kind, &data, site.as_deref()));
+        let spawned = self.on_parser_stack(|| {
+            let _compiling = Compiling::enter();
+            self.compile(tenant, path, kind, &data, site.as_deref())
+        });
         self.metrics.compiled(kind, started.elapsed());
         let compiled = spawned.map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
         let built = Arc::new(compiled?);
@@ -565,11 +689,20 @@ mod tests {
     const CAP: usize = 64 << 10;
 
     fn engine_capped(max_source_bytes: usize) -> Engine {
-        Engine::new(Config { cache_bytes: 8 << 20, max_source_bytes, ..Config::default() }, Arc::new(crate::metrics::Metrics::default()))
+        Engine::new(capped(max_source_bytes), Arc::new(crate::metrics::Metrics::default()))
     }
 
     fn tenant_with(path: &str, source: &str) -> Arc<Tenant> {
         tenant(&[(path, source)])
+    }
+
+    /// The queue deadline is not a flag, so tests reach past `Engine::new` to shorten it.
+    fn engine_gated(cfg: Config, limit: usize, wait: Duration) -> Engine {
+        Engine { gate: Gate::new(limit, wait), ..Engine::new(cfg, Arc::new(crate::metrics::Metrics::default())) }
+    }
+
+    fn capped(max_source_bytes: usize) -> Config {
+        Config { cache_bytes: 8 << 20, max_source_bytes, ..Config::default() }
     }
 
     fn build_err(r: Result<Arc<Built>, BuildError>) -> BuildError {
@@ -731,6 +864,64 @@ mod tests {
         SPAWNED.set(0);
         e.build(&t, "src/scripted.astro", Kind::Script(0)).unwrap();
         assert_eq!(SPAWNED.get(), 1);
+    }
+
+    /// Issue #47: every compile reserves a stack of its own on a thread of its own, and tokio's
+    /// blocking pool would let 512 of those exist together. Three concurrent compiles, two permits:
+    /// the third waits for a slot and is refused at the deadline instead of reserving a third stack.
+    #[test]
+    fn concurrent_compiles_reserve_no_more_stacks_than_permits() {
+        let bomb = |n: u32| format!("@for $i from 1 through {n} {{ .a-#{{$i}} {{ color: red }} }}");
+        let (a, b, c) = (bomb(200_000), bomb(200_001), bomb(200_002));
+        let t = tenant(&[("src/a.scss", a.as_str()), ("src/b.scss", b.as_str()), ("src/c.scss", c.as_str())]);
+        let cfg = Config { sass_timeout: Duration::from_secs(2), ..capped(CAP) };
+        let engine = engine_gated(cfg, 2, Duration::from_millis(50));
+        std::thread::scope(|scope| {
+            let busy = ["src/a.scss", "src/b.scss"].map(|path| {
+                let (engine, t) = (&engine, &t);
+                scope.spawn(move || {
+                    SPAWNED.set(0);
+                    let _ = engine.build(t, path, Kind::Module);
+                    SPAWNED.get()
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.compile_stats().running < 2 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            SPAWNED.set(0);
+            let e = build_err(engine.build(&t, "src/c.scss", Kind::Module));
+            assert_eq!(e.status, 503, "{}", e.message);
+            assert_eq!(SPAWNED.get(), 0, "a refused compile reserves no stack");
+            let stats = engine.compile_stats();
+            assert_eq!((stats.limit, stats.queued, stats.refused), (2, 0, 1));
+            let stacks: usize = busy.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(stacks, 2, "three concurrent compiles, two stacks");
+        });
+    }
+
+    /// A `?type=style` build compiles the module from inside its own compile. That inner build runs
+    /// under the permit its parent holds; asking for a second would never be answered.
+    #[test]
+    fn a_nested_build_takes_no_second_permit() {
+        let t = tenant_with("src/styled.astro", "<style>p{color:red}</style><script>console.log(1)</script><p>hi</p>");
+        for kind in [Kind::Style(0), Kind::Script(0)] {
+            let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
+            engine.build(&t, "src/styled.astro", kind).unwrap();
+            let stats = engine.compile_stats();
+            assert_eq!((stats.running, stats.refused), (0, 0));
+        }
+    }
+
+    /// A warm daemon serving cached modules must not queue: only a miss is a compile.
+    #[test]
+    fn a_cache_hit_takes_no_permit() {
+        let t = tenant(&[("src/hit.ts", "export const x = 1;\n"), ("src/miss.ts", "export const y = 2;\n")]);
+        let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
+        engine.build(&t, "src/hit.ts", Kind::Module).unwrap();
+        let closed = Engine { gate: Gate::new(0, Duration::from_millis(50)), ..engine };
+        assert!(closed.build(&t, "src/hit.ts", Kind::Module).is_ok());
+        assert_eq!(build_err(closed.build(&t, "src/miss.ts", Kind::Module)).status, 503);
     }
 
     #[test]

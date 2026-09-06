@@ -46,6 +46,9 @@ jobs:
           grep -qxF '# TYPE sandbox_lite_cache_hits_total counter' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_sass_runaway gauge' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_compile_seconds histogram' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_compiles_queued gauge' /tmp/metrics.txt
+          # issue #47: the permit count is what bounds concurrent compiles, so it must never render as 0
+          grep -qE '^sandbox_lite_compiles_limit [1-9][0-9]*$' /tmp/metrics.txt
           grep -qxF 'sandbox_lite_bases{base="starter"} 1' /tmp/metrics.txt
           grep -qE '^sandbox_lite_module_requests_total\{kind="module",status="200"\} [1-9][0-9]*$' /tmp/metrics.txt
           grep -qE '^sandbox_lite_module_requests_total\{kind="module",status="500"\} [1-9][0-9]*$' /tmp/metrics.txt
