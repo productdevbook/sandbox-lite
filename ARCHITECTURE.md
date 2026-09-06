@@ -253,15 +253,29 @@ The transform cache never sees the version; it is content-addressed.
 
 ## Content collections and Markdown (`src/transform/content.rs`)
 
-`/__sl/content/<name>` reads `src/content/<name>/` and returns entries:
-`.md`/`.markdown` with parsed YAML frontmatter as `data`, the body, the
-rendered HTML and headings; `.mdx` with `data` and the body only; `.json`
-arrays as one entry per item, other JSON as one entry; `.yaml`/`.yml` as one
-entry. The `astro:content` shim fetches that JSON, revives ISO dates, and
-implements `getCollection`, `getEntry` and `render` on top of it; for an
-`.mdx` entry `render` imports the compiled module at `/__sl/m/<filePath>` and
-returns its `Content`, `getHeadings()` and `frontmatter`. `content.config.ts`
-is not executed.
+`/__sl/content/<name>` returns `{entries, dates}`. An entry is `.md`/
+`.markdown` with parsed YAML frontmatter as `data`, the body, the rendered
+HTML and headings; `.mdx` with `data` and the body only; `.json` arrays as one
+entry per item, other JSON as one entry; `.yaml`/`.yml` as one entry. The
+`astro:content` shim fetches that JSON and implements `getCollection`,
+`getEntry` and `render` on top of it; for an `.mdx` entry `render` imports the
+compiled module at `/__sl/m/<filePath>` and returns its `Content`,
+`getHeadings()` and `frontmatter`.
+
+Which files those are comes from `src/content.config.ts` (or the Astro 2–4
+`src/content/config.ts`), parsed with oxc and never executed. `parse_config`
+maps `export const collections = { name: … }` to the `defineCollection({…})`
+literal behind each name and reads three things out of it: a
+`glob({ pattern, base })` loader — patterns matched with `globset` under
+`base`, negations included, ids being the base-relative path without its
+extension, lower-cased; a `file(path)` loader — one JSON or YAML file whose
+top level is an array of objects with an `id` or an object keyed by id; and
+the `z.date()` / `z.coerce.date()` fields of a `schema: z.object({…})`
+literal, which become the `dates` list the shim turns into `Date` objects.
+Anything the reader cannot see through — a computed pattern, a custom loader,
+a schema built by a function — leaves that part unset, and the collection
+falls back to `src/content/<name>/` with the shim's ISO-shaped-string guess
+for dates.
 
 ## `check` (`src/check.rs`)
 

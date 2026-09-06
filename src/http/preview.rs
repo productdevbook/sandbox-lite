@@ -129,7 +129,8 @@ pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<Tenan
     if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return err(StatusCode::BAD_REQUEST, "bad collection name");
     }
-    let out = tokio::task::spawn_blocking(move || content::collection_json(&t, &name)).await.unwrap_or(Value::Null);
+    let out =
+        tokio::task::spawn_blocking(move || content::collection_json(&t, &name)).await.unwrap_or_else(|_| content::empty_collection());
     ([(header::CACHE_CONTROL, "no-cache")], Json(out)).into_response()
 }
 

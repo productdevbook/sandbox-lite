@@ -42,6 +42,15 @@ test.describe('starter', () => {
     await expect(page.locator('article pre code')).toContainText('AstroContainer.create()');
   });
 
+  test('/team', async ({ daemon, page }) => {
+    const site = await daemon.tenant('starter', 'starter');
+    await page.goto(site.url('/team'));
+    await expect(page).toHaveTitle('Team · Lumen Studio');
+    // Ordered by `joined`, which only sorts if the schema's z.coerce.date() field came back as a Date.
+    await expect(page.locator('.team strong')).toHaveText(['Mara Okafor', 'Deniz Yilmaz', 'Iris Lambert']);
+    await expect(page.locator('.team span').first()).toHaveText('Design lead · joined Apr 2, 2019');
+  });
+
   test('/docs', async ({ daemon, page }) => {
     const site = await daemon.tenant('starter', 'starter');
     await page.goto(site.url('/docs'));

@@ -206,7 +206,7 @@ Tenant host (`<id>.<domain>`):
 | `/__sl/raw/<path>` | file as-is (assets, `@import`ed CSS) |
 | `/__sl/routes.json` | route table built from `src/pages`, in Astro priority order |
 | `/__sl/renderers.json` | framework renderers to register, derived from `package.json` (`@astrojs/react`, `@astrojs/preact`) or `sandbox-lite.json` |
-| `/__sl/content/<collection>` | `src/content/<collection>/*` as entries; Markdown arrives rendered, MDX entries render through their compiled module |
+| `/__sl/content/<collection>` | `{entries, dates}` — the collection's entries and the schema's date fields; Markdown arrives rendered, MDX entries render through their compiled module |
 | `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, …; `astro-jsx-runtime.js` is Astro's JSX runtime and `astro:jsx` renderer |
 | `/__sl/astro.js` | Astro's runtime + container API, bundled once per Astro version |
 | `/__sl/events` | same SSE stream as the API; the page reloads itself on it |
@@ -264,9 +264,13 @@ e2e/                   Playwright suite for the browser side: every example page
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
 - **Endpoints.** `src/pages/*.ts` endpoints show an "unsupported route" page.
 - **Less/Stylus.** Sass works; other preprocessors are passed through untouched.
-- **`content.config.ts` loaders.** Collections are read straight from
-  `src/content/<name>/`, which is what the `glob` loader does for almost every
-  theme; custom loaders are ignored.
+- **`content.config.ts` loaders.** The config is read statically, never
+  executed: `glob({ pattern, base })` and `file(path)` with literal arguments
+  are honoured, and `z.date()` / `z.coerce.date()` fields in a `z.object({…})`
+  schema are revived as `Date` exactly. A loader the reader cannot see through
+  — a custom one, or a pattern built from a variable — falls back to reading
+  `src/content/<name>/`; a schema it cannot see through falls back to reviving
+  every ISO-shaped string.
 - **`astro.config.*`** is not executed. `site` can be set in `sandbox-lite.json`
   (`{"site": "https://example.com", "imports": {"react": "https://esm.sh/react@19"}}`).
 - **Authentication.** There are no users: `--api-token` is one shared bearer
