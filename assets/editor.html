@@ -73,6 +73,7 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
 const $ = (s) => document.querySelector(s);
 const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chat: [], saving: null };
 const BINARY = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|pdf|wasm|zip)$/i;
+const esc = (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 let apiToken = "";
 try { apiToken = localStorage.getItem("sl_api_token") || ""; } catch {}
 const authHeaders = () => (apiToken ? { authorization: `Bearer ${apiToken}` } : {});
@@ -97,7 +98,7 @@ const fmtKB = (kb) => kb == null ? "?" : kb > 10240 ? (kb / 1024).toFixed(1) + "
 async function refreshStats() {
   try { state.stats = await api("GET", "/api/stats"); } catch (e) { $("#stat").textContent = "daemon unreachable"; return; }
   const s = state.stats;
-  $("#stat").innerHTML = `daemon RSS <b>${fmtKB(s.rss_kb)}</b> · ${s.tenants} tenants · cache ${(s.cache.bytes / 1024).toFixed(0)} kB / ${s.cache.entries} · astro ${s.astro} · chat ${s.ai ? "on" : "off"}`;
+  $("#stat").innerHTML = `daemon RSS <b>${esc(fmtKB(s.rss_kb))}</b> · ${esc(s.tenants)} tenants · cache ${esc((s.cache.bytes / 1024).toFixed(0))} kB / ${esc(s.cache.entries)} · astro ${esc(s.astro)} · chat ${esc(s.ai ? "on" : "off")}`;
   $("#chatSend").disabled = !s.ai;
   if (!s.ai) $("#chatHint").textContent = "Chat is off: start the daemon with ANTHROPIC_API_KEY set to enable the built-in assistant. The file editor works without it.";
 }
@@ -105,10 +106,10 @@ async function refreshStats() {
 async function loadTenants(selectId) {
   state.tenants = await api("GET", "/api/tenants");
   const sel = $("#tenant");
-  sel.innerHTML = state.tenants.map((t) => `<option value="${t.id}">${t.id} (${t.base})</option>`).join("");
+  sel.replaceChildren(...state.tenants.map((t) => new Option(`${t.id} (${t.base})`, t.id)));
   const id = selectId || state.tenant || (state.tenants[0] && state.tenants[0].id);
   if (id && state.tenants.some((t) => t.id === id)) { sel.value = id; await selectTenant(id); }
-  else { state.tenant = null; $("#frame").classList.add("hidden"); $("#empty").classList.remove("hidden"); $("#files").innerHTML = ""; }
+  else { state.tenant = null; $("#frame").classList.add("hidden"); $("#empty").classList.remove("hidden"); $("#files").replaceChildren(); }
 }
 
 async function selectTenant(id) {
@@ -130,7 +131,13 @@ async function selectTenant(id) {
 async function loadFiles() {
   if (!state.tenant) return;
   const { files } = await api("GET", `/api/t/${state.tenant}/files`);
-  $("#files").innerHTML = files.map((f) => `<div data-path="${f.path}" class="${f.modified ? "modified" : ""}${f.path === state.file ? " active" : ""}" title="${f.size} bytes">${f.path}</div>`).join("");
+  $("#files").replaceChildren(...files.map((f) => {
+    const d = document.createElement("div");
+    d.dataset.path = f.path; d.textContent = f.path; d.title = `${f.size} bytes`;
+    if (f.modified) d.classList.add("modified");
+    if (f.path === state.file) d.classList.add("active");
+    return d;
+  }));
 }
 
 async function openFile(path, silent) {
@@ -167,7 +174,7 @@ $("#tabs").addEventListener("click", (e) => {
 });
 const openDialog = async () => {
   const bases = await api("GET", "/api/bases");
-  $("#dlgBase").innerHTML = bases.map((b) => `<option value="${b.name}">${b.name} (${b.files} files)</option>`).join("");
+  $("#dlgBase").replaceChildren(...bases.map((b) => new Option(`${b.name} (${b.files} files)`, b.name)));
   $("#dlgId").value = ""; $("#dlg").showModal();
 };
 $("#newTenant").onclick = openDialog; $("#emptyNew").onclick = openDialog;
@@ -189,7 +196,11 @@ $("#frame").addEventListener("load", () => { try { $("#path").value = new URL($(
 
 function addMsg(role, text, changes) {
   const div = document.createElement("div"); div.className = "msg " + role; div.textContent = text;
-  if (changes && changes.length) { const c = document.createElement("div"); c.className = "chips"; c.innerHTML = changes.map((p) => `<span>${p}</span>`).join(""); div.appendChild(c); }
+  if (changes && changes.length) {
+    const c = document.createElement("div"); c.className = "chips";
+    for (const p of changes) { const s = document.createElement("span"); s.textContent = p; c.appendChild(s); }
+    div.appendChild(c);
+  }
   $("#msgs").appendChild(div); $("#msgs").scrollTop = 1e9; return div;
 }
 $("#chatForm").addEventListener("submit", async (e) => {
