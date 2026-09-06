@@ -63,11 +63,7 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
     let store = Store::new(None, u64::MAX);
     store.add_base(base);
     let tenant = store.create_tenant("check", "check")?;
-    let engine = Engine::new(Config {
-        cdn: "https://esm.sh".into(),
-        cache_bytes: 64 << 20,
-        sass_timeout: std::time::Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
-    });
+    let engine = Engine::new(Config::default());
     let mut report = Report {
         name,
         files: 0,

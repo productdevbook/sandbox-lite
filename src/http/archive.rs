@@ -222,11 +222,7 @@ mod tests {
         store.create_tenant("bb", "b").unwrap();
         let state = Arc::new(AppState {
             store,
-            engine: Engine::new(Config {
-                cdn: "https://esm.sh".into(),
-                cache_bytes: 1 << 20,
-                sass_timeout: std::time::Duration::from_millis(crate::transform::scss::DEFAULT_TIMEOUT_MS),
-            }),
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }),
             domain: "localhost".into(),
             port: 4321,
             model: "m".into(),

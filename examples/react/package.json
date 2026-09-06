@@ -7,7 +7,7 @@
     "@astrojs/react": "^6.0.5",
     "astro": "^7.3.1",
     "react": "^19.2.8",
-    "react-countup": "^6.5.3",
+    "react-countup": "6.5.3",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {

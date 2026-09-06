@@ -142,6 +142,12 @@ pub struct Config {
     pub sass_timeout: Duration,
 }
 
+impl Default for Config {
+    fn default() -> Config {
+        Config { cdn: "https://esm.sh".into(), cache_bytes: 64 << 20, sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS) }
+    }
+}
+
 #[derive(Serialize, Clone, Copy)]
 pub struct CacheStats {
     pub entries: usize,
@@ -421,11 +427,7 @@ mod tests {
     }
 
     fn engine() -> Engine {
-        Engine::new(Config {
-            cdn: "https://esm.sh".into(),
-            cache_bytes: 1 << 20,
-            sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
-        })
+        Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() })
     }
 
     fn served(engine: &Engine, tenant: &Tenant) -> String {
