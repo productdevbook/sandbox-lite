@@ -1,0 +1,138 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # dry run: builds, packages and smoke-tests every target, publishes nothing
+
+env:
+  # Archives are named after the tag; a dry run from a branch gets "dev".
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    runs-on: ubuntu-latest
+    # Built in the image the Dockerfile builds in, so the tarball runs wherever the image does
+    # (glibc 2.36, Debian 12, or newer); a build on ubuntu-latest itself would demand glibc 2.38.
+    container: rust:1-bookworm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: aarch64 cross toolchain and qemu-user
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          rustup target add aarch64-unknown-linux-gnu
+          {
+            echo CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            echo CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            echo AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+            echo STRIP=aarch64-linux-gnu-strip
+          } >> "$GITHUB_ENV"
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        run: |
+          "${STRIP:-strip}" target/${{ matrix.target }}/release/sandbox-lite
+          mkdir dist smoke
+          cp target/${{ matrix.target }}/release/sandbox-lite LICENSE README.md dist/
+          tar -C dist -czf "sandbox-lite-$RELEASE_TAG-${{ matrix.target }}.tar.gz" sandbox-lite LICENSE README.md
+          tar -C smoke -xzf "sandbox-lite-$RELEASE_TAG-${{ matrix.target }}.tar.gz"
+      - name: smoke test the packaged binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: ./smoke/sandbox-lite check examples/starter
+      - name: smoke test the packaged binary under qemu-user
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: qemu-aarch64 -L /usr/aarch64-linux-gnu ./smoke/sandbox-lite check examples/starter
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sandbox-lite-${{ matrix.target }}
+          path: sandbox-lite-*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        run: |
+          strip target/${{ matrix.target }}/release/sandbox-lite
+          mkdir dist smoke
+          cp target/${{ matrix.target }}/release/sandbox-lite LICENSE README.md dist/
+          tar -C dist -czf "sandbox-lite-$RELEASE_TAG-${{ matrix.target }}.tar.gz" sandbox-lite LICENSE README.md
+          tar -C smoke -xzf "sandbox-lite-$RELEASE_TAG-${{ matrix.target }}.tar.gz"
+      - name: smoke test the packaged binary
+        # The runner is arm64; the x86_64 build is cross-compiled here and would need Rosetta to run.
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: ./smoke/sandbox-lite check examples/starter
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sandbox-lite-${{ matrix.target }}
+          path: sandbox-lite-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [linux, macos]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: sandbox-lite-*
+          merge-multiple: true
+          path: dist
+      - run: cd dist && sha256sum sandbox-lite-*.tar.gz > SHA256SUMS
+      - name: create the release, or replace the files of one that a re-run already created
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload --clobber "$GITHUB_REF_NAME" dist/*
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes dist/*
+          fi
+
+  docker:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # The arm64 half compiles under emulation: expect it to take an hour or two, not minutes.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+            ${{ env.IMAGE }}:latest
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

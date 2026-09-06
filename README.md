@@ -72,6 +72,36 @@ transform cache shared by every tenant: two tenants with the same `Header.astro`
 share one compiled output. The cache has a byte budget (`--cache-mb`, default
 64) so the daemon's memory is bounded regardless of tenant count.
 
+## Install
+
+Every [release](https://github.com/productdevbook/sandbox-lite/releases) carries
+a stripped binary for Linux (x86-64 and arm64, glibc 2.35 or newer) and macOS
+(Intel and Apple silicon) as `sandbox-lite-<tag>-<target>.tar.gz`, holding
+`sandbox-lite`, `LICENSE` and `README.md`, plus a `SHA256SUMS` file:
+
+```sh
+tag=v0.1.0
+target=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin
+curl -fsSL "https://github.com/productdevbook/sandbox-lite/releases/download/$tag/sandbox-lite-$tag-$target.tar.gz" | tar xzf - sandbox-lite
+sudo install sandbox-lite /usr/local/bin/
+sandbox-lite --bases path/to/your/astro-projects
+```
+
+The same tag is published as a multi-arch image (`linux/amd64`, `linux/arm64`)
+at `ghcr.io/productdevbook/sandbox-lite:<tag>`, and `:latest` follows the newest
+release; see [Docker](#docker) for what the image bundles:
+
+```sh
+docker run -p 4321:4321 -v sandbox-data:/data ghcr.io/productdevbook/sandbox-lite:latest
+```
+
+Or build from source with a current stable Rust toolchain. The browser runtime
+is embedded in the binary, so nothing else is needed at run time:
+
+```sh
+cargo install --locked --git https://github.com/productdevbook/sandbox-lite   # --tag v0.1.0 pins a release
+```
+
 ## Try it
 
 ```sh
