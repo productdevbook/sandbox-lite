@@ -9,6 +9,8 @@ mod transform;
 #[cfg(test)]
 mod proptests;
 #[cfg(test)]
+mod shared_fixtures;
+#[cfg(test)]
 mod silent_failures;
 
 use std::path::PathBuf;

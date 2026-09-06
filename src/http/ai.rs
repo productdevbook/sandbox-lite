@@ -595,7 +595,6 @@ mod tests {
 
     use super::*;
     use crate::store::{Base, Store};
-    use crate::transform::{Config, Engine};
 
     const TEST_QUOTA: u64 = 1 << 20;
 
@@ -699,23 +698,14 @@ mod tests {
         store.add_base(Base::load("test", &base_dir).unwrap());
         store.create_tenant("acme", "test").unwrap();
         let (api_base, seen) = upstream(turns).await;
-        let metrics = Arc::new(crate::metrics::Metrics::default());
         let st = Arc::new(AppState {
             store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
-            metrics,
-            chats: super::super::chats::Chats::default(),
-            domain: "localhost".into(),
-            port: 4321,
             model: "test-model".into(),
             api_key: Some("test-key".into()),
             api_base,
-            api_token: None,
-            preview_secret: None,
-            cookie_samesite: super::super::SameSite::Lax,
             chrome,
             shots,
-            started: Instant::now(),
+            ..AppState::for_tests()
         });
         Fixture { st, seen, root }
     }
@@ -853,24 +843,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"], "unknown chat");
 
-        let metrics = Arc::new(crate::metrics::Metrics::default());
-        let broken = Arc::new(AppState {
-            store: Store::new(None, TEST_QUOTA),
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
-            metrics,
-            chats: super::super::chats::Chats::default(),
-            domain: "localhost".into(),
-            port: 4321,
-            model: "m".into(),
-            api_key: Some("k".into()),
-            api_base: "http://127.0.0.1:1".into(),
-            api_token: None,
-            preview_secret: None,
-            cookie_samesite: super::super::SameSite::Lax,
-            chrome: None,
-            shots: super::super::ai::Shots::default(),
-            started: Instant::now(),
-        });
+        let broken = Arc::new(AppState { store: Store::new(None, TEST_QUOTA), api_key: Some("k".into()), ..AppState::for_tests() });
         broken.store.add_base(Base::load("test", &f.root.join("base")).unwrap());
         broken.store.create_tenant("acme", "test").unwrap();
         let (status, body) = post_chat(&broken, None, ask("hi", None)).await;

@@ -298,40 +298,53 @@ pub fn mime(path: &str) -> &'static str {
     }
 }
 
+/// The state every fixture starts from, so that a field added to `AppState` is one edit here rather
+/// than one in each test that builds one. A fixture that needs a different value says only that
+/// value: `AppState { api_key: Some("k".into()), ..AppState::for_tests() }`.
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    use axum::body::Body;
-    use axum::http::header::{LOCATION, SET_COOKIE};
-    use axum::http::{HeaderName, Request, StatusCode};
-    use tower::ServiceExt;
-
-    use super::{AppState, SameSite, State, app, chats, constant_time_eq, preview_token, tenant_from_host};
-    use crate::metrics::Metrics;
-    use crate::store::Store;
-    use crate::transform::{Config, Engine};
-
-    fn state_for(store: Store, api_token: Option<&str>, preview_secret: Option<&str>) -> State {
-        let metrics = Arc::new(Metrics::default());
-        Arc::new(AppState {
-            store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
-            metrics,
+impl AppState {
+    pub fn for_tests() -> AppState {
+        let engine = Engine::for_tests();
+        AppState {
+            store: Store::new(None, u64::MAX),
+            metrics: engine.metrics(),
+            engine,
             chats: chats::Chats::default(),
             domain: "localhost".into(),
             port: 4321,
             model: "m".into(),
             api_key: None,
             api_base: "http://127.0.0.1:1".into(),
+            api_token: None,
+            preview_secret: None,
+            cookie_samesite: SameSite::Lax,
+            chrome: None,
+            shots: ai::Shots::default(),
+            started: Instant::now(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::header::{LOCATION, SET_COOKIE};
+    use axum::http::{HeaderName, Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::{AppState, SameSite, State, app, constant_time_eq, preview_token, tenant_from_host};
+    use crate::store::Store;
+
+    fn state_for(store: Store, api_token: Option<&str>, preview_secret: Option<&str>) -> State {
+        Arc::new(AppState {
+            store,
             api_token: api_token.map(str::to_string),
             preview_secret: preview_secret.map(str::to_string),
             cookie_samesite: SameSite::default_for(preview_secret),
-            chrome: None,
-            shots: super::ai::Shots::default(),
-            started: Instant::now(),
+            ..AppState::for_tests()
         })
     }
 
