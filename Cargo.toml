@@ -19,7 +19,7 @@ oxc_transformer = { git = "https://github.com/withastro/oxc", rev = "8bb526fc0c2
 axum = "0.8"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server-graceful", "service", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,7 +35,7 @@ imagesize = "0.15"
 grass = { version = "0.13", default-features = false }
 globset = "0.4"
 blake3 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 

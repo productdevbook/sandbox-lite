@@ -177,6 +177,11 @@ impl Tenant {
         self.version.load(Ordering::Relaxed)
     }
 
+    /// `<data-dir>/<id>`, or None with `--no-persist`. Site files live under `files/`; chats do not.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
     pub fn data(&self, path: &str) -> Option<FileData> {
         let overlay = self.overlay.read().unwrap();
         match overlay.get(path) {

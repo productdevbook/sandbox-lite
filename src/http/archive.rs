@@ -223,13 +223,16 @@ mod tests {
         let state = Arc::new(AppState {
             store,
             engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }),
+            chats: crate::http::chats::Chats::default(),
             domain: "localhost".into(),
             port: 4321,
             model: "m".into(),
             api_key: None,
+            api_base: "http://127.0.0.1:1".into(),
             api_token: None,
             preview_secret: None,
             cookie_samesite: crate::http::SameSite::Lax,
+            chrome: None,
             started: Instant::now(),
         });
         Fixture { app: crate::http::app(state.clone()), state, root }
