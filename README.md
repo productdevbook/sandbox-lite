@@ -239,6 +239,7 @@ examples/tailwind      Tailwind v4 through its browser build
 examples/react         a React island hydrated with client:load
 scripts/build-runtime.sh   regenerates assets/astro.js for a new Astro version
 bench/mem.sh           the memory measurement above
+e2e/                   Playwright suite for the browser side: every example page, live reload, hydration, the error overlay
 ```
 
 ## What the preview does not do

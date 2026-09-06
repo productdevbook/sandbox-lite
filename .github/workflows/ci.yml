@@ -27,3 +27,29 @@ jobs:
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/__sl/routes.json' | grep -q '"/blog/\[slug\]"'
           curl -sf -H 'Host: ci.localhost' 'http://127.0.0.1:4399/' | grep -q shell.js
       - run: bench/mem.sh 100 4398
+  e2e:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: npm ci
+        working-directory: e2e
+      - run: npx playwright install --with-deps chromium
+        working-directory: e2e
+      - run: npx playwright test
+        working-directory: e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
