@@ -9,6 +9,7 @@ pub mod scss;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
@@ -136,6 +137,7 @@ impl Kind {
 pub struct Config {
     pub cdn: String,
     pub cache_bytes: usize,
+    pub sass_timeout: Duration,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -157,16 +159,22 @@ struct Cache {
 pub struct Engine {
     pub cfg: Config,
     cache: Mutex<Cache>,
+    sass: scss::Sass,
 }
 
 impl Engine {
     pub fn new(cfg: Config) -> Engine {
-        Engine { cfg, cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }) }
+        let sass = scss::Sass::new(cfg.sass_timeout);
+        Engine { cfg, cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }), sass }
     }
 
     pub fn stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
         CacheStats { entries: c.map.len(), bytes: c.bytes, hits: c.hits, misses: c.misses }
+    }
+
+    pub fn sass_stats(&self) -> scss::SassStats {
+        self.sass.stats()
     }
 
     fn cached(&self, key: u128) -> Option<Arc<Built>> {
@@ -248,7 +256,7 @@ impl Engine {
                 match ext.as_str() {
                     "astro" => {
                         let dir = dirname(path);
-                        let preprocess = |lang: &str, src: &str| scss::compile(tenant, dir, src, lang == "sass");
+                        let preprocess = |lang: &str, src: &str| self.sass.compile(tenant, dir, src, lang == "sass");
                         let out = astro::compile(path, &text(), site, &preprocess)?;
                         let specs = js::scan(&out.code);
                         let globs = glob::find(&out.code);
@@ -274,7 +282,7 @@ impl Engine {
                     }
                     "css" => Ok(Built::js(css::to_module(path, &text(), dirname(path)))),
                     "scss" | "sass" => {
-                        let compiled = scss::compile(tenant, dirname(path), &text(), ext == "sass").map_err(|e| {
+                        let compiled = self.sass.compile(tenant, dirname(path), &text(), ext == "sass").map_err(|e| {
                             BuildError::compile(
                                 format!("{path}: {e}"),
                                 vec![Diag {

@@ -61,6 +61,22 @@ credentials on the API side.
   (`DefaultBodyLimit`). No tenant-host handler reads a request body.
 - **Host matching** is exact: `a.b.<domain>` and `evil-<domain>` are not tenant
   hosts.
+- **Sass compilation** is bounded (`src/transform/scss.rs`). grass runs
+  synchronously and cannot be cancelled — `@while true {}` never returns — so
+  each compile runs on a thread of its own with a deadline
+  (`--sass-timeout-ms`, default 5000) that the request gives up on rather than
+  joins. A source over 1 MiB is refused before the compile starts, one
+  compilation may read at most 4 MiB through `@use`/`@import`, and CSS over
+  4 MiB is an error instead of a cache entry. The thread that overran cannot be
+  stopped and is left to finish; while it runs, every further request for the
+  same source is refused, so a runaway stylesheet costs one thread rather than
+  one per request, and at most 8 compiles run at once whatever their source.
+  `/api/stats` reports `sass.running`, `sass.runaway`, `sass.timeouts` and
+  `sass.refused`. What this does not do is stop an abandoned compile: it keeps
+  a core and keeps allocating until it ends by itself, so
+  `@while true { .a { color: red } }` can still exhaust memory, and eight of
+  them stop Sass compiling for every tenant until the daemon restarts. Bounding
+  that needs the compile in a child process with rlimits.
 - **The preview cookie** (`sl_t`) is set with `Path=/; HttpOnly` and no
   `Domain` attribute, so it is a host-only session cookie for that one tenant
   host. `--cookie-samesite` picks `SameSite=Lax` (the default; `Secure` is
@@ -184,7 +200,8 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 - No rate limiting on any route.
 - Compilation is CPU work per request; `/__sl/check` and `/api/t/{id}/check`
   build every source file of a tenant on every call — a cache hit for an
-  unchanged file, a compile for a changed one.
+  unchanged file, a compile for a changed one. Only Sass has a deadline and a
+  thread cap (above); nothing bounds the total CPU a caller can ask for.
 - No timeout once a request head has arrived: a body may trickle in, and a
   response may be read slowly, for as long as the client likes.
 - The transform cache is bounded by `--cache-mb` and each tenant's overlay by
