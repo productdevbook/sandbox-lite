@@ -5,6 +5,9 @@ mod routes;
 mod store;
 mod transform;
 
+#[cfg(test)]
+mod proptests;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
