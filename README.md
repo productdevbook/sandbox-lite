@@ -204,7 +204,7 @@ src/transform/         astro (astro_codegen), js (oxc), css, scss (grass), impor
 src/http/              host-based dispatch, auth, editor API, preview endpoints, Claude chat loop
 src/check.rs           the `check` subcommand
 assets/                shell.html, shell.js, live.js, editor.html, astro.js bundle, astro:* shims
-examples/starter       a dependency-free Astro 7 site; the base CI's smoke test and bench/mem.sh use
+examples/starter       a dependency-free Astro 7 site; the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
 examples/react         a React island hydrated with client:load
 scripts/build-runtime.sh   regenerates assets/astro.js for a new Astro version
