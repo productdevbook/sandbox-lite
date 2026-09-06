@@ -14,49 +14,51 @@ pub struct Route {
 }
 
 pub fn build(tenant: &Tenant) -> Vec<Route> {
-    let mut routes = Vec::new();
-    for e in tenant.list() {
-        let Some(rest) = e.path.strip_prefix("src/pages/") else { continue };
-        let Some((stem, ext)) = rest.rsplit_once('.') else { continue };
-        let kind = match ext {
-            "astro" => "astro",
-            "md" => "md",
-            "mdx" => "mdx",
-            "ts" | "js" | "mjs" | "mts" => "endpoint",
-            _ => continue,
-        };
-        let mut segs: Vec<&str> = stem.split('/').collect();
-        if segs.iter().any(|s| s.starts_with('_')) {
-            continue;
-        }
-        if segs.last() == Some(&"index") {
-            segs.pop();
-        }
-        let mut params = Vec::new();
-        let mut pattern = String::from("^");
-        let mut key = Vec::new();
-        let mut route = String::new();
-        for seg in &segs {
-            route.push('/');
-            route.push_str(seg);
-            let (re, kind_max, ps) = segment_regex(seg);
-            if seg.starts_with("[...") && seg.ends_with(']') && ps.len() == 1 && kind_max == 2 {
-                pattern.push_str("(?:/(.*?))?");
-            } else {
-                pattern.push('/');
-                pattern.push_str(&re);
-            }
-            key.push(kind_max);
-            params.extend(ps);
-        }
-        if segs.is_empty() {
-            route.push('/');
-        }
-        pattern.push_str("/?$");
-        routes.push(Route { route, component: e.path.clone(), kind, params, pattern, key });
-    }
+    let mut routes: Vec<Route> = tenant.list().iter().filter_map(|e| route(&e.path)).collect();
     routes.sort_by(|a, b| a.key.cmp(&b.key).then(b.key.len().cmp(&a.key.len())).then(a.route.cmp(&b.route)));
     routes
+}
+
+fn route(path: &str) -> Option<Route> {
+    let rest = path.strip_prefix("src/pages/")?;
+    // Only the last dot is the extension: rss.xml.ts is the route /rss.xml.
+    let (stem, ext) = rest.rsplit_once('.')?;
+    let kind = match ext {
+        "astro" => "astro",
+        "md" => "md",
+        "mdx" => "mdx",
+        "ts" | "js" | "mjs" | "mts" => "endpoint",
+        _ => return None,
+    };
+    let mut segs: Vec<&str> = stem.split('/').collect();
+    if segs.iter().any(|s| s.starts_with('_')) {
+        return None;
+    }
+    if segs.last() == Some(&"index") {
+        segs.pop();
+    }
+    let mut params = Vec::new();
+    let mut pattern = String::from("^");
+    let mut key = Vec::new();
+    let mut route = String::new();
+    for seg in &segs {
+        route.push('/');
+        route.push_str(seg);
+        let (re, kind_max, ps) = segment_regex(seg);
+        if seg.starts_with("[...") && seg.ends_with(']') && ps.len() == 1 && kind_max == 2 {
+            pattern.push_str("(?:/(.*?))?");
+        } else {
+            pattern.push('/');
+            pattern.push_str(&re);
+        }
+        key.push(kind_max);
+        params.extend(ps);
+    }
+    if segs.is_empty() {
+        route.push('/');
+    }
+    pattern.push_str("/?$");
+    Some(Route { route, component: path.to_string(), kind, params, pattern, key })
 }
 
 fn segment_regex(seg: &str) -> (String, u8, Vec<String>) {
@@ -108,6 +110,23 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn of(path: &str) -> (String, &'static str, String) {
+        let r = route(path).unwrap_or_else(|| panic!("{path} is not a route"));
+        (r.route, r.kind, r.pattern)
+    }
+
+    #[test]
+    fn endpoints_keep_the_extension_the_file_name_carries() {
+        assert_eq!(of("src/pages/rss.xml.ts"), ("/rss.xml".into(), "endpoint", "^/rss\\.xml/?$".into()));
+        assert_eq!(of("src/pages/api/products.json.ts"), ("/api/products.json".into(), "endpoint", "^/api/products\\.json/?$".into()));
+        assert_eq!(of("src/pages/sitemap.js").0, "/sitemap");
+        assert_eq!(of("src/pages/api/index.ts").0, "/api");
+        assert_eq!(of("src/pages/about.astro"), ("/about".into(), "astro", "^/about/?$".into()));
+        assert!(route("src/pages/_helpers.ts").is_none());
+        assert!(route("src/pages/styles.css").is_none());
+        assert!(route("src/data/products.ts").is_none());
+    }
 
     #[test]
     fn segment_patterns() {
