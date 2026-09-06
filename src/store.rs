@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,6 +119,31 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1)
 }
 
+#[derive(Debug)]
+pub enum WriteError {
+    Quota { quota: u64, after: u64 },
+    Io(io::Error),
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteError::Quota { quota, after } => {
+                write!(f, "tenant quota exceeded: edited files would total {after} bytes, the quota is {quota} bytes (--tenant-quota-mb)")
+            }
+            WriteError::Io(e) => fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+impl From<io::Error> for WriteError {
+    fn from(e: io::Error) -> WriteError {
+        WriteError::Io(e)
+    }
+}
+
 pub struct Tenant {
     pub id: String,
     pub base: Arc<Base>,
@@ -125,6 +151,7 @@ pub struct Tenant {
     version: AtomicU64,
     pub events: broadcast::Sender<String>,
     dir: Option<PathBuf>,
+    quota: u64,
 }
 
 pub struct Entry {
@@ -134,9 +161,9 @@ pub struct Entry {
 }
 
 impl Tenant {
-    fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>) -> Tenant {
+    fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>, quota: u64) -> Tenant {
         let (events, _) = broadcast::channel(64);
-        Tenant { id, base, overlay: RwLock::new(BTreeMap::new()), version: AtomicU64::new(now_millis()), events, dir }
+        Tenant { id, base, overlay: RwLock::new(BTreeMap::new()), version: AtomicU64::new(now_millis()), events, dir, quota }
     }
 
     pub fn version(&self) -> u64 {
@@ -180,7 +207,14 @@ impl Tenant {
         out.into_iter().map(|(path, (size, modified))| Entry { path, size, modified }).collect()
     }
 
-    pub fn write(&self, path: &str, bytes: Vec<u8>) -> io::Result<u64> {
+    pub fn write(&self, path: &str, bytes: Vec<u8>) -> Result<u64, WriteError> {
+        // held across the disk write so a concurrent write cannot slip past the quota check
+        let mut overlay = self.overlay.write().unwrap();
+        let replaced = overlay.get(path).and_then(|d| d.as_ref()).map_or(0, |d| d.size());
+        let after = overlay_bytes(&overlay) - replaced + bytes.len() as u64;
+        if after > self.quota {
+            return Err(WriteError::Quota { quota: self.quota, after });
+        }
         if let Some(dir) = &self.dir {
             let target = dir.join("files").join(path);
             if let Some(parent) = target.parent() {
@@ -192,11 +226,8 @@ impl Tenant {
             Some(dir) if bytes.len() as u64 > INLINE_LIMIT => FileData::Disk(dir.join("files").join(path), bytes.len() as u64),
             _ => FileData::Mem(bytes.into()),
         };
-        let was_tombstone = {
-            let mut overlay = self.overlay.write().unwrap();
-            let prev = overlay.insert(path.to_string(), Some(data));
-            matches!(prev, Some(None))
-        };
+        let was_tombstone = matches!(overlay.insert(path.to_string(), Some(data)), Some(None));
+        drop(overlay);
         if was_tombstone {
             self.persist_tombstones()?;
         }
@@ -248,8 +279,7 @@ impl Tenant {
 
     pub fn overlay_stats(&self) -> (usize, u64) {
         let overlay = self.overlay.read().unwrap();
-        let bytes = overlay.values().filter_map(|d| d.as_ref()).map(|d| d.size()).sum();
-        (overlay.len(), bytes)
+        (overlay.len(), overlay_bytes(&overlay))
     }
 
     fn restore_overlay(&self, dir: &Path) -> io::Result<()> {
@@ -272,15 +302,20 @@ impl Tenant {
     }
 }
 
+fn overlay_bytes(overlay: &BTreeMap<String, Option<FileData>>) -> u64 {
+    overlay.values().flatten().map(|d| d.size()).sum()
+}
+
 pub struct Store {
     bases: RwLock<HashMap<String, Arc<Base>>>,
     tenants: RwLock<HashMap<String, Arc<Tenant>>>,
     data_dir: Option<PathBuf>,
+    tenant_quota: u64,
 }
 
 impl Store {
-    pub fn new(data_dir: Option<PathBuf>) -> Store {
-        Store { bases: RwLock::new(HashMap::new()), tenants: RwLock::new(HashMap::new()), data_dir }
+    pub fn new(data_dir: Option<PathBuf>, tenant_quota: u64) -> Store {
+        Store { bases: RwLock::new(HashMap::new()), tenants: RwLock::new(HashMap::new()), data_dir, tenant_quota }
     }
 
     pub fn add_base(&self, base: Base) {
@@ -311,7 +346,7 @@ impl Store {
             std::fs::write(dir.join("tenant.json"), format!(r#"{{"base":{}}}"#, serde_json::to_string(base_name).unwrap()))
                 .map_err(|e| e.to_string())?;
         }
-        let tenant = Arc::new(Tenant::new(id.to_string(), base, dir));
+        let tenant = Arc::new(Tenant::new(id.to_string(), base, dir, self.tenant_quota));
         self.tenants.write().unwrap().insert(id.to_string(), tenant.clone());
         Ok(tenant)
     }
@@ -360,7 +395,7 @@ impl Store {
                 eprintln!("tenant {id}: base '{base_name}' is not loaded, skipping");
                 continue;
             };
-            let tenant = Tenant::new(id.clone(), base, Some(dir.clone()));
+            let tenant = Tenant::new(id.clone(), base, Some(dir.clone()), self.tenant_quota);
             tenant.restore_overlay(&dir)?;
             self.tenants.write().unwrap().insert(id, Arc::new(tenant));
             n += 1;
@@ -371,7 +406,47 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_path, is_private_path};
+    use super::*;
+
+    fn tenant(quota: u64, dir: Option<PathBuf>) -> Tenant {
+        let base = Base { name: "b".into(), root: PathBuf::from("."), files: BTreeMap::new() };
+        Tenant::new("t".into(), Arc::new(base), dir, quota)
+    }
+
+    #[test]
+    fn quota_bounds_the_overlay_after_the_write() {
+        let t = tenant(10, None);
+        t.write("a", vec![0; 6]).unwrap();
+        let err = t.write("b", vec![0; 5]).unwrap_err();
+        assert!(matches!(err, WriteError::Quota { quota: 10, after: 11 }), "{err}");
+        assert!(err.to_string().contains("quota"));
+        assert_eq!(t.overlay_stats(), (1, 6));
+        t.write("a", vec![0; 10]).unwrap();
+        assert!(t.write("a", vec![0; 11]).is_err());
+        t.delete("a").unwrap();
+        t.write("b", vec![0; 10]).unwrap();
+        assert_eq!(t.overlay_stats(), (1, 10));
+    }
+
+    #[test]
+    fn io_errors_keep_their_message() {
+        let err = WriteError::from(io::Error::new(io::ErrorKind::NotFound, "boom"));
+        assert_eq!(err.to_string(), "boom");
+    }
+
+    #[test]
+    fn quota_counts_disk_entries_and_refuses_before_touching_disk() {
+        let dir = std::env::temp_dir().join(format!("sandbox-lite-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let big = INLINE_LIMIT as usize + 1;
+        let t = tenant(2 * big as u64 - 1, Some(dir.clone()));
+        t.write("big", vec![0; big]).unwrap();
+        assert!(matches!(t.data("big"), Some(FileData::Disk(_, n)) if n == big as u64));
+        assert!(matches!(t.write("big2", vec![0; big]), Err(WriteError::Quota { .. })));
+        assert!(!dir.join("files").join("big2").exists());
+        assert_eq!(t.overlay_stats(), (1, big as u64));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn private_paths() {

@@ -2,8 +2,10 @@ pub mod ai;
 pub mod api;
 pub mod preview;
 
+use std::io::ErrorKind;
+use std::pin::pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State as AxState};
@@ -12,6 +14,11 @@ use axum::http::{StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 use crate::store::{Store, valid_id};
@@ -26,10 +33,61 @@ pub struct AppState {
     pub api_key: Option<String>,
     pub api_token: Option<String>,
     pub preview_secret: Option<String>,
+    pub cookie_samesite: SameSite,
     pub started: Instant,
 }
 
 pub type State = Arc<AppState>;
+
+#[derive(Clone, Copy)]
+pub enum SameSite {
+    Lax,
+    None,
+}
+
+impl std::str::FromStr for SameSite {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<SameSite, ()> {
+        match s.to_ascii_lowercase().as_str() {
+            "lax" => Ok(SameSite::Lax),
+            "none" => Ok(SameSite::None),
+            _ => Err(()),
+        }
+    }
+}
+
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+pub async fn serve(listener: TcpListener, app: Router, shutdown: impl Future<Output = ()>) {
+    let mut http = http1::Builder::new();
+    // hyper arms this timer whenever it waits for a request head, so it also closes idle keep-alive connections
+    http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
+    let graceful = GracefulShutdown::new();
+    let mut shutdown = pin!(shutdown);
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    if !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset) {
+                        eprintln!("accept: {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        let conn = http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
+        tokio::spawn(graceful.watch(conn));
+    }
+    drop(listener);
+    if tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown()).await.is_err() {
+        eprintln!("shutdown: closing connections still open after {}s", SHUTDOWN_GRACE.as_secs());
+    }
+}
 
 #[derive(Clone)]
 pub struct TenantId(pub String);
@@ -99,10 +157,20 @@ async fn require_api_token(AxState(st): AxState<State>, req: Request, next: Next
     }
     let header = req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
     let query = query_param(req.uri(), "token");
-    if header == Some(expected.as_str()) || query == Some(expected.as_str()) {
+    let valid = |given: Option<&str>| given.is_some_and(|g| constant_time_eq(g.as_bytes(), expected.as_bytes()));
+    if valid(header) || valid(query) {
         return next.run(req).await;
     }
     (StatusCode::UNAUTHORIZED, "missing or wrong api token\n").into_response()
+}
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    // black_box keeps the optimizer from turning the fold into an early exit
+    std::hint::black_box(diff) == 0
 }
 
 pub fn preview_token(secret: &str, tenant: &str) -> String {
@@ -117,13 +185,18 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
     let Some(TenantId(id)) = req.extensions().get::<TenantId>().cloned() else { return next.run(req).await };
     let expected = preview_token(secret, &id);
     if let Some(token) = query_param(req.uri(), "sl_token") {
-        if token != expected {
+        if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             return (StatusCode::FORBIDDEN, "wrong preview token\n").into_response();
         }
         let rest: Vec<&str> = req.uri().query().unwrap_or("").split('&').filter(|p| !p.starts_with("sl_token=")).collect();
         let location = if rest.is_empty() { req.uri().path().to_string() } else { format!("{}?{}", req.uri().path(), rest.join("&")) };
-        let secure = req.headers().get("x-forwarded-proto").and_then(|h| h.to_str().ok()) == Some("https");
-        let cookie = format!("{PREVIEW_COOKIE}={expected}; Path=/; HttpOnly; SameSite=Lax{}", if secure { "; Secure" } else { "" });
+        let forwarded_https = req.headers().get("x-forwarded-proto").and_then(|h| h.to_str().ok()) == Some("https");
+        let attributes = match st.cookie_samesite {
+            SameSite::Lax if forwarded_https => "SameSite=Lax; Secure",
+            SameSite::Lax => "SameSite=Lax",
+            SameSite::None => "SameSite=None; Secure",
+        };
+        let cookie = format!("{PREVIEW_COOKIE}={expected}; Path=/; HttpOnly; {attributes}");
         return (StatusCode::SEE_OTHER, [(LOCATION, location), (SET_COOKIE, cookie)]).into_response();
     }
     let has_cookie = req
@@ -132,7 +205,8 @@ async fn require_preview_token(AxState(st): AxState<State>, req: Request, next: 
         .iter()
         .filter_map(|c| c.to_str().ok())
         .flat_map(|c| c.split(';'))
-        .any(|c| c.trim().strip_prefix(PREVIEW_COOKIE).and_then(|r| r.strip_prefix('=')) == Some(expected.as_str()));
+        .filter_map(|c| c.trim().strip_prefix(PREVIEW_COOKIE).and_then(|r| r.strip_prefix('=')))
+        .any(|given| constant_time_eq(given.as_bytes(), expected.as_bytes()));
     if has_cookie {
         return next.run(req).await;
     }
@@ -178,7 +252,18 @@ pub fn mime(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_token, tenant_from_host};
+    use super::{constant_time_eq, preview_token, tenant_from_host};
+
+    #[test]
+    fn constant_time_eq_compares_whole_slices() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"Token"));
+        assert!(!constant_time_eq(b"token", b"tokem"));
+        assert!(!constant_time_eq(b"token", b"toke"));
+        assert!(!constant_time_eq(b"token", b"tokens"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
 
     #[test]
     fn preview_tokens_are_stable_and_tenant_specific() {

@@ -71,7 +71,8 @@ Per-tenant state is the overlay (only edited files) plus a content-addressed
 transform cache shared by every tenant: two tenants with the same `Header.astro`
 share one compiled output. The cache has a byte budget (`--cache-mb`, default
 64), so its share of the daemon's memory is bounded regardless of tenant count;
-overlays grow with what tenants write.
+each overlay is capped by `--tenant-quota-mb` (default 64), and a write that
+would push a tenant past it is refused with `413`.
 
 ## Install
 
@@ -133,17 +134,28 @@ tenant. Every write shows up in the preview as it happens.
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
 --preview-secret S   tenant hosts require a per-tenant token derived from S
+--tenant-quota-mb N  edited files a tenant may hold, in MiB (default 64)
+--cookie-samesite lax|none
+                     SameSite of the preview cookie; none also sets Secure (default lax)
 ```
 
-`SANDBOX_LITE_API_TOKEN` and `SANDBOX_LITE_PREVIEW_SECRET` are read as defaults
-for the two auth flags. With a preview secret set, `/api/tenants` returns each
-tenant's `preview_token`; opening `http://<id>.<domain>/?sl_token=<token>` once
-sets a cookie for that host and redirects to the clean URL. Tokens are
-per-tenant, so a customer's link does not open another customer's preview.
+`SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET` and
+`SANDBOX_LITE_TENANT_QUOTA_MB` are read as defaults for those flags. With a
+preview secret set, `/api/tenants` returns each tenant's `preview_token`;
+opening `http://<id>.<domain>/?sl_token=<token>` once sets a cookie for that
+host and redirects to the clean URL. Tokens are per-tenant, so a customer's
+link does not open another customer's preview. The cookie is `SameSite=Lax`,
+which browsers send only on same-site requests: an editor that embeds previews
+from a different registrable domain (`app.example.com` framing
+`acme.preview.example.net`) needs `--cookie-samesite none`, which also marks
+the cookie `Secure`, so those previews must be served over HTTPS.
 
 In production put the daemon behind a wildcard DNS record (`*.preview.example.com`),
 pass `--domain preview.example.com`, set both secrets, and keep `/` and `/api`
-reachable only from your own backend.
+reachable only from your own backend. A connection that has not delivered a
+complete request head within 30 s — freshly opened or idle between keep-alive
+requests — is closed; streaming responses and uploads in progress are not
+affected.
 
 ### `check`: compile a project without serving it
 

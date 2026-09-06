@@ -23,11 +23,13 @@ struct Args {
     model: String,
     api_token: Option<String>,
     preview_secret: Option<String>,
+    tenant_quota_mb: u64,
+    cookie_samesite: http::SameSite,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR       bind address (default 127.0.0.1:4321)\n  --domain NAME       preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR         directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH    add one base project (repeatable)\n  --data-dir DIR      where tenant edits are persisted (default ./data)\n  --no-persist        keep tenant edits in memory only\n  --cdn URL           where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N        transform cache budget in MiB (default 64)\n  --model NAME        Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN   require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S  tenant hosts need a per-tenant token derived from S (the API hands it out)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN and SANDBOX_LITE_PREVIEW_SECRET are read as defaults for the two flags.",
+        "sandbox-lite {}\n\nUsage: sandbox-lite [options]\n       sandbox-lite check [--json] DIR...   compile every source file of an Astro project and print diagnostics + a feature census\n\n  --listen ADDR        bind address (default 127.0.0.1:4321)\n  --domain NAME        preview domain; tenants are served at http://<id>.NAME:PORT/ (default localhost)\n  --bases DIR          directory whose sub-directories are base projects (default ./examples if present)\n  --base NAME=PATH     add one base project (repeatable)\n  --data-dir DIR       where tenant edits are persisted (default ./data)\n  --no-persist         keep tenant edits in memory only\n  --cdn URL            where bare npm imports are fetched from in the browser (default https://esm.sh)\n  --cache-mb N         transform cache budget in MiB (default 64)\n  --model NAME         Claude model for the built-in chat (default claude-fable-5-1)\n  --api-token TOKEN    require `Authorization: Bearer TOKEN` (or ?token=) on /api/*\n  --preview-secret S   tenant hosts need a per-tenant token derived from S (the API hands it out)\n  --tenant-quota-mb N  edited files a tenant may hold, in MiB; a write past it is refused with 413 (default 64)\n  --cookie-samesite lax|none\n                       SameSite of the preview cookie; none also sets Secure (default lax)\n\nEnvironment: ANTHROPIC_API_KEY enables the chat endpoint; SANDBOX_LITE_API_TOKEN, SANDBOX_LITE_PREVIEW_SECRET and SANDBOX_LITE_TENANT_QUOTA_MB are read as defaults for those flags.",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -45,6 +47,11 @@ fn parse_args() -> Args {
         model: "claude-fable-5-1".into(),
         api_token: std::env::var("SANDBOX_LITE_API_TOKEN").ok().filter(|v| !v.is_empty()),
         preview_secret: std::env::var("SANDBOX_LITE_PREVIEW_SECRET").ok().filter(|v| !v.is_empty()),
+        tenant_quota_mb: std::env::var("SANDBOX_LITE_TENANT_QUOTA_MB")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map_or(64, |v| v.parse().unwrap_or_else(|_| usage())),
+        cookie_samesite: http::SameSite::Lax,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -65,6 +72,8 @@ fn parse_args() -> Args {
             "--model" => args.model = value(),
             "--api-token" => args.api_token = Some(value()),
             "--preview-secret" => args.preview_secret = Some(value()),
+            "--tenant-quota-mb" => args.tenant_quota_mb = value().parse().unwrap_or_else(|_| usage()),
+            "--cookie-samesite" => args.cookie_samesite = value().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
             _ => usage(),
         }
@@ -92,7 +101,7 @@ async fn main() {
         check_command(&argv[1..]);
     }
     let args = parse_args();
-    let store = store::Store::new(args.data_dir.clone());
+    let store = store::Store::new(args.data_dir.clone(), args.tenant_quota_mb.saturating_mul(1 << 20));
     let mut bases = args.bases.clone();
     if let Some(dir) = &args.bases_dir {
         match std::fs::read_dir(dir) {
@@ -140,6 +149,7 @@ async fn main() {
         api_key,
         api_token: args.api_token.clone(),
         preview_secret: args.preview_secret.clone(),
+        cookie_samesite: args.cookie_samesite,
         started: Instant::now(),
     });
     let listener = match tokio::net::TcpListener::bind(&args.listen).await {
@@ -158,7 +168,7 @@ async fn main() {
         if state.preview_secret.is_some() { "required" } else { "off" }
     );
     let app = http::app(state);
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+    http::serve(listener, app, shutdown_signal()).await;
 }
 
 async fn shutdown_signal() {

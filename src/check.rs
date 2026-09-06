@@ -60,7 +60,7 @@ fn is_npm_import(spec: &str) -> bool {
 pub fn inspect(dir: &Path) -> Result<Report, String> {
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string());
     let base = Base::load("check", dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let store = Store::new(None);
+    let store = Store::new(None, u64::MAX);
     store.add_base(base);
     let tenant = store.create_tenant("check", "check")?;
     let engine = Engine::new(Config { cdn: "https://esm.sh".into(), cache_bytes: 64 << 20 });
