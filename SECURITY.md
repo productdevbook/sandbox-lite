@@ -86,6 +86,27 @@ credentials on the API side.
   over HTTPS.
 - **Connections** that have not delivered a complete request head within 30 s,
   whether newly opened or idle between keep-alive requests, are closed.
+- **Archive imports.** `POST /api/tenants/{id}/import` is on the editor/API
+  router, so `--api-token` is the only thing gating it, and the tenant must
+  already exist — an import cannot create one. Every tar entry is checked
+  before anything is written: only regular files are taken, directory and
+  pax-header entries are skipped, and a symbolic link, hard link, device or
+  fifo entry is refused with `400` naming it. The entry name must be
+  tenant-relative: a leading `/`, a `..` segment, a backslash or a NUL byte is
+  refused with `400` naming the entry — an absolute path is refused, not
+  stripped the way `clean_path` strips one from a request path — while `./` and
+  `//` segments are normalised away. So an import writes only under
+  `<data-dir>/<id>/files`. Entry sizes are summed from the tar headers as
+  the archive is read and the whole import is refused with `413` once the total
+  passes the quota, so an archive that decompresses past it is rejected without
+  being decompressed. What survives is then applied under the tenant's write
+  lock as one batch, quota-checked against the resulting overlay: a refusal
+  writes nothing, and the response says so.
+- **Hidden files** are exported and imported like any other file: an export
+  carries `.env`, `sandbox-lite.json` and every dotfile of the tenant, and an
+  import may write them. What the preview refuses to serve is unchanged
+  (`is_private_path`), and both routes are on the editor/API router, whose
+  audience is already every file of every tenant.
 - **Per-tenant write volume** is capped by `--tenant-quota-mb` (default 64):
   a write that would take the tenant's edited files past it is refused with
   `413` before anything reaches disk or memory, and the chat `write_file` tool
@@ -118,6 +139,9 @@ that router answers `401` unless the request carries
   editor origin.
 - It gates spending: every `POST /api/t/{id}/chat` can make up to 16 calls to
   the Anthropic API with the daemon's `ANTHROPIC_API_KEY`.
+- It is the only thing gating `POST /api/tenants/{id}/import`, which writes a
+  whole file tree into a tenant in one request, and
+  `GET /api/t/{id}/export`, which returns one.
 - It does nothing for tenant hosts.
 
 ### `--preview-secret S` (`require_preview_token`, `src/http/mod.rs`)

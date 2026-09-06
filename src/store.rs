@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,13 @@ pub struct Entry {
     pub modified: bool,
 }
 
+/// What one `write_many` changed: files written, and overlay entries it dropped or hid.
+pub struct Applied {
+    pub version: u64,
+    pub written: usize,
+    pub deleted: usize,
+}
+
 impl Tenant {
     fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>, quota: u64) -> Tenant {
         let (events, _) = broadcast::channel(64);
@@ -215,23 +222,75 @@ impl Tenant {
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
         }
-        if let Some(dir) = &self.dir {
-            let target = dir.join("files").join(path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, &bytes)?;
-        }
-        let data = match &self.dir {
-            Some(dir) if bytes.len() as u64 > INLINE_LIMIT => FileData::Disk(dir.join("files").join(path), bytes.len() as u64),
-            _ => FileData::Mem(bytes.into()),
-        };
+        let data = self.store_on_disk(path, bytes)?;
         let was_tombstone = matches!(overlay.insert(path.to_string(), Some(data)), Some(None));
         drop(overlay);
         if was_tombstone {
             self.persist_tombstones()?;
         }
         Ok(self.bump("update", path))
+    }
+
+    /// Applies a whole import: every removal and every file land under one lock, one version bump
+    /// and one `update` event. `deleted` names paths to hide, `replace` drops every edit the import
+    /// does not carry — dropping an edit over a base file brings the base copy back, which is what
+    /// makes an overlay export reproduce the source overlay exactly. The quota is checked against
+    /// the resulting overlay before anything is written, so a refusal leaves the tenant untouched.
+    pub fn write_many(&self, files: Vec<(String, Vec<u8>)>, deleted: &[String], replace: bool) -> Result<Applied, WriteError> {
+        let mut overlay = self.overlay.write().unwrap();
+        let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        let keep = |path: &str, data: &Option<FileData>| !replace || data.is_none() || incoming.contains(path);
+        let mut next: BTreeMap<String, Option<FileData>> =
+            overlay.iter().filter(|(p, d)| keep(p, d)).map(|(p, d)| (p.clone(), d.clone())).collect();
+        for path in deleted.iter().filter(|p| !incoming.contains(p.as_str())) {
+            match self.base.get(path) {
+                Some(_) => next.insert(path.clone(), None),
+                None => next.remove(path),
+            };
+        }
+        let kept: u64 = next.iter().filter(|(p, _)| !incoming.contains(p.as_str())).filter_map(|(_, d)| d.as_ref()).map(|d| d.size()).sum();
+        let after = kept + files.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
+        if after > self.quota {
+            return Err(WriteError::Quota { quota: self.quota, after });
+        }
+        // `None` is untouched, `Some(true)` an edit, `Some(false)` a tombstone: a dropped edit and
+        // a new tombstone both read as a change, and only writes are left out
+        let overlaid = |o: &BTreeMap<String, Option<FileData>>, p: &str| o.get(p).map(Option::is_some);
+        let touched: BTreeSet<&str> = overlay.keys().chain(deleted.iter()).map(String::as_str).collect();
+        let dropped: Vec<&str> =
+            touched.into_iter().filter(|p| !incoming.contains(p) && overlaid(&overlay, p) != overlaid(&next, p)).collect();
+        for path in &dropped {
+            self.forget_on_disk(path)?;
+        }
+        let (written, removed) = (files.len(), dropped.len());
+        for (path, bytes) in files {
+            next.insert(path.clone(), Some(self.store_on_disk(&path, bytes)?));
+        }
+        *overlay = next;
+        drop(overlay);
+        self.persist_tombstones()?;
+        Ok(Applied { version: self.bump("update", ""), written, deleted: removed })
+    }
+
+    /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
+    /// anything past the inline limit lives on disk only.
+    fn store_on_disk(&self, path: &str, bytes: Vec<u8>) -> io::Result<FileData> {
+        let Some(dir) = &self.dir else { return Ok(FileData::Mem(bytes.into())) };
+        let target = dir.join("files").join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &bytes)?;
+        if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
+    }
+
+    fn forget_on_disk(&self, path: &str) -> io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let target = dir.join("files").join(path);
+        if target.exists() {
+            std::fs::remove_file(target)?;
+        }
+        Ok(())
     }
 
     pub fn delete(&self, path: &str) -> io::Result<u64> {
@@ -243,12 +302,7 @@ impl Tenant {
                 overlay.remove(path);
             }
         }
-        if let Some(dir) = &self.dir {
-            let target = dir.join("files").join(path);
-            if target.exists() {
-                std::fs::remove_file(target)?;
-            }
-        }
+        self.forget_on_disk(path)?;
         self.persist_tombstones()?;
         Ok(self.bump("delete", path))
     }
@@ -275,6 +329,15 @@ impl Tenant {
         let _ =
             self.events.send(format!(r#"{{"type":"{kind}","path":{},"version":{v}}}"#, serde_json::to_string(path).unwrap_or_default()));
         v
+    }
+
+    /// The tenant's own edits: `Some` is a written file, `None` a tombstone over a base file.
+    pub fn overlay(&self) -> Vec<(String, Option<FileData>)> {
+        self.overlay.read().unwrap().iter().map(|(p, d)| (p.clone(), d.clone())).collect()
+    }
+
+    pub fn quota(&self) -> u64 {
+        self.quota
     }
 
     pub fn overlay_stats(&self) -> (usize, u64) {

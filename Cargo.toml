@@ -36,6 +36,8 @@ grass = { version = "0.13", default-features = false }
 globset = "0.4"
 blake3 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }

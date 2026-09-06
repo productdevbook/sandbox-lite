@@ -29,7 +29,7 @@ pub fn err(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 #[allow(clippy::result_large_err)]
-fn tenant_or_404(st: &AppState, id: &str) -> Result<Arc<Tenant>, Response> {
+pub fn tenant_or_404(st: &AppState, id: &str) -> Result<Arc<Tenant>, Response> {
     st.store.tenant(id).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown tenant '{id}'")))
 }
 

@@ -52,12 +52,39 @@ creation. `write` and `delete` call `bump`, which sets it to
 (`/api/t/{id}/events`, `/__sl/events`) subscribe to that channel and open with
 an `event: hello` carrying the current version.
 
+`write_many` is the batch form used by an import: it settles the whole
+resulting overlay under one lock — the removals, the tombstones and every file
+— checks the quota against that result before writing anything, and bumps once.
+Its event carries an empty path, which the editor reads as "the whole tree
+changed" and the preview treats like any other update.
+
 With a `--data-dir`, the overlay is persisted as
 `<data-dir>/<id>/tenant.json` (`{"base": name}`), `<data-dir>/<id>/files/<path>`
 and `<data-dir>/<id>/deleted.json` (the tombstones). Every write goes to disk;
 files over 256 KiB are then kept only there. `Store::restore` rebuilds tenants
 at startup with a fresh version and skips any whose base is not loaded.
 `--no-persist` keeps everything in memory.
+
+### Export and import (`src/http/archive.rs`)
+
+`GET /api/t/{id}/export` writes a gzipped tar of the tenant: by default the
+merged tree (`Tenant::list` plus `Tenant::data`, so a tombstoned base file is
+absent), with `?overlay=1` only the overlay's own files plus
+`.sandbox-lite/deleted.json` holding the tombstoned paths. Headers are
+deterministic (mode 644, mtime 0) and a `FileData::Disk` entry is streamed from
+its open handle rather than read into memory.
+
+`POST /api/tenants/{id}/import` reads one back. Entries that are not regular
+files are skipped (directories, pax headers) or refused (links, devices); an
+entry name must be tenant-relative — a leading `/`, a `..` segment, a backslash
+or a NUL byte is refused, while `./` and `//` are normalised away; the sizes are
+summed from the tar headers and the import is refused with `413` before any
+body is decompressed once they pass the quota. `.sandbox-lite/deleted.json` is
+applied as tombstones instead of being written, so an overlay export imported
+into a tenant on the same base reproduces the source overlay exactly.
+`?replace=1` also drops the edits the archive does not carry — an edit over a
+base file goes back to the base copy, which is what makes that reproduction
+exact.
 
 ## Rendering a page
 
@@ -330,6 +357,7 @@ src/main.rs            flags, base loading, restore, listener
 src/store.rs           Base, Tenant (overlay, version, events, persistence), Store, clean_path, valid_id
 src/http/mod.rs        routers, host dispatch, the two token middlewares, MIME table
 src/http/api.rs        editor page, /api handlers, SSE, check_tenant
+src/http/archive.rs    tar.gz export and import of a tenant tree
 src/http/preview.rs    tenant-host handlers: shell, modules, raw, routes, renderers, shims, content
 src/http/ai.rs         chat tool loop
 src/resolve.rs         Resolver, CDN URLs, renderers, sandbox-lite.json, tsconfig paths

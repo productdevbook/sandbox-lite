@@ -1,10 +1,12 @@
 //! Property tests for the parsers that read attacker-controlled bytes: request
-//! paths, query strings, Host headers, tenant files and compiled module source.
+//! paths, query strings, Host headers, tar entry names, tenant files and
+//! compiled module source.
 //! None may panic, and nothing path-shaped may climb out of the tenant.
 
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 
+use crate::http::archive::entry_path;
 use crate::http::preview::percent_decode;
 use crate::http::tenant_from_host;
 use crate::resolve::{import_map, join, normalize, package_name, strip_jsonc, tsconfig_paths, urlenc};
@@ -128,6 +130,16 @@ proptest! {
                 let again = clean_path(&p);
                 prop_assert_eq!(again.as_deref(), Some(p.as_str()));
             }
+        }
+    }
+
+    #[test]
+    fn tar_entry_names_never_escape_the_tenant(raw in input()) {
+        if let Some(p) = entry_path(&raw) {
+            assert_inside_tenant(&p)?;
+            prop_assert!(!raw.starts_with('/'), "absolute entry name {raw:?} was accepted");
+            let again = entry_path(&p);
+            prop_assert_eq!(again.as_deref(), Some(p.as_str()));
         }
     }
 
