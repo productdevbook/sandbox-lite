@@ -10,11 +10,12 @@ pub mod scss;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
 
+use crate::metrics::Metrics;
 use crate::resolve::{Resolver, dirname};
 use crate::store::Tenant;
 
@@ -249,12 +250,18 @@ pub struct Engine {
     pub cfg: Config,
     cache: Mutex<Cache>,
     sass: scss::Sass,
+    metrics: Arc<Metrics>,
 }
 
 impl Engine {
-    pub fn new(cfg: Config) -> Engine {
+    pub fn new(cfg: Config, metrics: Arc<Metrics>) -> Engine {
         let sass = scss::Sass::new(cfg.sass_timeout);
-        Engine { cfg, cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }), sass }
+        Engine {
+            cfg,
+            cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }),
+            sass,
+            metrics,
+        }
     }
 
     pub fn parser_stack_bytes(&self) -> usize {
@@ -323,9 +330,10 @@ impl Engine {
         if let Some(b) = self.cached(key) {
             return Ok(b);
         }
-        let compiled = self
-            .on_parser_stack(|| self.compile(tenant, path, kind, &data, site.as_deref()))
-            .map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
+        let started = Instant::now();
+        let spawned = self.on_parser_stack(|| self.compile(tenant, path, kind, &data, site.as_deref()));
+        self.metrics.compiled(kind, started.elapsed());
+        let compiled = spawned.map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
         let built = Arc::new(compiled?);
         self.insert(key, built.clone());
         Ok(built)
@@ -544,7 +552,7 @@ mod tests {
     }
 
     fn engine() -> Engine {
-        Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() })
+        Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, Arc::new(crate::metrics::Metrics::default()))
     }
 
     fn served(engine: &Engine, tenant: &Tenant) -> String {
@@ -554,7 +562,7 @@ mod tests {
     const CAP: usize = 64 << 10;
 
     fn engine_capped(max_source_bytes: usize) -> Engine {
-        Engine::new(Config { cache_bytes: 8 << 20, max_source_bytes, ..Config::default() })
+        Engine::new(Config { cache_bytes: 8 << 20, max_source_bytes, ..Config::default() }, Arc::new(crate::metrics::Metrics::default()))
     }
 
     fn tenant_with(path: &str, source: &str) -> Arc<Tenant> {

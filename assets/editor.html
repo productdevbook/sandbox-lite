@@ -104,7 +104,9 @@ const fmtKB = (kb) => kb == null ? "?" : kb > 10240 ? (kb / 1024).toFixed(1) + "
 async function refreshStats() {
   try { state.stats = await api("GET", "/api/stats"); } catch (e) { $("#stat").textContent = "daemon unreachable"; return; }
   const s = state.stats;
-  $("#stat").innerHTML = `daemon RSS <b>${esc(fmtKB(s.rss_kb))}</b> · ${esc(s.tenants)} tenants · cache ${esc((s.cache.bytes / 1024).toFixed(0))} kB / ${esc(s.cache.entries)} · astro ${esc(s.astro)} · chat ${esc(s.ai ? "on" : "off")}`;
+  const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+  const mods = (s.modules || []).reduce((a, m) => ({ requests: a.requests + sum(m.requests), compiles: a.compiles + m.compiles, seconds: a.seconds + m.compile_seconds }), { requests: 0, compiles: 0, seconds: 0 });
+  $("#stat").innerHTML = `daemon RSS <b>${esc(fmtKB(s.rss_kb))}</b> · ${esc(s.tenants)} tenants · cache ${esc((s.cache.bytes / 1024).toFixed(0))} kB / ${esc(s.cache.entries)} · ${esc(mods.requests)} module requests · ${esc(mods.compiles)} compiles in ${esc(mods.seconds.toFixed(1))}s · astro ${esc(s.astro)} · chat ${esc(s.ai ? "on" : "off")}`;
   $("#chatSend").disabled = !s.ai || state.busy;
   if (!s.ai) $("#chatHint").textContent = "Chat is off: start the daemon with ANTHROPIC_API_KEY set to enable the built-in assistant. The file editor works without it.";
 }

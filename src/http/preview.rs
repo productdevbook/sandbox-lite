@@ -52,7 +52,15 @@ pub async fn module(
     Path(path): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let t = match tenant(&st, &id) {
+    let query = query.unwrap_or_default();
+    let kind = Kind::from_query(&query);
+    let response = module_response(&st, &id, path, &query, kind).await;
+    st.metrics.module_request(kind, response.status().as_u16());
+    response
+}
+
+async fn module_response(st: &State, id: &TenantId, path: String, query: &str, kind: Kind) -> Response {
+    let t = match tenant(st, id) {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -60,8 +68,6 @@ pub async fn module(
     if is_private_path(&path) {
         return err(StatusCode::NOT_FOUND, format!("{path}: not found"));
     }
-    let query = query.unwrap_or_default();
-    let kind = Kind::from_query(&query);
     let versioned = query.split('&').any(|p| p.starts_with("v="));
     let st2 = st.clone();
     let result = tokio::task::spawn_blocking(move || {

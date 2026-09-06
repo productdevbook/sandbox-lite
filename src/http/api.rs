@@ -8,11 +8,12 @@ use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use super::{AppState, State, mime};
+use crate::metrics::{BaseSize, KINDS, STATUSES, Snapshot, render};
 use crate::store::{Tenant, WriteError, clean_path};
 use crate::transform::{Kind, is_source};
 
@@ -55,17 +56,35 @@ pub fn preview_url_path(st: &AppState, id: &str, path: &str) -> String {
     }
 }
 
+/// One row per `Kind`: the requests the module endpoint answered and the compiles they cost.
+fn module_stats(st: &AppState) -> Vec<Value> {
+    let requests = st.metrics.requests();
+    let compile = st.metrics.compiles();
+    KINDS
+        .iter()
+        .enumerate()
+        .map(|(k, kind)| {
+            let by_status: Map<String, Value> =
+                STATUSES.iter().enumerate().map(|(i, status)| ((*status).to_string(), json!(requests[k][i]))).collect();
+            json!({ "kind": kind, "requests": by_status, "compiles": compile[k].count(), "compile_seconds": compile[k].seconds() })
+        })
+        .collect()
+}
+
 pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
     let tenants = st.store.tenants();
     let overlay_bytes: u64 = tenants.iter().map(|t| t.overlay_stats().1).sum();
+    let subscribers: usize = tenants.iter().map(|t| t.events.receiver_count()).sum();
     Json(json!({
         "rss_kb": rss_kb(),
         "uptime_s": st.started.elapsed().as_secs(),
         "tenants": tenants.len(),
         "overlay_bytes": overlay_bytes,
+        "sse_subscribers": subscribers,
         "bases": st.store.bases().iter().map(|b| json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes() })).collect::<Vec<_>>(),
         "cache": st.engine.stats(),
         "sass": st.engine.sass_stats(),
+        "modules": module_stats(&st),
         "ai": st.api_key.is_some(),
         "preview_auth": st.preview_secret.is_some(),
         "model": st.model,
@@ -73,6 +92,35 @@ pub async fn stats(AxState(st): AxState<State>) -> Json<Value> {
         "port": st.port,
         "astro": include_str!("../../assets/astro.version").trim(),
     }))
+}
+
+fn snapshot(st: &AppState) -> Snapshot {
+    let tenants = st.store.tenants();
+    let cache = st.engine.stats();
+    let sass = st.engine.sass_stats();
+    Snapshot {
+        uptime_seconds: st.started.elapsed().as_secs(),
+        rss_bytes: rss_kb().map(|kb| kb * 1024),
+        tenants: tenants.len() as u64,
+        overlay_bytes: tenants.iter().map(|t| t.overlay_stats().1).sum(),
+        bases: st.store.bases().iter().map(|b| BaseSize { name: b.name.clone(), files: b.file_count() as u64, bytes: b.bytes() }).collect(),
+        cache_entries: cache.entries as u64,
+        cache_bytes: cache.bytes as u64,
+        cache_hits: cache.hits,
+        cache_misses: cache.misses,
+        sse_subscribers: tenants.iter().map(|t| t.events.receiver_count() as u64).sum(),
+        sass_running: sass.running as u64,
+        sass_runaway: sass.runaway as u64,
+        sass_timeouts: sass.timeouts,
+        sass_refused: sass.refused,
+        requests: st.metrics.requests(),
+        compile: st.metrics.compiles(),
+    }
+}
+
+pub async fn metrics(AxState(st): AxState<State>) -> Response {
+    let body = render(&snapshot(&st));
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
 pub async fn bases(AxState(st): AxState<State>) -> Json<Value> {

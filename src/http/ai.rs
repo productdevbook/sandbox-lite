@@ -514,9 +514,11 @@ mod tests {
         store.add_base(Base::load("test", &base_dir).unwrap());
         store.create_tenant("acme", "test").unwrap();
         let (api_base, seen) = upstream(turns).await;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
         let st = Arc::new(AppState {
             store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }),
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
+            metrics,
             chats: super::super::chats::Chats::default(),
             domain: "localhost".into(),
             port: 4321,
@@ -665,9 +667,11 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"], "unknown chat");
 
+        let metrics = Arc::new(crate::metrics::Metrics::default());
         let broken = Arc::new(AppState {
             store: Store::new(None, TEST_QUOTA),
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }),
+            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
+            metrics,
             chats: super::super::chats::Chats::default(),
             domain: "localhost".into(),
             port: 4321,
