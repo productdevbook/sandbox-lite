@@ -47,10 +47,16 @@ same base share the base's memory; a tenant costs its overlay.
 Each tenant has a **version**, a `u64` of milliseconds since the epoch at
 creation. `write` and `delete` call `bump`, which sets it to
 `max(now, previous + 1)` — strictly increasing — and sends
-`{"type":"update"|"delete","path":…,"version":N}` on the tenant's
+`{"type":"update"|"delete","path":…,"kind":…,"version":N}` on the tenant's
 `tokio::sync::broadcast` channel (64 slots). Both SSE endpoints
 (`/api/t/{id}/events`, `/__sl/events`) subscribe to that channel and open with
 an `event: hello` carrying the current version.
+
+The `kind` is what the preview does with the event — `css`, `style` or
+`module`, in `UpdateKind`. `Tenant::write` takes it from the caller rather than
+deciding: `UpdateKind::from_path` is the whole answer for a stylesheet, but
+`style` takes a compile to prove, and that is `Engine::update_kind`'s job
+(`src/transform/mod.rs`). See "CSS without a reload" below.
 
 `write_many` is the batch form used by an import: it settles the whole
 resulting overlay under one lock — the removals, the tombstones and every file
@@ -154,10 +160,12 @@ exact.
    `type="text/tailwindcss"` when it contains `@import "tailwindcss"` or
    `@tailwind`), `live.js` is appended, the block is injected before
    `</head>`, and `document.write` replaces the shell. If Tailwind was seen,
-   its browser build is loaded from jsDelivr.
+   its browser build is loaded from jsDelivr. The `data-sl` key is what lets a
+   later CSS write find the block again — see "CSS without a reload".
 9. **Errors.** Any exception fetches `/__sl/check` and renders an error page
    with the daemon's diagnostics; a missing route lists the routes. Error
-   pages also load `live.js`, so they reload when the file is fixed.
+   pages also load `live.js`, so they reload when the file is fixed; their
+   `<body data-sl-overlay>` is how `live.js` knows not to swap CSS into them.
 
 The editor (`assets/editor.html`) is the other client: it embeds the preview
 in an `<iframe>` and edits files through `/api/t/{id}/file/{path}`.
@@ -259,7 +267,9 @@ Not in the key: the tenant id, the version, the CDN, `package.json`,
 `tsconfig.json`, and the tenant's other files except through the fingerprint.
 So the cache is content-addressed: two tenants with byte-identical files share
 one entry, and a changed file simply hashes to a new key — nothing is
-invalidated explicitly.
+invalidated explicitly. That is also why `build_bytes` can build a source the
+tenant does not hold yet: classifying a write compiles the incoming bytes, and
+the entry it leaves is the one the next module request would have paid for.
 
 The cache (`Engine::cache`) is a `HashMap<u128, Arc<Built>>` behind a mutex
 with a `VecDeque` of insertion order. The budget (`--cache-mb`, default 64
@@ -375,15 +385,56 @@ The version does three jobs:
   browser fetches fresh; the old URLs stay in its cache harmlessly. The daemon
   does not read the value of `v` — it only checks that the parameter is
   present — and always serves the file's current content.
-- **Reload.** `live.js` reloads the page on any `update`/`delete` event, and
-  on the `hello` event when the daemon's version is higher than the one baked
-  into the shell — which covers an edit that landed between the shell and the
-  `EventSource` connecting, and a daemon restart, since restored tenants get a
-  fresh version.
+- **Reload.** `live.js` reloads the page on any `update`/`delete` event it
+  cannot answer by swapping CSS, and on the `hello` event when the daemon's
+  version is higher than the one baked into the shell — which covers an edit
+  that landed between the shell and the `EventSource` connecting, and a daemon
+  restart, since restored tenants get a fresh version. A swap sets
+  `window.__sl.version` to the version it applied, so a later reconnect does
+  not read the page as stale.
 - **Editor refresh.** The editor subscribes to `/api/t/{id}/events` to reload
   its file list and the open file.
 
 The transform cache never sees the version; it is content-addressed.
+
+## CSS without a reload
+
+An `update` event carries a `kind`, and `live.js` swaps rather than reloads for
+two of them.
+
+- **`css`** — a `.css`, `.scss` or `.sass` write. The path is the key the CSS
+  module registered, so `<style data-sl="src/styles/global.css">` is re-imported
+  from `/__sl/m/<path>?v=<new version>` and its text replaced. A stylesheet the
+  page reaches through another sheet's `@import` — `global.css` pulls in
+  `tokens.css` that way — has no block of its own; the importing block's
+  `/__sl/raw/<path>` URL gets a fresh `?v=` instead, which is what makes the
+  browser fetch the file again.
+- **`style`** — an `.astro` write whose compiled JS is byte-identical to the
+  last build of that file, so only its `<style>` blocks moved. Each block is
+  keyed `<file>?<index>` and re-imported from
+  `?astro&type=style&index=<i>&lang.css`.
+- Anything else reloads: a `module` kind, a `delete`, a `write_many`'s empty
+  path, a `kind` the client does not know, a page showing the error overlay
+  (`<body data-sl-overlay>`), a block the page does not have, or a failed swap.
+
+`Engine::update_kind` decides. It compares the JS the incoming bytes compile to
+against `last_js`, a bounded `(tenant, path) → fingerprint` map that every
+module build of an `.astro` file writes — `Tenant::write` must stay cheap, and
+only a build can prove the JS is unchanged. Three consequences worth knowing:
+the fingerprint covers the module body *and* the hoisted `<script>` sources,
+which the body only names by index, so editing a `<script>` reloads; the map is
+written only for content the tenant holds, so a write that is then refused
+leaves nothing behind to compare against; and a file nothing has built yet
+reads as `module`, because a client that renders stale JS is worse than one
+that reloads too often.
+
+That compile takes a permit from the compile gate like any other, and a refused or failed
+one reads as `module` — the fallback is always the reload.
+
+Tailwind is the exception. A `type="text/tailwindcss"` block is compiled by
+`@tailwindcss/browser` when that script loads, and it exposes no rebuild hook
+to call afterwards, so any swap that would touch such a block reloads the page
+instead.
 
 ## Content collections and Markdown (`src/transform/content.rs`)
 
@@ -464,7 +515,7 @@ through the same `Tenant::write` as the editor, so previews follow.
 
 ```
 src/main.rs            flags, base loading, restore, listener
-src/store.rs           Base, Tenant (overlay, version, events, persistence), Store, clean_path, valid_id
+src/store.rs           Base, Tenant (overlay, version, events, persistence), Store, UpdateKind, clean_path, valid_id
 src/http/mod.rs        routers, host dispatch, the two token middlewares, MIME table
 src/http/api.rs        editor page, /api handlers, SSE, check_tenant
 src/http/archive.rs    tar.gz export and import of a tenant tree

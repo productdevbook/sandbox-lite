@@ -330,7 +330,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{MAX_FILE, MAX_OUTPUT, MAX_READ, Sass, uses_sass};
-    use crate::store::{Base, Store, Tenant};
+    use crate::store::{Base, Store, Tenant, UpdateKind};
 
     fn tenant(files: &[(&str, String)]) -> Arc<Tenant> {
         let store = Store::new(None, u64::MAX);
@@ -338,7 +338,7 @@ mod tests {
         store.add_base(Base::load("starter", &root).unwrap());
         let t = store.create_tenant("t", "starter").unwrap();
         for (path, body) in files {
-            t.write(path, body.clone().into_bytes()).unwrap();
+            t.write(path, body.clone().into_bytes(), UpdateKind::from_path(path)).unwrap();
         }
         t
     }

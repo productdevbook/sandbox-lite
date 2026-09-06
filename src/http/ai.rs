@@ -124,7 +124,8 @@ fn file_tool(st: &AppState, t: &Tenant, name: &str, input: &Value, changes: &mut
         "write_file" => {
             let Some(p) = path() else { return "error: bad path".into() };
             let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            match t.write(&p, content.as_bytes().to_vec()) {
+            let kind = st.engine.update_kind(t, &p, content.as_bytes());
+            match t.write(&p, content.as_bytes().to_vec(), kind) {
                 Ok(_) => {
                     changes.push(p.clone());
                     format!("wrote {p} ({} bytes)", content.len())

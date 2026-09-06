@@ -15,11 +15,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::{Xxh3Default, xxh3_128};
 
 use crate::metrics::Metrics;
 use crate::resolve::{Resolver, dirname};
-use crate::store::Tenant;
+use crate::store::{Tenant, UpdateKind};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Diag {
@@ -361,9 +361,16 @@ impl Drop for Compiling {
     }
 }
 
+/// How many `(tenant, .astro path)` pairs keep a compiled-JS fingerprint. Past that the map is
+/// emptied rather than evicted one by one: a forgotten entry costs a page reload, nothing more.
+const LAST_JS_ENTRIES: usize = 4096;
+
 pub struct Engine {
     pub cfg: Config,
     cache: Mutex<Cache>,
+    /// The JS each `.astro` module last compiled to, so a write can be told apart from an edit that
+    /// only moved a `<style>` block. Written by every module build, read once per write.
+    last_js: Mutex<HashMap<(String, String), u128>>,
     sass: scss::Sass,
     gate: Gate,
     metrics: Arc<Metrics>,
@@ -376,6 +383,7 @@ impl Engine {
         Engine {
             cfg,
             cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }),
+            last_js: Mutex::new(HashMap::new()),
             sass,
             gate,
             metrics,
@@ -436,6 +444,15 @@ impl Engine {
 
     pub fn build(&self, tenant: &Tenant, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
         let data = tenant.read(path).ok_or_else(|| BuildError::not_found(path))?;
+        let built = self.build_bytes(tenant, path, kind, &data)?;
+        self.remember(tenant, path, kind, &built);
+        Ok(built)
+    }
+
+    /// `build` of a source the tenant may not hold yet. The cache is content-addressed, so building
+    /// the bytes of a write before it lands is the compile the next module request would have paid
+    /// for anyway.
+    fn build_bytes(&self, tenant: &Tenant, path: &str, kind: Kind, data: &[u8]) -> Result<Arc<Built>, BuildError> {
         let site = crate::resolve::tenant_site(tenant);
         let mut h = Vec::with_capacity(data.len() + path.len() + 32);
         h.extend_from_slice(kind.tag().as_bytes());
@@ -444,10 +461,10 @@ impl Engine {
         h.push(0);
         h.extend_from_slice(site.as_deref().unwrap_or("").as_bytes());
         h.push(0);
-        if scss::is_sass_path(path) || (path.ends_with(".astro") && scss::uses_sass(&String::from_utf8_lossy(&data))) {
+        if scss::is_sass_path(path) || (path.ends_with(".astro") && scss::uses_sass(&String::from_utf8_lossy(data))) {
             h.extend_from_slice(&scss::fingerprint(tenant).to_le_bytes());
         }
-        h.extend_from_slice(&data);
+        h.extend_from_slice(data);
         let key = xxh3_128(&h);
         if let Some(b) = self.cached(key) {
             return Ok(b);
@@ -456,13 +473,45 @@ impl Engine {
         let started = Instant::now();
         let spawned = self.on_parser_stack(|| {
             let _compiling = Compiling::enter();
-            self.compile(tenant, path, kind, &data, site.as_deref())
+            self.compile(tenant, path, kind, data, site.as_deref())
         });
         self.metrics.compiled(kind, started.elapsed());
         let compiled = spawned.map_err(|e| BuildError::compile(format!("{path}: cannot start a compiler thread: {e}"), vec![]))?;
         let built = Arc::new(compiled?);
         self.insert(key, built.clone());
         Ok(built)
+    }
+
+    /// Only ever called for content the tenant holds, so a fingerprint here is one a page could
+    /// have loaded. A speculative build — the one `update_kind` runs on bytes not yet written —
+    /// must not land in the map: were the write then refused, the next write would be compared
+    /// against JS the browser never ran.
+    fn remember(&self, tenant: &Tenant, path: &str, kind: Kind, built: &Built) {
+        if kind != Kind::Module || !path.ends_with(".astro") {
+            return;
+        }
+        let mut map = self.last_js.lock().unwrap();
+        if map.len() >= LAST_JS_ENTRIES {
+            map.clear();
+        }
+        map.insert((tenant.id.clone(), path.to_string()), module_fingerprint(built));
+    }
+
+    /// How the live-reload client should apply a write of `bytes` to `path`. A stylesheet swaps in
+    /// place. An `.astro` file that compiles to the JS the last build produced moved only its
+    /// `<style>` blocks, so those swap instead. Everything else reloads, and so does anything this
+    /// cannot prove: an `.astro` file nothing has built yet, one that no longer compiles, one whose
+    /// hoisted `<script>` changed.
+    pub fn update_kind(&self, tenant: &Tenant, path: &str, bytes: &[u8]) -> UpdateKind {
+        if !path.ends_with(".astro") {
+            return UpdateKind::from_path(path);
+        }
+        let before = self.last_js.lock().unwrap().get(&(tenant.id.clone(), path.to_string())).copied();
+        let Some(before) = before else { return UpdateKind::Module };
+        match self.build_bytes(tenant, path, Kind::Module, bytes) {
+            Ok(built) if module_fingerprint(&built) == before => UpdateKind::Style,
+            _ => UpdateKind::Module,
+        }
     }
 
     fn compile(&self, tenant: &Tenant, path: &str, kind: Kind, data: &[u8], site: Option<&str>) -> Result<Built, BuildError> {
@@ -600,6 +649,23 @@ impl Engine {
     }
 }
 
+/// Everything a component renders except its CSS: the module body, and the hoisted scripts, which
+/// the body only names by index. Two builds with the same fingerprint differ in their `<style>`
+/// blocks or not at all.
+fn module_fingerprint(built: &Built) -> u128 {
+    let mut h = Xxh3Default::new();
+    h.update(built.body.as_bytes());
+    for script in &built.scripts {
+        let (tag, code) = match script {
+            astro::Script::Inline(code) => (b"i", code),
+            astro::Script::External(src) => (b"e", src),
+        };
+        h.update(tag);
+        h.update(code.as_bytes());
+    }
+    h.digest128()
+}
+
 /// No Rust compiler exists for `.vue` or `.svelte`, so the file is served as a module that
 /// compiles its source in the browser and re-exports the component. The source it carries has
 /// been through `sfc::strip_types`, so its `<script>` blocks are JavaScript.
@@ -659,7 +725,7 @@ mod tests {
 
     use super::*;
     use crate::resolve::Resolver;
-    use crate::store::{Base, Store, Tenant};
+    use crate::store::{Base, Store, Tenant, UpdateKind};
 
     const PAGE: &str = "---\nimport { Chart } from \"some-widgets\";\n---\n<Chart client:load />\n";
     const PAGE_PATH: &str = "src/pages/index.astro";
@@ -673,7 +739,7 @@ mod tests {
         std::fs::remove_dir(&root).unwrap();
         let tenant = store.create_tenant("t", "b").unwrap();
         for (path, body) in files {
-            tenant.write(path, body.as_bytes().to_vec()).unwrap();
+            tenant.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
         }
         tenant
     }
@@ -922,6 +988,57 @@ mod tests {
         let closed = Engine { gate: Gate::new(0, Duration::from_millis(50)), ..engine };
         assert!(closed.build(&t, "src/hit.ts", Kind::Module).is_ok());
         assert_eq!(build_err(closed.build(&t, "src/miss.ts", Kind::Module)).status, 503);
+    }
+
+    const CARD: &str = "---\nconst n = 1;\n---\n<p>{n}</p>\n<style>p{color:red}</style>\n<script>console.log(1)</script>\n";
+    const CARD_PATH: &str = "src/components/Card.astro";
+
+    /// Issue #13: what the client is told a write changed. Only an `.astro` file that compiles to
+    /// the JS the page is already running may swap its styles; everything else reloads.
+    #[test]
+    fn an_astro_write_is_a_style_swap_only_when_its_js_is_unchanged() {
+        let t = tenant(&[(CARD_PATH, CARD)]);
+        let e = engine();
+        let restyled = CARD.replace("color:red", "color:blue");
+        assert_eq!(
+            e.update_kind(&t, CARD_PATH, restyled.as_bytes()),
+            UpdateKind::Module,
+            "nothing has built this file, so nothing can be proved about it"
+        );
+        e.build(&t, CARD_PATH, Kind::Module).unwrap();
+        assert_eq!(e.update_kind(&t, CARD_PATH, restyled.as_bytes()), UpdateKind::Style);
+        for edited in [
+            CARD.replace("console.log(1)", "console.log(2)"),
+            CARD.replace("const n = 1;", "const n = 2;"),
+            CARD.replace("<p>{n}</p>", "<p>{n}!</p>"),
+            CARD.replace("<style>p{color:red}</style>", ""),
+            "---\nconst n = ;\n---\n".to_string(),
+        ] {
+            assert_eq!(e.update_kind(&t, CARD_PATH, edited.as_bytes()), UpdateKind::Module, "{edited}");
+        }
+    }
+
+    /// A refused write must leave no fingerprint behind, or the write after it would be compared
+    /// against JS no browser ever ran.
+    #[test]
+    fn a_classified_write_that_never_lands_is_not_remembered() {
+        let t = tenant(&[(CARD_PATH, CARD)]);
+        let e = engine();
+        e.build(&t, CARD_PATH, Kind::Module).unwrap();
+        let rewritten = CARD.replace("const n = 1;", "const n = 2;");
+        assert_eq!(e.update_kind(&t, CARD_PATH, rewritten.as_bytes()), UpdateKind::Module);
+        let restyled = rewritten.replace("color:red", "color:blue");
+        assert_eq!(e.update_kind(&t, CARD_PATH, restyled.as_bytes()), UpdateKind::Module);
+    }
+
+    #[test]
+    fn a_stylesheet_needs_no_compile_to_be_classified() {
+        let t = tenant(&[]);
+        let e = engine();
+        assert_eq!(e.update_kind(&t, "src/styles/tokens.css", b"a{}"), UpdateKind::Css);
+        assert_eq!(e.update_kind(&t, "src/styles/app.scss", b"a{}"), UpdateKind::Css);
+        assert_eq!(e.update_kind(&t, "src/lib/x.ts", b"export {};"), UpdateKind::Module);
+        assert_eq!(e.stats().misses, 0);
     }
 
     #[test]

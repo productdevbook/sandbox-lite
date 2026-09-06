@@ -142,7 +142,8 @@ cargo build --release
 Open <http://localhost:4321/>, create a tenant `acme` from the `starter` base,
 and the preview appears at <http://acme.localhost:4321/> (`*.localhost` resolves
 to 127.0.0.1 in Chrome and Firefox without any setup). Edit a file on the left;
-the preview reloads.
+the preview updates — a stylesheet swaps into the open page, anything else
+reloads it.
 
 With `ANTHROPIC_API_KEY` set, the Chat tab talks to Claude with `read_file`,
 `write_file`, `delete_file`, `list_files` and `check_site` tools scoped to that
@@ -252,7 +253,7 @@ Editor host (`localhost`):
 | GET | `/api/t/{id}/files` | merged base + overlay listing |
 | GET | `/api/t/{id}/export` | tar.gz of the merged tree; `?overlay=1` for the edits alone |
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
-| GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version |
+| GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version and a `kind` (`css`, `style`, `module`) |
 | GET | `/api/t/{id}/check` | compile every source file, return diagnostics |
 | POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, chat}`, or SSE with `Accept: text/event-stream` |
 | GET | `/api/t/{id}/chats` | saved conversations, newest first |
@@ -302,7 +303,7 @@ Tenant host (`<id>.<domain>`):
 | `/__sl/content/<collection>` | `{entries, dates}` — the collection's entries and the schema's date fields; Markdown arrives rendered, MDX entries render through their compiled module |
 | `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, …; `astro-jsx-runtime.js` is Astro's JSX runtime and `astro:jsx` renderer |
 | `/__sl/astro.js` | Astro's runtime + container API, bundled once per Astro version |
-| `/__sl/events` | same SSE stream as the API; the page reloads itself on it |
+| `/__sl/events` | same SSE stream as the API; the page swaps CSS or reloads itself on it |
 | anything under `public/` | served directly |
 
 ## How a page renders
@@ -328,7 +329,16 @@ Tenant host (`<id>.<domain>`):
    `routeType: "endpoint"` runs its `GET` (or `ALL`) handler with an
    `APIContext`. An HTML response is written as a page; anything else — XML,
    JSON, plain text — is shown with its status and content-type above the body.
-8. `live.js` holds an `EventSource`; any write to the tenant reloads the page.
+8. `live.js` holds an `EventSource`. Each event carries a `kind`: a `.css`,
+   `.scss` or `.sass` write is `css`, an `.astro` write whose compiled JS is
+   byte-identical to the last build changed only its `<style>` blocks and is
+   `style`, and everything else is `module`. On `css` and `style` the CSS
+   module is re-imported and the matching `<style data-sl=…>` swapped in place,
+   leaving the page's DOM and JS state alone; on `module` — or on anything the
+   daemon cannot prove, or while the error overlay is up — the page reloads.
+   Tailwind is the exception: a `type="text/tailwindcss"` block is compiled by
+   Tailwind's browser build when it loads and there is no rebuild hook to call,
+   so a write that touches one reloads the page.
 
 Error states are pages too: a compile error, a missing import, a 404 route or
 a failing `getStaticPaths` render an overlay that lists the daemon's
