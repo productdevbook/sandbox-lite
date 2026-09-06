@@ -54,46 +54,50 @@ TypeScript in their `<script>` blocks stripped by the daemon first);
 
 `bench/mem.sh` starts the release binary, creates N tenants from the starter
 project, edits one file in each, loads the preview module graph of each, and
-reads the daemon's RSS from `/proc`.
-
-Release build on Linux x86-64, three base projects loaded, every tenant with
-one edited page and a loaded preview:
+reads the daemon's RSS from `/proc`. CI runs it on every push, so the figures
+below are a CI run's and not a laptop's — `bench/mem.sh 100 4398` on
+`ubuntu-latest`, at commit `49be004`, in
+[run 34060501537](https://github.com/productdevbook/sandbox-lite/actions/runs/34060501537).
+Every tenant there has one edited page and a loaded preview, with all five
+`examples/` projects loaded as bases:
 
 | | daemon RSS |
 |---|---|
-| idle | 7.0 MB |
-| after 1000 tenants (edit + preview each) | 19.7 MB — 13 kB per tenant |
+| idle | 7.4 MB |
+| after 100 tenants (edit + preview each) | 14.6 MB — 72 kB per tenant |
 
 Creating a tenant, writing its edit and fetching its whole module graph took
-~147 ms per tenant through the HTTP API. After 1000 tenants the transform cache
-held 1008 entries in 571 kB (1000 unique edited pages plus the 8 shared modules
-every tenant reuses), 7993 hits to 1008 misses. The binary is 15.8 MB.
+~90 ms per tenant through the HTTP API. The transform cache then held 108
+entries in 66 kB — 100 unique edited pages plus the 8 shared modules every
+tenant reuses — at 793 hits to 108 misses. 100 is the count CI runs, so 100 is
+the count this table reports; `bench/mem.sh N` takes any other, and the
+per-tenant figure is the marginal cost at the count it was measured at rather
+than a constant to multiply.
 
 ### The same project, the other way
 
 `bench/vs-astro-dev.sh` runs the comparison on one machine: `npm install` plus
-`astro dev` for one tenant, then the daemon serving the same project.
+`astro dev` for one tenant, then the daemon serving the same project. It prints
+install time and `node_modules` size, time to a ready server, time to the first
+page, and RSS for each side. Nothing runs it in CI, so no numbers off it are
+quoted here; run it on the hardware you care about.
 
-| | `astro dev`, one per tenant | sandbox-lite, one for all |
-|---|---|---|
-| dependencies | 4.1 s install, 166 MB of `node_modules` **per tenant** | none — the browser fetches packages from a CDN, already built |
-| server ready | 3.0 s | 8 ms |
-| tenant ready | (the process *is* the tenant) | 6 ms |
-| first page, whole module graph | 97 ms | 51 ms (6 modules compiled) |
-| **cold → first page** | **7.2 s** | **65 ms** |
-| memory | 636 MB for that one tenant | 12 MB for the daemon and every tenant in it |
-
-The install was measured with a warm npm cache; in a fresh container it was
-18 s, which is the number that matters — that is what a hosted builder pays
-every time it starts a session. For scale: ComputeSDK's public
+The shape of the difference is not a measurement, though. `astro dev` needs a
+dependency install and a Node process for every tenant; sandbox-lite needs
+neither, because the browser fetches packages from a CDN already built and one
+daemon serves every tenant. The install is what dominates a cold start, and it
+is paid again every time a hosted builder opens a session. For scale:
+ComputeSDK's public
 [sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/dax/) times
 32 providers doing clone + install + typecheck in a fresh sandbox, and the
 fastest finishes in 33.5 s.
 
-sandbox-lite is not in that benchmark and cannot be: it has no shell and runs no
-customer code. It removes the install step rather than accelerating it, which
-only works because the compiler is a library and the runtime is the browser's.
-That trade is the whole design — see *What the preview does not do*.
+sandbox-lite is not in that benchmark and cannot be: it has no shell, installs
+nothing and never runs the project's build. It removes the install step rather
+than accelerating it, which only works because the compiler is a library and the
+runtime is the browser's. That trade is the whole design — see *What the preview
+does not do*. (`--chrome` is the one thing that runs tenant JavaScript on the
+daemon's own host; `SECURITY.md` says what that means.)
 
 Per-tenant state is the overlay (only edited files) plus a content-addressed
 transform cache shared by every tenant: two tenants with the same `Header.astro`
@@ -104,10 +108,15 @@ would push a tenant past it is refused with `413`.
 
 ## Install
 
-Every [release](https://github.com/productdevbook/sandbox-lite/releases) carries
-a stripped binary for Linux (x86-64 and arm64, glibc 2.35 or newer) and macOS
-(Intel and Apple silicon) as `sandbox-lite-<tag>-<target>.tar.gz`, holding
-`sandbox-lite`, `LICENSE` and `README.md`, plus a `SHA256SUMS` file:
+**No version has been tagged yet**, so there is nothing on the releases page
+and no image in the registry: build from source for now, and read the next two
+blocks as what a `v*` tag will produce (`.github/workflows/release.yml`).
+
+Each [release](https://github.com/productdevbook/sandbox-lite/releases) will
+carry a stripped binary for Linux (x86-64 and arm64, built in `rust:1-bookworm`
+so glibc 2.36 or newer) and macOS (Intel and Apple silicon) as
+`sandbox-lite-<tag>-<target>.tar.gz`, holding `sandbox-lite`, `LICENSE` and
+`README.md`, plus a `SHA256SUMS` file:
 
 ```sh
 tag=v0.1.0
@@ -118,18 +127,19 @@ sandbox-lite --bases path/to/your/astro-projects
 ```
 
 The same tag is published as a multi-arch image (`linux/amd64`, `linux/arm64`)
-at `ghcr.io/productdevbook/sandbox-lite:<tag>`, and `:latest` follows the newest
-release; see [Docker](#docker) for what the image bundles:
+at `ghcr.io/productdevbook/sandbox-lite:<tag>`, with `:latest` following the
+newest release; see [Docker](#docker) for what the image bundles:
 
 ```sh
 docker run -p 4321:4321 -v sandbox-data:/data ghcr.io/productdevbook/sandbox-lite:latest
 ```
 
-Or build from source with a current stable Rust toolchain. The browser runtime
-is embedded in the binary, so nothing else is needed at run time:
+Build from source with a current stable Rust toolchain — the way in today. The
+browser runtime is embedded in the binary, so nothing else is needed at run
+time:
 
 ```sh
-cargo install --locked --git https://github.com/productdevbook/sandbox-lite   # --tag v0.1.0 pins a release
+cargo install --locked --git https://github.com/productdevbook/sandbox-lite   # --tag v0.1.0 will pin a release
 ```
 
 ## Try it
@@ -149,9 +159,10 @@ With `ANTHROPIC_API_KEY` set, the Chat tab talks to Claude with `read_file`,
 `write_file`, `delete_file`, `list_files` and `check_site` tools scoped to that
 tenant. Every write shows up in the preview as it happens. The reply is
 streamed: the editor sends `Accept: text/event-stream` and paints the text and
-each tool call as they arrive. Conversations are kept per tenant under
-`<data-dir>/<id>/chats/` and are listed in the Chat tab's dropdown, so a
-customer can pick an old thread back up; the tool loop sees the earlier turns.
+each tool call as they arrive. Conversations are kept per tenant as one JSON
+file each under `<data-dir>/<id>/chats/` — in memory with `--no-persist` — and
+are listed in the Chat tab's dropdown, so a customer can pick an old thread back
+up; the tool loop sees the earlier turns.
 
 A conversation does not grow without end. The last `--chat-window` turns
 (default 24) are replayed to the model in full; when a conversation passes that,
@@ -194,7 +205,8 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 --chats-per-tenant N conversations a tenant may keep (default 50)
 --tenant-quota-mb N  edited files a tenant may hold, in MiB (default 64)
 --cookie-samesite lax|none
-                     SameSite of the preview cookie; none also sets Secure (default lax)
+                     SameSite of the preview cookie; none also sets Secure
+                     (default: none with --preview-secret, lax without)
 ```
 
 `SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET`,
@@ -264,7 +276,7 @@ Editor host (`localhost`):
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
 | GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version and a `kind` (`css`, `style`, `module`) |
 | GET | `/api/t/{id}/check` | compile every source file, return diagnostics |
-| POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, chat}`, or SSE with `Accept: text/event-stream` |
+| POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, iterations, version, chat}`, or SSE with `Accept: text/event-stream` |
 | GET | `/api/t/{id}/chats` | saved conversations, newest first |
 | GET/DELETE | `/api/t/{id}/chats/{chat}` | one conversation with its turns / remove it |
 
@@ -289,8 +301,10 @@ curl -fsS -X POST --data-binary @acme.tar.gz localhost:4321/api/tenants/acme-cop
 `sandbox_lite_tenants`, `sandbox_lite_overlay_bytes`, `sandbox_lite_cache_*`,
 `sandbox_lite_sse_subscribers`, `sandbox_lite_rss_bytes`,
 `sandbox_lite_uptime_seconds`, one series per base, `sandbox_lite_sass_*`
-(running, runaway, timeouts, refusals), `sandbox_lite_screenshots_*` (running,
-calls told the tool was busy, browsers killed on their deadline),
+(running, runaway, timeouts, refusals), `sandbox_lite_compiles_*` (permits
+held, builds queued, the `--max-compiles` limit, builds refused with 503),
+`sandbox_lite_screenshots_*` (running, calls told the tool was busy, browsers
+killed on their deadline),
 `sandbox_lite_module_requests_total{kind,status}` and
 `sandbox_lite_compile_seconds{kind}` — a histogram of what a transform-cache
 miss costs, so `histogram_quantile(0.99, …)` answers "how slow is a cold
@@ -376,15 +390,22 @@ the two configurations that work — is [`docs/multi-node.md`](docs/multi-node.m
    byte-identical to the last build changed only its `<style>` blocks and is
    `style`, and everything else is `module`. On `css` and `style` the CSS
    module is re-imported and the matching `<style data-sl=…>` swapped in place,
-   leaving the page's DOM and JS state alone; on `module` — or on anything the
-   daemon cannot prove, or while the error overlay is up — the page reloads.
+   leaving the page's DOM and JS state alone; a stylesheet the page only reaches
+   through another sheet's `@import` has no block of its own, so the importing
+   block's `/__sl/raw/` URL gets a fresh `?v=` instead. On `module` — or on
+   anything the daemon cannot prove, or while the error overlay is up — the page
+   reloads.
    Tailwind is the exception: a `type="text/tailwindcss"` block is compiled by
    Tailwind's browser build when it loads and there is no rebuild hook to call,
    so a write that touches one reloads the page.
 
-Error states are pages too: a compile error, a missing import, a 404 route or
-a failing `getStaticPaths` render an overlay that lists the daemon's
-diagnostics and reloads when the file is fixed.
+Error states are pages too, and they all reload when the file is fixed —
+`live.js` is in the overlay, and its `<body data-sl-overlay>` is what stops a
+CSS swap being applied to it. A render that throws — a compile error, a missing
+import, a `getStaticPaths` that fails — fetches `/__sl/check` and lists the
+daemon's diagnostics. The overlays that have none to list say what happened
+instead: no route matched (with the route table), no static path matched the
+URL, or the page answered `4xx`/`5xx` with an empty body.
 
 ## Layout
 
@@ -413,7 +434,7 @@ e2e/                   Playwright suite for the browser side: every example page
 
 - **Solid islands.** React, Preact, Vue and Svelte renderers ship; another
   framework needs a `server` module exposing `check` and
-  `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 40 lines) and a
+  `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 42 lines) and a
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
 - **Type-driven Vue macros.** There is no Rust compiler for `.vue` or
   `.svelte`, so the daemon serves the component as a loader module that runs
