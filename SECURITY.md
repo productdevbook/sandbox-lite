@@ -88,6 +88,12 @@ credentials on the API side.
   - Sass partials, which grass reads itself and compiles on its own thread
     (see below) rather than on the one `Engine::build` reserved. Each is
     refused past the nesting cap, and that thread gets a 64 MiB stack.
+- **Concurrent compiles** are capped by `--max-compiles` (default: one per
+  core). Each compile holds a stack reservation of its own, so without the cap
+  the only ceiling on how many exist together is tokio's blocking pool of 512
+  threads. A build that waits more than five seconds for a permit is refused
+  with 503. A cache hit takes no permit, and the module build a `?type=style`
+  request makes from inside its own compile runs under its parent's.
 - **Host matching** is exact: `a.b.<domain>` and `evil-<domain>` are not tenant
   hosts.
 - **Sass compilation** is bounded (`src/transform/scss.rs`). grass runs

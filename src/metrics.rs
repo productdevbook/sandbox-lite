@@ -118,6 +118,10 @@ pub struct Snapshot {
     pub sass_runaway: u64,
     pub sass_timeouts: u64,
     pub sass_refused: u64,
+    pub compiles_running: u64,
+    pub compiles_queued: u64,
+    pub compiles_limit: u64,
+    pub compiles_refused: u64,
     pub requests: [[u64; STATUSES.len()]; KINDS.len()],
     pub compile: [HistogramSnapshot; KINDS.len()],
 }
@@ -179,6 +183,17 @@ pub fn render(s: &Snapshot) -> String {
         "counter",
         "Sass compilations refused by a size cap, the thread cap, or a runaway thread holding the same source.",
         s.sass_refused,
+    );
+
+    scalar(&mut out, "sandbox_lite_compiles_running", "gauge", "Compiles holding a permit.", s.compiles_running);
+    scalar(&mut out, "sandbox_lite_compiles_queued", "gauge", "Compiles waiting for a permit.", s.compiles_queued);
+    scalar(&mut out, "sandbox_lite_compiles_limit", "gauge", "Compiles that may run at once (--max-compiles).", s.compiles_limit);
+    scalar(
+        &mut out,
+        "sandbox_lite_compiles_refused_total",
+        "counter",
+        "Compiles refused with 503 after waiting for a permit.",
+        s.compiles_refused,
     );
 
     family(&mut out, "sandbox_lite_module_requests_total", "counter", "Requests answered by the preview module endpoint.");
@@ -268,6 +283,10 @@ mod tests {
             sass_runaway: 2,
             sass_timeouts: 3,
             sass_refused: 4,
+            compiles_running: 2,
+            compiles_queued: 5,
+            compiles_limit: 8,
+            compiles_refused: 6,
             requests: m.requests(),
             compile: m.compiles(),
         };
@@ -322,6 +341,18 @@ sandbox_lite_sass_timeouts_total 3
 # HELP sandbox_lite_sass_refused_total Sass compilations refused by a size cap, the thread cap, or a runaway thread holding the same source.
 # TYPE sandbox_lite_sass_refused_total counter
 sandbox_lite_sass_refused_total 4
+# HELP sandbox_lite_compiles_running Compiles holding a permit.
+# TYPE sandbox_lite_compiles_running gauge
+sandbox_lite_compiles_running 2
+# HELP sandbox_lite_compiles_queued Compiles waiting for a permit.
+# TYPE sandbox_lite_compiles_queued gauge
+sandbox_lite_compiles_queued 5
+# HELP sandbox_lite_compiles_limit Compiles that may run at once (--max-compiles).
+# TYPE sandbox_lite_compiles_limit gauge
+sandbox_lite_compiles_limit 8
+# HELP sandbox_lite_compiles_refused_total Compiles refused with 503 after waiting for a permit.
+# TYPE sandbox_lite_compiles_refused_total counter
+sandbox_lite_compiles_refused_total 6
 # HELP sandbox_lite_module_requests_total Requests answered by the preview module endpoint.
 # TYPE sandbox_lite_module_requests_total counter
 sandbox_lite_module_requests_total{kind="module",status="200"} 3
@@ -423,6 +454,10 @@ sandbox_lite_compile_seconds_count{kind="url"} 0
             sass_runaway: 0,
             sass_timeouts: 0,
             sass_refused: 0,
+            compiles_running: 0,
+            compiles_queued: 0,
+            compiles_limit: 1,
+            compiles_refused: 0,
             requests: m.requests(),
             compile: m.compiles(),
         };
