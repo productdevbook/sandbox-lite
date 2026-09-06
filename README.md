@@ -56,14 +56,13 @@ one edited page and a loaded preview:
 
 | | daemon RSS |
 |---|---|
-| idle | 6.3 MB |
-| after 200 tenants (edit + preview each) | 12.7 MB — 32 kB per tenant |
-| after 1000 tenants (edit + preview each) | 17.5 MB — 11 kB per tenant |
+| idle | 7.0 MB |
+| after 1000 tenants (edit + preview each) | 19.7 MB — 13 kB per tenant |
 
 Creating a tenant, writing its edit and fetching its whole module graph took
-~90 ms per tenant through the HTTP API. After 1000 tenants the transform cache
-held 1008 entries in 568 kB (1000 unique edited pages plus the 8 shared modules
-every tenant reuses), 7993 hits to 1008 misses. The binary is 13.8 MB.
+~147 ms per tenant through the HTTP API. After 1000 tenants the transform cache
+held 1008 entries in 571 kB (1000 unique edited pages plus the 8 shared modules
+every tenant reuses), 7993 hits to 1008 misses. The binary is 15.8 MB.
 
 ### The same project, the other way
 
