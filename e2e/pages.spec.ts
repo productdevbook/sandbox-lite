@@ -112,6 +112,6 @@ test.describe('react', () => {
     await expect(page.locator('h1')).toHaveText('Islands in the preview');
     await expect(page.locator('.counter strong')).toHaveText('41');
     await expect(page.locator('.greeting h2')).toHaveText('Hello, static React');
-    await expect(page.locator('astro-island:not([ssr])'), 'island hydrated').toHaveCount(1, { timeout: CDN_TIMEOUT });
+    await expect(page.locator('astro-island:not([ssr])'), 'both islands hydrated').toHaveCount(2, { timeout: CDN_TIMEOUT });
   });
 });

@@ -42,7 +42,9 @@ dynamic routes with `getStaticPaths` and `paginate`;
 `import.meta.glob` (eager and lazy, `import:`/`query:` options); `import.meta.env`
 and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
 CDN pinned to the versions in `package.json`; React and Preact islands
-(`client:load` and friends hydrate with the framework's own client entrypoint);
+(`client:load` and friends hydrate with the framework's own client entrypoint,
+whether the component is a file in `src/` or a component imported from a
+package);
 `<script>` tags, `public/` files and live reload.
 
 ## What it costs
@@ -291,7 +293,7 @@ src/check.rs           the `check` subcommand
 assets/                shell.html, shell.js, live.js, editor.html, astro.js and astro-jsx.js bundles, astro:* shims
 examples/starter       a framework-free Astro 7 site (Markdown, MDX, content collections); the base used by CI's smoke test and bench/mem.sh
 examples/tailwind      Tailwind v4 through its browser build
-examples/react         a React island hydrated with client:load
+examples/react         React islands hydrated with client:load, one local and one imported from npm
 scripts/build-runtime.sh   regenerates assets/astro.js and assets/astro-jsx.js for a new Astro version
 bench/mem.sh           the memory measurement above
 e2e/                   Playwright suite for the browser side: every example page, live reload, hydration, the error overlay

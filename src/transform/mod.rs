@@ -48,6 +48,7 @@ pub struct Built {
     pub body: String,
     pub content_type: &'static str,
     pub specs: Vec<js::SpecRef>,
+    pub component_paths: Vec<js::SpecRef>,
     pub globs: Vec<glob::GlobRef>,
     pub warnings: Vec<Diag>,
     pub env_banner: bool,
@@ -62,6 +63,7 @@ impl Built {
             body,
             content_type: JS,
             specs: vec![],
+            component_paths: vec![],
             globs: vec![],
             warnings: vec![],
             env_banner: false,
@@ -264,6 +266,7 @@ impl Engine {
                             body: out.code,
                             content_type: JS,
                             specs,
+                            component_paths: out.component_paths,
                             globs,
                             warnings: out.warnings,
                             env_banner: true,
@@ -323,7 +326,7 @@ impl Engine {
     pub fn serve(&self, tenant: &Tenant, path: &str, kind: Kind, resolver: &Resolver) -> Result<(String, &'static str), BuildError> {
         let built = self.build(tenant, path, kind)?;
         let mut edits: Vec<(usize, usize, String)> =
-            built.specs.iter().map(|s| (s.start, s.end, resolver.resolve(path, &s.spec))).collect();
+            built.specs.iter().chain(&built.component_paths).map(|s| (s.start, s.end, resolver.resolve(path, &s.spec))).collect();
         let mut hoisted = String::new();
         for (i, g) in built.globs.iter().enumerate() {
             let expansion = glob::expand(tenant, path, g, i, resolver.version())
@@ -392,7 +395,83 @@ pub fn is_source(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::svg_size;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{Config, Engine, Kind, scss, svg_size};
+    use crate::resolve::Resolver;
+    use crate::store::{Base, Store, Tenant};
+
+    const PAGE: &str = "---\nimport { Chart } from \"some-widgets\";\n---\n<Chart client:load />\n";
+    const PAGE_PATH: &str = "src/pages/index.astro";
+
+    fn tenant(files: &[(&str, &str)]) -> Arc<Tenant> {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!("sandbox-lite-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::new(None, u64::MAX);
+        store.add_base(Base::load("b", &root).unwrap());
+        std::fs::remove_dir(&root).unwrap();
+        let tenant = store.create_tenant("t", "b").unwrap();
+        for (path, body) in files {
+            tenant.write(path, body.as_bytes().to_vec()).unwrap();
+        }
+        tenant
+    }
+
+    fn engine() -> Engine {
+        Engine::new(Config {
+            cdn: "https://esm.sh".into(),
+            cache_bytes: 1 << 20,
+            sass_timeout: Duration::from_millis(scss::DEFAULT_TIMEOUT_MS),
+        })
+    }
+
+    fn served(engine: &Engine, tenant: &Tenant) -> String {
+        engine.serve(tenant, PAGE_PATH, Kind::Module, &Resolver::new(tenant, "https://esm.sh", 7)).unwrap().0
+    }
+
+    #[test]
+    fn a_package_island_path_becomes_the_pinned_cdn_url() {
+        let t = tenant(&[("package.json", r#"{"dependencies":{"some-widgets":"^1.2.3"}}"#), (PAGE_PATH, PAGE)]);
+        let out = served(&engine(), &t);
+        assert!(out.contains(r#""client:component-path": "https://esm.sh/some-widgets@^1.2.3""#), "{out}");
+        assert!(out.contains(r#""client:component-export": "Chart""#), "{out}");
+        assert!(out.contains(r#"import { Chart } from "https://esm.sh/some-widgets@^1.2.3""#), "{out}");
+    }
+
+    #[test]
+    fn a_client_only_package_island_resolves_at_serve_time() {
+        let t = tenant(&[
+            ("package.json", r#"{"dependencies":{"some-widgets":"1.0.0"}}"#),
+            (PAGE_PATH, "---\nimport Widget from \"some-widgets\";\n---\n<Widget client:only=\"react\" />\n"),
+        ]);
+        let out = served(&engine(), &t);
+        assert!(out.contains(r#""client:component-path": "https://esm.sh/some-widgets@1.0.0""#), "{out}");
+        assert!(out.contains(r#""client:component-export": "default""#), "{out}");
+    }
+
+    #[test]
+    fn an_aliased_island_path_becomes_the_tenants_own_module() {
+        let t = tenant(&[
+            ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@c/*":["src/components/*"]}}}"#),
+            ("src/components/Card.tsx", "export default () => null;\n"),
+            (PAGE_PATH, "---\nimport Card from \"@c/Card.tsx\";\n---\n<Card client:load />\n"),
+        ]);
+        let out = served(&engine(), &t);
+        assert!(out.contains(r#""client:component-path": "/__sl/m/src/components/Card.tsx?v=7""#), "{out}");
+    }
+
+    #[test]
+    fn one_cached_compile_serves_each_tenant_its_own_pin() {
+        let a = tenant(&[("package.json", r#"{"dependencies":{"some-widgets":"1.0.0"}}"#), (PAGE_PATH, PAGE)]);
+        let b = tenant(&[("package.json", r#"{"dependencies":{"some-widgets":"2.0.0"}}"#), (PAGE_PATH, PAGE)]);
+        let engine = engine();
+        assert!(served(&engine, &a).contains("https://esm.sh/some-widgets@1.0.0"));
+        assert!(served(&engine, &b).contains("https://esm.sh/some-widgets@2.0.0"));
+        assert_eq!(engine.stats().misses, 1, "package.json is not in the cache key, so both tenants share one compile");
+    }
 
     #[test]
     fn svg_size_survives_junk_attributes() {
