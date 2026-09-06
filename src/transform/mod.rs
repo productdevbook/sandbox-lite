@@ -330,25 +330,34 @@ impl Engine {
     }
 }
 
-fn svg_size(svg: &str) -> (usize, usize) {
+pub(crate) fn svg_size(svg: &str) -> (usize, usize) {
     let Some(open) = svg.find("<svg") else { return (0, 0) };
     let tag = &svg[open..svg[open..].find('>').map(|i| open + i).unwrap_or(svg.len())];
-    let attr = |name: &str| -> Option<String> {
-        let i = tag.find(&format!(" {name}="))?;
-        let rest = &tag[i + name.len() + 2..];
-        let q = rest.chars().next()?;
-        let end = rest[1..].find(q)?;
-        Some(rest[1..1 + end].to_string())
-    };
-    let num = |v: String| v.trim().trim_end_matches("px").parse::<f64>().ok().map(|n| n.round() as usize);
-    match (attr("width").and_then(num), attr("height").and_then(num)) {
+    let length = |v: &str| v.trim().trim_end_matches("px").parse().ok().and_then(pixels);
+    match (svg_attr(tag, "width").and_then(length), svg_attr(tag, "height").and_then(length)) {
         (Some(w), Some(h)) => (w, h),
         _ => {
-            let vb = attr("viewBox").unwrap_or_default();
+            let vb = svg_attr(tag, "viewBox").unwrap_or_default();
             let parts: Vec<f64> = vb.split([' ', ',']).filter_map(|p| p.trim().parse().ok()).collect();
-            if parts.len() == 4 { (parts[2].round() as usize, parts[3].round() as usize) } else { (0, 0) }
+            match parts[..] {
+                [_, _, w, h] => (pixels(w).unwrap_or(0), pixels(h).unwrap_or(0)),
+                _ => (0, 0),
+            }
         }
     }
+}
+
+fn svg_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let i = tag.find(&format!(" {name}="))?;
+    let rest = &tag[i + name.len() + 2..];
+    let quote = rest.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+    let end = rest[1..].find(quote)?;
+    Some(&rest[1..1 + end])
+}
+
+/// `inf`, `NaN`, `1e999` and negatives parse as f64 but are not sizes an image can have.
+fn pixels(n: f64) -> Option<usize> {
+    (0.0..=u32::MAX as f64).contains(&n).then(|| n.round() as usize)
 }
 
 pub fn json_str(s: &str) -> String {
@@ -358,4 +367,18 @@ pub fn json_str(s: &str) -> String {
 pub fn is_source(path: &str) -> bool {
     matches!(path.rsplit_once('.').map(|(_, e)| e).unwrap_or(""), "astro" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "md")
         && path.starts_with("src/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::svg_size;
+
+    #[test]
+    fn svg_size_survives_junk_attributes() {
+        assert_eq!(svg_size("<svg width=€ height=\"1\">"), (0, 0));
+        assert_eq!(svg_size("<svg width=\"inf\" height=\"1e999\">"), (0, 0));
+        assert_eq!(svg_size("<svg viewBox=\"0 0 NaN -1\">"), (0, 0));
+        assert_eq!(svg_size("<svg width=\"24px\" height='16'>"), (24, 16));
+        assert_eq!(svg_size("<svg width=\"x\" viewBox=\"0,0,100.4,50.5\">"), (100, 51));
+    }
 }

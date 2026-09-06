@@ -272,63 +272,58 @@ pub fn normalize(path: &str) -> String {
 pub fn strip_jsonc(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut in_str = false;
+    let (mut i, mut kept, mut in_str) = (0, 0, false);
     while i < bytes.len() {
         let c = bytes[i];
         if in_str {
-            out.push(c as char);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_str = false;
+                    i += 1;
+                }
+                _ => i += 1,
             }
-            if c == b'"' {
-                in_str = false;
-            }
-            i += 1;
             continue;
         }
         match c {
             b'"' => {
                 in_str = true;
-                out.push('"');
                 i += 1;
             }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                out.push_str(&text[kept..i]);
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+                kept = i;
             }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push_str(&text[kept..i]);
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
                 }
-                i += 2;
+                i = (i + 2).min(bytes.len());
+                kept = i;
             }
-            b',' => {
-                let mut j = i + 1;
-                while j < bytes.len() && (bytes[j] as char).is_whitespace() {
-                    j += 1;
+            b'}' | b']' => {
+                out.push_str(&text[kept..i]);
+                let end = out.trim_end_matches([' ', '\t', '\n', '\r']).len();
+                if end > 0 && out.as_bytes()[end - 1] == b',' {
+                    out.remove(end - 1);
                 }
-                if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
-                    i += 1;
-                    continue;
-                }
-                out.push(',');
+                kept = i;
                 i += 1;
             }
-            _ => {
-                out.push(c as char);
-                i += 1;
-            }
+            _ => i += 1,
         }
     }
+    out.push_str(&text[kept..]);
     out
 }
 
-fn tsconfig_paths(text: &str) -> Vec<(String, String)> {
+pub(crate) fn tsconfig_paths(text: &str) -> Vec<(String, String)> {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else { return vec![] };
     let Some(co) = json.get("compilerOptions") else { return vec![] };
     let base_url = co.get("baseUrl").and_then(|b| b.as_str()).unwrap_or(".");
@@ -345,7 +340,7 @@ fn tsconfig_paths(text: &str) -> Vec<(String, String)> {
     out
 }
 
-fn import_map(text: &str) -> Vec<(String, String)> {
+pub(crate) fn import_map(text: &str) -> Vec<(String, String)> {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else { return vec![] };
     let Some(imports) = json.get("imports").and_then(|p| p.as_object()) else { return vec![] };
     let mut out: Vec<(String, String)> = imports.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
@@ -370,6 +365,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&strip_jsonc(t)).unwrap();
         assert_eq!(v["b"], "//not");
         assert_eq!(v["a"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn strip_jsonc_keeps_multibyte_text_and_drops_commas_before_comments() {
+        let t = "{\n  \"site\": \"https://exämple.com\", // ünicode\n  \"x\": [\"字\", /* last */ ],\n}";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(t)).unwrap();
+        assert_eq!(v["site"], "https://exämple.com");
+        assert_eq!(v["x"][0], "字");
+        assert!(strip_jsonc(t).len() <= t.len());
     }
 
     #[test]

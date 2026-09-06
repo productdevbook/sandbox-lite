@@ -231,14 +231,14 @@ pub async fn missing(RawQuery(query): RawQuery) -> Response {
 
 pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
+    let digit = |at: usize| bytes.get(at).and_then(|b| (*b as char).to_digit(16));
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(hi), Some(lo)) = (digit(i + 1), digit(i + 2))
         {
-            out.push(v);
+            out.push((hi * 16 + lo) as u8);
             i += 3;
             continue;
         }
@@ -267,4 +267,18 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         .replace("%ASSETS%", asset_version())
         .replace("%ENV%", &env.to_string());
     ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decode_takes_any_string() {
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%ࠀ"), "%ࠀ");
+        assert_eq!(percent_decode("%C3%A9%"), "é%");
+        assert_eq!(percent_decode("%+1%-1%2"), "%+1%-1%2");
+        assert_eq!(percent_decode("%FF"), "\u{fffd}");
+    }
 }
