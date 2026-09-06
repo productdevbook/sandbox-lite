@@ -33,7 +33,11 @@ function reviveFields(data, paths) {
 function load(name) {
   if (!cache.has(name)) {
     cache.set(name, fetch(slUrl(`/__sl/content/${encodeURIComponent(name)}?v=${globalThis.__sl?.version ?? ""}`)).then(async (r) => {
-      if (!r.ok) throw new Error(`content collection '${name}' is not available (${r.status})`);
+      if (!r.ok) {
+        // The daemon answers a collection it could not build with the diagnostic; the overlay renders this message.
+        const detail = await r.json().then((b) => b?.error).catch(() => undefined);
+        throw new Error(detail ? `content collection '${name}': ${detail}` : `content collection '${name}' is not available (${r.status})`);
+      }
       const { entries, dates } = await r.json();
       for (const e of entries) e.data = dates ? reviveFields(e.data, dates) : reviveDates(e.data);
       return entries;

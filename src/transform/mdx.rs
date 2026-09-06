@@ -22,7 +22,10 @@ pub struct Compiled {
 pub fn compile(path: &str, source: &str) -> Result<Compiled, BuildError> {
     let source = strip_leading_bom(source);
     let (fm, body) = split_frontmatter(source);
-    let frontmatter = fm.map(yaml_to_json).unwrap_or_else(|| Value::Object(Map::new()));
+    let frontmatter = match fm.map(yaml_to_json).transpose() {
+        Ok(fm) => fm.unwrap_or_else(|| Value::Object(Map::new())),
+        Err(reason) => return Err(error(path, &reason, 1, 1)),
+    };
     // Blank lines stand in for the frontmatter so positions in diagnostics match the file.
     let text = format!("{}{body}", "\n".repeat(source[..source.len() - body.len()].matches('\n').count()));
     let (mdast, errors) = satteri_pulldown_cmark::parse(&text, MDX_OPTIONS);

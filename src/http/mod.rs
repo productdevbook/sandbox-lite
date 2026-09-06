@@ -383,7 +383,7 @@ mod tests {
         let (status, body) = post(&app, "/api/bases/theme/reload", "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains(r#""tenants":["acme"]"#), "{body}");
-        assert_eq!(t.read_text("src/pages/index.astro").as_deref(), Some("<h1>two</h1>\n"));
+        assert_eq!(t.read_text("src/pages/index.astro").unwrap().as_deref(), Some("<h1>two</h1>\n"));
         assert!(t.version() > version);
         assert_eq!(post(&app, "/api/bases/nope/reload", "").await.0, StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(&root).unwrap();

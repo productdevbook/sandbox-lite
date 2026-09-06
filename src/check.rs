@@ -75,7 +75,7 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
         sass: 0,
         mdx: 0,
         endpoints: 0,
-        integrations: package_deps(&tenant).into_iter().map(|(n, _)| n).filter(|n| n.starts_with("@astrojs/")).collect(),
+        integrations: package_deps(&tenant)?.into_iter().map(|(n, _)| n).filter(|n| n.starts_with("@astrojs/")).collect(),
         bare_imports: BTreeSet::new(),
     };
     for entry in tenant.list() {
@@ -93,7 +93,7 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
             continue;
         }
         report.files += 1;
-        if path.ends_with(".astro") && tenant.read_text(&path).is_some_and(|t| scss::uses_sass(&t)) {
+        if path.ends_with(".astro") && tenant.read_text(&path).ok().flatten().is_some_and(|t| scss::uses_sass(&t)) {
             report.sass += 1;
         }
         match engine.build(&tenant, &path, Kind::Module) {

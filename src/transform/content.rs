@@ -10,8 +10,25 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::{BuildError, Diag};
 use crate::resolve::{join, normalize};
 use crate::store::Tenant;
+
+/// A collection that could not be built answers 500 with this, rather than an empty collection:
+/// a page rendered from no posts looks exactly like a page rendered from a tenant that has none.
+fn failed(file: &str, text: impl Into<String>, hint: &str) -> BuildError {
+    let diag = Diag { severity: "error".into(), text: text.into(), hint: hint.into(), file: file.to_string(), line: 0, column: 0 };
+    BuildError { status: 500, message: format!("{file}: {}", diag.text), diagnostics: vec![diag] }
+}
+
+fn read(tenant: &Tenant, path: &str) -> Result<Option<String>, BuildError> {
+    tenant.read_text(path).map_err(|e| failed(path, e.to_string(), ""))
+}
+
+/// The path came out of `Tenant::list`, so absent here means unreadable, not missing.
+fn read_listed(tenant: &Tenant, path: &str) -> Result<String, BuildError> {
+    read(tenant, path)?.ok_or_else(|| failed(path, "the tenant lists this file but it cannot be read", ""))
+}
 
 #[derive(Serialize, Clone)]
 pub struct Heading {
@@ -45,21 +62,28 @@ pub fn split_frontmatter(src: &str) -> (Option<&str>, &str) {
     (None, src)
 }
 
-pub fn yaml_to_json(yaml: &str) -> Value {
+/// Empty frontmatter is no data; frontmatter that does not parse, or that is not a mapping, is a
+/// file whose data could not be read — served as `{}` it renders a page with every field missing.
+pub fn yaml_to_json(yaml: &str) -> Result<Value, String> {
     if yaml.trim().is_empty() {
-        return Value::Object(Map::new());
+        return Ok(Value::Object(Map::new()));
     }
     match serde_yaml::from_str::<Value>(yaml) {
-        Ok(v @ Value::Object(_)) => v,
-        _ => Value::Object(Map::new()),
+        Ok(v @ Value::Object(_)) => Ok(v),
+        Ok(_) => Err("frontmatter is not a mapping of keys to values".into()),
+        Err(e) => Err(format!("frontmatter is not valid YAML: {e}")),
     }
 }
 
-pub fn parse_markdown(src: &str) -> Md {
+pub fn frontmatter(src: &str) -> Result<(Value, &str), String> {
     let (fm, body) = split_frontmatter(src);
-    let frontmatter = fm.map(yaml_to_json).unwrap_or_else(|| Value::Object(Map::new()));
+    Ok((fm.map(yaml_to_json).transpose()?.unwrap_or_else(|| Value::Object(Map::new())), body))
+}
+
+pub fn parse_markdown(src: &str) -> Result<Md, String> {
+    let (frontmatter, body) = frontmatter(src)?;
     let (html, headings) = render(body);
-    Md { frontmatter, body: body.to_string(), html, headings }
+    Ok(Md { frontmatter, body: body.to_string(), html, headings })
 }
 
 fn render(body: &str) -> (String, Vec<Heading>) {
@@ -113,57 +137,57 @@ pub fn slugify(text: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-pub fn collection_json(tenant: &Tenant, name: &str, max_config_bytes: usize) -> Value {
-    let def = config(tenant, max_config_bytes).remove(name).unwrap_or_default();
+pub fn collection_json(tenant: &Tenant, name: &str, max_config_bytes: usize) -> Result<Value, BuildError> {
+    let (config_path, mut defs) = config(tenant, max_config_bytes)?;
+    let def = defs.remove(name).unwrap_or_default();
+    let config_path = config_path.unwrap_or_else(|| CONFIG_PATHS[0].to_string());
     let entries = match &def.loader {
-        Some(Loader::Glob { patterns, base }) => glob_entries(tenant, name, patterns, base),
-        Some(Loader::File { path }) => file_entries(tenant, name, path),
-        None => dir_entries(tenant, name),
+        Some(Loader::Glob { patterns, base }) => glob_entries(tenant, name, patterns, base, &config_path)?,
+        Some(Loader::File { path }) => file_entries(tenant, name, path, &config_path)?,
+        None => dir_entries(tenant, name)?,
     };
-    json!({ "entries": entries, "dates": def.dates })
+    Ok(json!({ "entries": entries, "dates": def.dates }))
 }
 
-pub fn empty_collection() -> Value {
-    json!({ "entries": [], "dates": Value::Null })
-}
-
-fn dir_entries(tenant: &Tenant, name: &str) -> Vec<Value> {
+fn dir_entries(tenant: &Tenant, name: &str) -> Result<Vec<Value>, BuildError> {
     let prefix = format!("src/content/{name}/");
     let mut entries = Vec::new();
     for e in tenant.list() {
         let Some(id) = e.path.strip_prefix(&prefix).and_then(entry_id) else { continue };
-        push_file(tenant, name, &e.path, &id, &mut entries);
+        push_file(tenant, name, &e.path, &id, &mut entries)?;
     }
-    entries
+    Ok(entries)
 }
 
-fn glob_entries(tenant: &Tenant, name: &str, patterns: &[String], base: &str) -> Vec<Value> {
+fn glob_entries(tenant: &Tenant, name: &str, patterns: &[String], base: &str, config_path: &str) -> Result<Vec<Value>, BuildError> {
     let files: Vec<String> = tenant.list().into_iter().map(|e| e.path).collect();
+    let matched = glob_matches(&files, patterns, base).map_err(|e| failed(config_path, e, "check the collection's glob pattern"))?;
     let mut entries = Vec::new();
-    for (path, id) in glob_matches(&files, patterns, base) {
-        push_file(tenant, name, &path, &id, &mut entries);
+    for (path, id) in matched {
+        push_file(tenant, name, &path, &id, &mut entries)?;
     }
-    entries
+    Ok(entries)
 }
 
 /// The files a glob loader picks up, each with the id Astro derives from its path relative to `base`.
-fn glob_matches(files: &[String], patterns: &[String], base: &str) -> Vec<(String, String)> {
+/// A pattern that does not compile is refused: dropped, it silently narrows the collection.
+fn glob_matches(files: &[String], patterns: &[String], base: &str) -> Result<Vec<(String, String)>, String> {
     let (mut pos, mut neg) = (GlobSetBuilder::new(), GlobSetBuilder::new());
     for p in patterns {
         let (negated, p) = match p.strip_prefix('!') {
             Some(rest) => (true, rest),
             None => (false, p.as_str()),
         };
-        let Ok(g) = GlobBuilder::new(&join(base, p)).literal_separator(true).build() else { continue };
+        let g = GlobBuilder::new(&join(base, p)).literal_separator(true).build().map_err(|e| format!("pattern '{p}': {e}"))?;
         if negated { &mut neg } else { &mut pos }.add(g);
     }
-    let (Ok(pos), Ok(neg)): (Result<GlobSet, _>, Result<GlobSet, _>) = (pos.build(), neg.build()) else { return Vec::new() };
+    let (pos, neg): (GlobSet, GlobSet) = (pos.build().map_err(|e| e.to_string())?, neg.build().map_err(|e| e.to_string())?);
     let prefix = if base.is_empty() { String::new() } else { format!("{base}/") };
-    files
+    Ok(files
         .iter()
         .filter(|p| pos.is_match(p.as_str()) && !neg.is_match(p.as_str()))
         .filter_map(|p| Some((p.clone(), entry_id(p.strip_prefix(prefix.as_str())?)?)))
-        .collect()
+        .collect())
 }
 
 fn entry_id(relative: &str) -> Option<String> {
@@ -171,18 +195,20 @@ fn entry_id(relative: &str) -> Option<String> {
     Some(stem.to_ascii_lowercase())
 }
 
-fn file_entries(tenant: &Tenant, name: &str, path: &str) -> Vec<Value> {
-    let Some(text) = tenant.read_text(path) else { return Vec::new() };
+fn file_entries(tenant: &Tenant, name: &str, path: &str, config_path: &str) -> Result<Vec<Value>, BuildError> {
+    let Some(text) = read(tenant, path)? else {
+        return Err(failed(config_path, format!("the file() loader of '{name}' points at '{path}', which this tenant does not have"), ""));
+    };
     let parsed = match path.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("yaml" | "yml") => serde_yaml::from_str::<Value>(&text).ok(),
-        _ => serde_json::from_str::<Value>(&text).ok(),
+        Some("yaml" | "yml") => serde_yaml::from_str::<Value>(&text).map_err(|e| failed(path, format!("invalid YAML: {e}"), ""))?,
+        _ => serde_json::from_str::<Value>(&text).map_err(|e| failed(path, format!("invalid JSON: {e}"), ""))?,
     };
     match parsed {
-        Some(Value::Array(items)) => {
-            items.into_iter().enumerate().map(|(i, item)| entry(&item_id(&item, i), name, item, None, None, path)).collect()
+        Value::Array(items) => {
+            Ok(items.into_iter().enumerate().map(|(i, item)| entry(&item_id(&item, i), name, item, None, None, path)).collect())
         }
-        Some(Value::Object(items)) => items.into_iter().map(|(id, item)| entry(&id, name, item, None, None, path)).collect(),
-        _ => Vec::new(),
+        Value::Object(items) => Ok(items.into_iter().map(|(id, item)| entry(&id, name, item, None, None, path)).collect()),
+        _ => Err(failed(path, "a file() loader needs an array of entries or an object keyed by id", "")),
     }
 }
 
@@ -195,31 +221,33 @@ fn item_id(item: &Value, index: usize) -> String {
     }
 }
 
-fn push_file(tenant: &Tenant, name: &str, path: &str, id: &str, entries: &mut Vec<Value>) {
-    let Some((_, ext)) = path.rsplit_once('.') else { return };
-    let Some(text) = tenant.read_text(path) else { return };
+fn push_file(tenant: &Tenant, name: &str, path: &str, id: &str, entries: &mut Vec<Value>) -> Result<(), BuildError> {
+    // An extension the reader has no format for is not an entry, the way it is not one to Astro.
+    let Some((_, ext)) = path.rsplit_once('.') else { return Ok(()) };
+    if !matches!(ext, "md" | "markdown" | "mdx" | "json" | "yaml" | "yml") {
+        return Ok(());
+    }
+    let text = read_listed(tenant, path)?;
     match ext {
         "md" | "markdown" => {
-            let md = parse_markdown(&text);
+            let md = parse_markdown(&text).map_err(|e| failed(path, e, ""))?;
             entries.push(entry(id, name, md.frontmatter, Some(&md.body), Some((md.html, md.headings)), path));
         }
         "mdx" => {
-            let (fm, body) = split_frontmatter(&text);
-            let data = fm.map(yaml_to_json).unwrap_or_else(|| Value::Object(Map::new()));
+            let (data, body) = frontmatter(&text).map_err(|e| failed(path, e, ""))?;
             entries.push(entry(id, name, data, Some(body.trim()), None, path));
         }
-        "json" => match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Array(items)) => {
+        "json" => match serde_json::from_str::<Value>(&text).map_err(|e| failed(path, format!("invalid JSON: {e}"), ""))? {
+            Value::Array(items) => {
                 for (i, item) in items.into_iter().enumerate() {
                     entries.push(entry(&item_id(&item, i), name, item, None, None, path));
                 }
             }
-            Ok(v) => entries.push(entry(id, name, v, None, None, path)),
-            Err(_) => {}
+            v => entries.push(entry(id, name, v, None, None, path)),
         },
-        "yaml" | "yml" => entries.push(entry(id, name, yaml_to_json(&text), None, None, path)),
-        _ => {}
+        _ => entries.push(entry(id, name, yaml_to_json(&text).map_err(|e| failed(path, e, ""))?, None, None, path)),
     }
+    Ok(())
 }
 
 fn entry(id: &str, collection: &str, data: Value, body: Option<&str>, rendered: Option<(String, Vec<Heading>)>, path: &str) -> Value {
@@ -263,23 +291,37 @@ const CONFIG_PATHS: [&str; 6] = [
 ];
 
 /// The config goes to oxc, which recurses over it. This is the one parsed source the content route
-/// reaches without going through `Engine::build`, so the size and nesting caps are applied here;
-/// past either, it is left unparsed and the collection falls back to the directory layout, as it
-/// does when there is no config at all.
-pub fn config(tenant: &Tenant, max_bytes: usize) -> BTreeMap<String, Definition> {
-    CONFIG_PATHS
-        .iter()
-        .find_map(|p| tenant.read_text(p))
-        .filter(|src| src.len() <= max_bytes && super::nesting_depth(src.as_bytes()) <= super::MAX_NESTING_DEPTH)
-        .map(|src| parse_config(&src))
-        .unwrap_or_default()
+/// reaches without going through `Engine::build`, so the size and nesting caps are applied here.
+/// No config at all is the directory layout; a config the caps refuse, or one that does not parse,
+/// is a collection whose shape is unknown — falling back to the directory layout there answers with
+/// somebody else's entries, or none.
+pub fn config(tenant: &Tenant, max_bytes: usize) -> Result<(Option<String>, BTreeMap<String, Definition>), BuildError> {
+    let mut found = None;
+    for p in CONFIG_PATHS {
+        if let Some(src) = read(tenant, p)? {
+            found = Some((p, src));
+            break;
+        }
+    }
+    let Some((path, src)) = found else { return Ok((None, BTreeMap::new())) };
+    if src.len() > max_bytes {
+        let text = format!("content config is {} KiB, over the {} KiB limit", src.len() / 1024, max_bytes / 1024);
+        return Err(failed(path, text, "raise --max-source-kb, or split the file"));
+    }
+    let depth = super::nesting_depth(src.as_bytes());
+    if depth > super::MAX_NESTING_DEPTH {
+        let text = format!("content config nests {depth} deep, over the {} level limit", super::MAX_NESTING_DEPTH);
+        return Err(failed(path, text, ""));
+    }
+    let defs = parse_config(&src).map_err(|e| failed(path, e, ""))?;
+    Ok((Some(path.to_string()), defs))
 }
 
-pub fn parse_config(source: &str) -> BTreeMap<String, Definition> {
+pub fn parse_config(source: &str) -> Result<BTreeMap<String, Definition>, String> {
     let allocator = Allocator::default();
     let ret = JsParser::new(&allocator, source, SourceType::ts()).parse();
-    if !ret.errors.is_empty() {
-        return BTreeMap::new();
+    if let Some(e) = ret.errors.first() {
+        return Err(format!("content config does not parse: {}", e.message));
     }
     let mut bindings: BTreeMap<&str, &Expression> = BTreeMap::new();
     for stmt in &ret.program.body {
@@ -297,7 +339,9 @@ pub fn parse_config(source: &str) -> BTreeMap<String, Definition> {
             }
         }
     }
-    let Some(Expression::ObjectExpression(collections)) = bindings.get("collections").copied() else { return BTreeMap::new() };
+    // A `collections` the reader cannot see through — built by a call, awaited — is the documented
+    // fallback to the directory layout, not a failure to read the file.
+    let Some(Expression::ObjectExpression(collections)) = bindings.get("collections").copied() else { return Ok(BTreeMap::new()) };
     let mut out = BTreeMap::new();
     for (name, value) in props(collections) {
         let value = match value {
@@ -309,7 +353,7 @@ pub fn parse_config(source: &str) -> BTreeMap<String, Definition> {
         };
         out.insert(name.into_owned(), definition(value));
     }
-    out
+    Ok(out)
 }
 
 fn definition(expr: &Expression) -> Definition {
@@ -437,7 +481,11 @@ fn strings(expr: &Expression) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::store::{Base, Store, UpdateKind};
 
     #[test]
     fn splits_frontmatter() {
@@ -451,7 +499,7 @@ mod tests {
 
     #[test]
     fn renders_headings() {
-        let md = parse_markdown("---\ntitle: T\n---\n## Hello World\ntext");
+        let md = parse_markdown("---\ntitle: T\n---\n## Hello World\ntext").unwrap();
         assert_eq!(md.frontmatter["title"], "T");
         assert_eq!(md.headings[0].slug, "hello-world");
         assert!(md.html.contains("<h2>Hello World</h2>"));
@@ -480,7 +528,8 @@ const posts = defineCollection({
 
 export const collections = { posts };
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg["posts"].loader, Some(glob(&["**/*.{md,mdx}"], "src/content/posts")));
         assert_eq!(cfg["posts"].dates.as_deref(), Some(["date", "updated", "meta.published"].map(String::from).as_slice()));
     }
@@ -496,7 +545,8 @@ const docs = defineCollection({ loader: glob({ base: `./src/docs`, pattern: ["**
 
 export const collections = { team, docs: docs };
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg["team"].loader, Some(Loader::File { path: "src/content/team.json".into() }));
         assert_eq!(cfg["team"].dates, None);
         assert_eq!(cfg["docs"].loader, Some(glob(&["**/*.md", "!**/_*.md"], "src/docs")));
@@ -511,7 +561,8 @@ const authors = defineCollection({
 });
 export const collections = { authors };
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg["authors"].loader, None);
         assert_eq!(cfg["authors"].dates.as_deref(), Some(["joined".to_string()].as_slice()));
     }
@@ -525,11 +576,19 @@ const base = process.env.CONTENT_DIR;
 const posts = defineCollection({ loader: glob({ pattern: patternsFor("posts"), base }), schema: buildSchema() });
 export const collections = { posts };
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(dynamic["posts"], Definition::default());
+        assert!(parse_config(r#"export const collections = await loadCollections();"#).unwrap().is_empty());
+    }
 
-        assert!(parse_config(r#"export const collections = await loadCollections();"#).is_empty());
-        assert!(parse_config("export const collections = {").is_empty());
+    /// Issue #48: a config the reader cannot see through falls back to the directory layout on
+    /// purpose; one that does not parse is a config nobody read, and the fallback then answers with
+    /// the wrong entries — or none — as if that were the tenant's own content.
+    #[test]
+    fn a_config_that_does_not_parse_is_an_error() {
+        let e = parse_config("export const collections = {").unwrap_err();
+        assert!(e.contains("does not parse"), "{e}");
     }
 
     #[test]
@@ -541,7 +600,7 @@ export const collections = { posts };
             .collect();
         let patterns = ["**/*.{md,mdx}".to_string(), "!**/_*.md".to_string()];
         assert_eq!(
-            glob_matches(&files, &patterns, "src/content/posts"),
+            glob_matches(&files, &patterns, "src/content/posts").unwrap(),
             vec![
                 ("src/content/posts/Hello World.md".to_string(), "hello world".to_string()),
                 ("src/content/posts/nested/Deep.md".to_string(), "nested/deep".to_string()),
@@ -552,6 +611,61 @@ export const collections = { posts };
     #[test]
     fn an_empty_base_matches_from_the_project_root() {
         let files = ["src/blog/a.md".to_string(), "src/blog/b.mdx".to_string()];
-        assert_eq!(glob_matches(&files, &["src/blog/*.md".to_string()], ""), vec![("src/blog/a.md".to_string(), "src/blog/a".to_string())]);
+        assert_eq!(
+            glob_matches(&files, &["src/blog/*.md".to_string()], "").unwrap(),
+            vec![("src/blog/a.md".to_string(), "src/blog/a".to_string())]
+        );
+    }
+
+    fn tenant(files: &[(&str, &str)]) -> Arc<Tenant> {
+        let store = Store::new(None, u64::MAX);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &root).unwrap());
+        let t = store.create_tenant("t", "starter").unwrap();
+        for (path, body) in files {
+            t.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
+        }
+        t
+    }
+
+    const MAX: usize = 64 << 10;
+
+    #[test]
+    fn a_collection_that_builds_answers_with_its_entries() {
+        let out = collection_json(&tenant(&[]), "posts", MAX).unwrap();
+        assert!(!out["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #48: each of these used to answer `{"entries": []}`, which renders as a tenant that
+    /// simply has no posts.
+    #[test]
+    fn a_collection_that_cannot_be_built_is_an_error() {
+        let broken_frontmatter = tenant(&[("src/content/posts/bad.md", "---\ntitle: \"unterminated\n---\nbody\n")]);
+        let e = collection_json(&broken_frontmatter, "posts", MAX).unwrap_err();
+        assert_eq!(e.status, 500);
+        assert!(e.message.contains("src/content/posts/bad.md") && e.message.contains("YAML"), "{}", e.message);
+        assert_eq!(e.diagnostics.len(), 1);
+
+        let bad_config = tenant(&[("src/content.config.ts", "export const collections = {")]);
+        let e = collection_json(&bad_config, "posts", MAX).unwrap_err();
+        assert!(e.message.contains("does not parse"), "{}", e.message);
+
+        let huge_config = tenant(&[("src/content.config.ts", &"// x\n".repeat(200))]);
+        let e = collection_json(&huge_config, "posts", 64).unwrap_err();
+        assert!(e.message.contains("over the") && e.message.contains("KiB limit"), "{}", e.message);
+
+        let missing_source = tenant(&[(
+            "src/content.config.ts",
+            "import { file } from \"astro/loaders\";\nexport const collections = { team: defineCollection({ loader: file(\"src/data/team.json\") }) };\n",
+        )]);
+        let e = collection_json(&missing_source, "team", MAX).unwrap_err();
+        assert!(e.message.contains("src/data/team.json"), "{}", e.message);
+    }
+
+    #[test]
+    fn an_entry_file_that_is_not_json_is_an_error() {
+        let t = tenant(&[("src/content/data/broken.json", "{ nope ")]);
+        let e = collection_json(&t, "data", MAX).unwrap_err();
+        assert!(e.message.contains("invalid JSON"), "{}", e.message);
     }
 }

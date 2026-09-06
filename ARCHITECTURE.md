@@ -470,6 +470,16 @@ entry per item, other JSON as one entry; `.yaml`/`.yml` as one entry. The
 compiled module at `/__sl/m/<filePath>` and returns its `Content`,
 `getHeadings()` and `frontmatter`.
 
+Every way the collection can fail to build answers **500** with the message and
+a diagnostic, and the shim throws it so the shell's error overlay renders it: a
+config past the size or nesting cap, a config that does not parse, a glob
+pattern that does not compile, a `file()` loader whose source is absent or
+malformed, and an entry file that is listed but cannot be read, whose JSON is
+invalid or whose frontmatter is not a YAML mapping. An empty collection means a
+collection with no entries and nothing else — a page rendered from a failed
+build is indistinguishable from a page rendered from a tenant that has no posts
+(issue #48).
+
 Which files those are comes from `src/content.config.ts` (or the Astro 2–4
 `src/content/config.ts`), parsed with oxc and never executed. `parse_config`
 maps `export const collections = { name: … }` to the `defineCollection({…})`
@@ -483,7 +493,8 @@ literal, which become the `dates` list the shim turns into `Date` objects.
 Anything the reader cannot see through — a computed pattern, a custom loader,
 a schema built by a function — leaves that part unset, and the collection
 falls back to `src/content/<name>/` with the shim's ISO-shaped-string guess
-for dates.
+for dates. That fallback is for a config the reader read and could not follow;
+a config it could not read at all is the error above.
 
 ## `check` (`src/check.rs`)
 
@@ -555,6 +566,7 @@ src/transform/scss.rs  grass over a tenant snapshot, size and time limits, finge
 src/transform/glob.rs  import.meta.glob detection and expansion
 src/transform/sfc.rs   TypeScript out of the <script> blocks of a .vue or .svelte file
 src/transform/markdown.rs, content.rs   Markdown pages and collections
+src/silent_failures.rs the check that reads src/ for failures answered as empty content (#48)
 src/transform/mdx.rs   MDX pages and entries through satteri-mdxjs
 src/check.rs           the check subcommand
 assets/shell.html, shell.js, live.js    the browser side of a render

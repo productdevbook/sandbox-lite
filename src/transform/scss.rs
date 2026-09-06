@@ -313,7 +313,7 @@ pub fn fingerprint(tenant: &Tenant) -> u64 {
     let mut buf = Vec::new();
     for e in tenant.list() {
         if is_sass_path(&e.path)
-            && let Some(bytes) = tenant.read(&e.path)
+            && let Ok(Some(bytes)) = tenant.read(&e.path)
         {
             buf.extend_from_slice(e.path.as_bytes());
             buf.push(0);

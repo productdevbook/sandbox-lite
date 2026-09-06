@@ -4,6 +4,10 @@ pub const SHIM_PREFIX: &str = "/__sl/shim/";
 const EXTS: &[&str] = &["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", ".json", ".astro", ".md", ".mdx", ".vue", ".svelte"];
 const INDEX: &[&str] = &["/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.astro"];
 
+fn read_config(tenant: &Tenant, path: &str) -> Result<Option<String>, String> {
+    tenant.read_text(path).map_err(|e| format!("{path}: {e}"))
+}
+
 pub struct Resolver<'a> {
     tenant: &'a Tenant,
     cdn: &'a str,
@@ -14,11 +18,14 @@ pub struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
-    pub fn new(tenant: &'a Tenant, cdn: &'a str, version: u64) -> Self {
-        let aliases = tenant.read_text("tsconfig.json").map(|t| tsconfig_paths(&t)).unwrap_or_default();
-        let imports = tenant.read_text("sandbox-lite.json").map(|t| import_map(&t)).unwrap_or_default();
-        let deps = package_deps(tenant);
-        Resolver { tenant, cdn, version, aliases, imports, deps }
+    /// A config file the tenant does not have is no aliases and no import map. One it has that does
+    /// not parse is refused: dropped, every specifier it would have redirected silently resolves to
+    /// a CDN URL instead of the tenant's own file.
+    pub fn new(tenant: &'a Tenant, cdn: &'a str, version: u64) -> Result<Self, String> {
+        let aliases = read_config(tenant, "tsconfig.json")?.map(|t| tsconfig_paths(&t)).transpose()?.unwrap_or_default();
+        let imports = read_config(tenant, "sandbox-lite.json")?.map(|t| import_map(&t)).transpose()?.unwrap_or_default();
+        let deps = package_deps(tenant)?;
+        Ok(Resolver { tenant, cdn, version, aliases, imports, deps })
     }
 
     pub fn version(&self) -> u64 {
@@ -126,9 +133,9 @@ pub fn package_name(spec: &str) -> (&str, &str) {
     if idx == 0 { (spec, "") } else { (&spec[..idx], &spec[idx..]) }
 }
 
-pub fn package_deps(tenant: &Tenant) -> Vec<(String, String)> {
-    let Some(text) = tenant.read_text("package.json") else { return vec![] };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![] };
+pub fn package_deps(tenant: &Tenant) -> Result<Vec<(String, String)>, String> {
+    let Some(text) = read_config(tenant, "package.json")? else { return Ok(vec![]) };
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("package.json: {e}"))?;
     let mut out = Vec::new();
     for key in ["dependencies", "devDependencies"] {
         if let Some(map) = json.get(key).and_then(|d| d.as_object()) {
@@ -139,7 +146,7 @@ pub fn package_deps(tenant: &Tenant) -> Vec<(String, String)> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -150,8 +157,8 @@ pub struct RendererCfg {
 }
 
 /// Framework renderers the preview should register, from package.json integrations and `sandbox-lite.json`.
-pub fn renderers(tenant: &Tenant, cdn: &str) -> Vec<RendererCfg> {
-    let deps = package_deps(tenant);
+pub fn renderers(tenant: &Tenant, cdn: &str) -> Result<Vec<RendererCfg>, String> {
+    let deps = package_deps(tenant)?;
     let range = |name: &str| deps.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone());
     let mut out = Vec::new();
     if let Some(r) = range("@astrojs/react") {
@@ -187,8 +194,7 @@ pub fn renderers(tenant: &Tenant, cdn: &str) -> Vec<RendererCfg> {
             client: Some(shim_url("renderer-svelte-client")),
         });
     }
-    if let Some(text) = tenant.read_text("sandbox-lite.json")
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text))
+    if let Some(json) = sandbox_lite_json(tenant)?
         && let Some(list) = json.get("renderers").and_then(|r| r.as_array())
     {
         for item in list {
@@ -204,24 +210,31 @@ pub fn renderers(tenant: &Tenant, cdn: &str) -> Vec<RendererCfg> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// `@vue/compiler-sfc` must match the `vue` it compiles for, and an Astro project never lists it.
-pub fn vue_compiler_url(tenant: &Tenant, cdn: &str) -> String {
-    let deps = package_deps(tenant);
+pub fn vue_compiler_url(tenant: &Tenant, cdn: &str) -> Result<String, String> {
+    let deps = package_deps(tenant)?;
     let range = deps.iter().find(|(n, _)| n == "@vue/compiler-sfc").or_else(|| deps.iter().find(|(n, _)| n == "vue"));
     let spec = match range {
         Some((_, r)) if !r.is_empty() && !r.contains(':') && !r.starts_with("file") => format!("@vue/compiler-sfc@{r}"),
         _ => "@vue/compiler-sfc".to_string(),
     };
-    format!("{}/{spec}", cdn.trim_end_matches('/'))
+    Ok(format!("{}/{spec}", cdn.trim_end_matches('/')))
 }
 
-pub fn tenant_site(tenant: &Tenant) -> Option<String> {
-    let text = tenant.read_text("sandbox-lite.json")?;
-    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
-    json.get("site")?.as_str().map(|s| s.to_string())
+fn sandbox_lite_json(tenant: &Tenant) -> Result<Option<serde_json::Value>, String> {
+    let Some(text) = read_config(tenant, "sandbox-lite.json")? else { return Ok(None) };
+    serde_json::from_str(&strip_jsonc(&text)).map(Some).map_err(|e| format!("sandbox-lite.json: {e}"))
+}
+
+/// `Astro.site`, which the compiler bakes into every module. A `sandbox-lite.json` that does not
+/// parse leaves it undefined, and a canonical URL or an RSS feed built from it is then wrong
+/// without saying so.
+pub fn tenant_site(tenant: &Tenant) -> Result<Option<String>, String> {
+    let Some(json) = sandbox_lite_json(tenant)? else { return Ok(None) };
+    Ok(json.get("site").and_then(|s| s.as_str()).map(|s| s.to_string()))
 }
 
 fn is_external(spec: &str) -> bool {
@@ -351,11 +364,11 @@ pub fn strip_jsonc(text: &str) -> String {
     out
 }
 
-pub(crate) fn tsconfig_paths(text: &str) -> Vec<(String, String)> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else { return vec![] };
-    let Some(co) = json.get("compilerOptions") else { return vec![] };
+pub(crate) fn tsconfig_paths(text: &str) -> Result<Vec<(String, String)>, String> {
+    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| format!("tsconfig.json: {e}"))?;
+    let Some(co) = json.get("compilerOptions") else { return Ok(vec![]) };
     let base_url = co.get("baseUrl").and_then(|b| b.as_str()).unwrap_or(".");
-    let Some(paths) = co.get("paths").and_then(|p| p.as_object()) else { return vec![] };
+    let Some(paths) = co.get("paths").and_then(|p| p.as_object()) else { return Ok(vec![]) };
     let mut out = Vec::new();
     for (key, targets) in paths {
         let Some(target) = targets.as_array().and_then(|a| a.first()).and_then(|t| t.as_str()) else { continue };
@@ -365,15 +378,15 @@ pub(crate) fn tsconfig_paths(text: &str) -> Vec<(String, String)> {
         out.push((key, target));
     }
     out.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-    out
+    Ok(out)
 }
 
-pub(crate) fn import_map(text: &str) -> Vec<(String, String)> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else { return vec![] };
-    let Some(imports) = json.get("imports").and_then(|p| p.as_object()) else { return vec![] };
+pub(crate) fn import_map(text: &str) -> Result<Vec<(String, String)>, String> {
+    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| format!("sandbox-lite.json: {e}"))?;
+    let Some(imports) = json.get("imports").and_then(|p| p.as_object()) else { return Ok(vec![]) };
     let mut out: Vec<(String, String)> = imports.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
     out.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -416,8 +429,16 @@ mod tests {
     #[test]
     fn parses_tsconfig_aliases() {
         let t = r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"],"@utils":["./src/utils/index.ts"]}}}"#;
-        let a = tsconfig_paths(t);
+        let a = tsconfig_paths(t).unwrap();
         assert!(a.contains(&("@/".to_string(), "src/".to_string())));
         assert!(a.contains(&("@utils".to_string(), "src/utils/index.ts".to_string())));
+    }
+
+    /// Issue #48: dropped, an alias table that does not parse sends `@/lib/x` to the CDN, where it
+    /// is a package that does not exist — with nothing said about the tsconfig that caused it.
+    #[test]
+    fn a_config_that_does_not_parse_is_an_error() {
+        assert!(tsconfig_paths(r#"{"compilerOptions":{"paths":}"#).is_err());
+        assert!(import_map("{ not json").is_err());
     }
 }

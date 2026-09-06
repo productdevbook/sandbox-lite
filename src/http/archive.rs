@@ -256,7 +256,7 @@ mod tests {
 
     fn bytes_of(f: &Fixture, id: &str) -> Vec<(String, Vec<u8>)> {
         let t = f.state.store.tenant(id).unwrap();
-        t.list().into_iter().map(|e| (e.path.clone(), t.read(&e.path).unwrap().to_vec())).collect()
+        t.list().into_iter().map(|e| (e.path.clone(), t.read(&e.path).unwrap().unwrap().to_vec())).collect()
     }
 
     fn tar_gz(entries: &[(&str, EntryType, &[u8])]) -> Vec<u8> {
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Value>(&report).unwrap()["deleted"], 1);
         let t = f.state.store.tenant("a").unwrap();
         assert_eq!(t.overlay_stats().0, 1);
-        assert_eq!(t.read_text("src/pages/index.astro").as_deref(), Some("<h1>base</h1>\n"));
+        assert_eq!(t.read_text("src/pages/index.astro").unwrap().as_deref(), Some("<h1>base</h1>\n"));
         assert!(!f.root.join("data/a/files/src/pages/index.astro").exists());
     }
 

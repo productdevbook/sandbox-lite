@@ -282,12 +282,14 @@ impl Tenant {
         self.data(path).is_some()
     }
 
-    pub fn read(&self, path: &str) -> Option<Arc<[u8]>> {
-        self.data(path).and_then(|d| d.read().ok())
+    /// `Ok(None)` is a file the tenant does not have; `Err` is one it has and could not read. A
+    /// `FileData::Disk` entry is re-read on every access, so the two are different answers.
+    pub fn read(&self, path: &str) -> io::Result<Option<Arc<[u8]>>> {
+        self.data(path).map(|d| d.read()).transpose()
     }
 
-    pub fn read_text(&self, path: &str) -> Option<String> {
-        self.read(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+    pub fn read_text(&self, path: &str) -> io::Result<Option<String>> {
+        Ok(self.read(path)?.map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
     pub fn list(&self) -> Vec<Entry> {
@@ -458,7 +460,8 @@ impl Tenant {
             overlay.insert(p, Some(d));
         }
         if let Ok(raw) = std::fs::read(dir.join("deleted.json")) {
-            let list: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+            // A tombstone list that is dropped brings deleted files back, which is not the tenant.
+            let list: Vec<String> = serde_json::from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             for p in list {
                 overlay.entry(p).or_insert(None);
             }
@@ -600,7 +603,9 @@ impl Store {
         }
         let dir = data_dir.join(id);
         let meta = std::fs::read(dir.join("tenant.json")).map_err(|e| format!("tenant.json: {e}"))?;
-        let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap_or_default();
+        // Read as null, a tenant.json that does not parse is reported as an unloaded base '' rather
+        // than as the unreadable file it is.
+        let meta: serde_json::Value = serde_json::from_slice(&meta).map_err(|e| format!("tenant.json does not parse: {e}"))?;
         let base_name = meta.get("base").and_then(|b| b.as_str()).unwrap_or("");
         let base = self.base(base_name).ok_or_else(|| format!("base '{base_name}' is not loaded"))?;
         let tenant = Tenant::new(id.to_string(), base, Some(dir.clone()), self.tenant_quota);
@@ -614,16 +619,17 @@ impl Store {
         v
     }
 
-    pub fn remove_tenant(&self, id: &str) -> bool {
-        let removed = self.tenants.write().unwrap().remove(id);
-        if let Some(t) = removed {
-            if let Some(dir) = &t.dir {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-            true
-        } else {
-            false
+    /// `Ok(false)` is a tenant that was not there. A data directory that survives the delete is an
+    /// error: it answered 204 and the tenant comes back at the next restore.
+    pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
+        let Some(t) = self.tenants.write().unwrap().remove(id) else { return Ok(false) };
+        if let Some(dir) = &t.dir
+            && let Err(e) = std::fs::remove_dir_all(dir)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(e);
         }
+        Ok(true)
     }
 
     pub fn restore(&self) -> io::Result<usize> {
@@ -691,10 +697,10 @@ mod tests {
         let (base, repointed) = store.reload_base("theme").unwrap().unwrap();
 
         assert_eq!(repointed, vec!["acme".to_string()], "only tenants on that base are re-pointed");
-        assert_eq!(t.read_text(PAGE).as_deref(), Some("<h1>two</h1>\n"));
+        assert_eq!(t.read_text(PAGE).unwrap().as_deref(), Some("<h1>two</h1>\n"));
         assert_eq!(t.base().name, base.name);
         assert!(Arc::ptr_eq(&t.base(), &base), "the tenant holds the fresh base, not a copy of the old one");
-        assert_eq!(t.read_text("src/pages/mine.astro").as_deref(), Some("<h1>mine</h1>"), "the overlay survives a reload");
+        assert_eq!(t.read_text("src/pages/mine.astro").unwrap().as_deref(), Some("<h1>mine</h1>"), "the overlay survives a reload");
         assert!(t.version() > version, "an open preview reloads on the new version");
         assert_eq!(untouched.version(), other_version, "a tenant on another base is not disturbed");
         let event = events.try_recv().unwrap();
@@ -719,7 +725,7 @@ mod tests {
 
         seed(root.join("theme").join(PAGE), "<h1>two, and longer</h1>\n");
         assert_eq!(store.reload_changed_bases(), vec!["theme".to_string()]);
-        assert_eq!(t.read_text(PAGE).as_deref(), Some("<h1>two, and longer</h1>\n"));
+        assert_eq!(t.read_text(PAGE).unwrap().as_deref(), Some("<h1>two, and longer</h1>\n"));
         assert!(store.reload_changed_bases().is_empty(), "the reloaded base is the new stamp");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -738,7 +744,7 @@ mod tests {
 
         assert!(b.tenants().is_empty(), "node b learned nothing from node a's write");
         let tb = b.tenant("acme").unwrap();
-        assert_eq!(tb.read_text(PAGE).as_deref(), Some("<h1>from a</h1>"), "the miss restored the tenant from the data dir");
+        assert_eq!(tb.read_text(PAGE).unwrap().as_deref(), Some("<h1>from a</h1>"), "the miss restored the tenant from the data dir");
         assert_eq!(b.tenants().len(), 1);
         assert!(Arc::ptr_eq(&tb, &b.tenant("acme").unwrap()), "a restored tenant is registered, not rebuilt per request");
         assert!(b.tenant("nobody").is_none());
@@ -747,7 +753,7 @@ mod tests {
         // the gap docs/multi-node.md names: node b holds the tenant now, and nothing tells it that
         // node a wrote again. Sticky routing per tenant is what keeps this from being reachable.
         ta.write(PAGE, b"<h1>from a, later</h1>".to_vec(), UpdateKind::Module).unwrap();
-        assert_eq!(tb.read_text(PAGE).as_deref(), Some("<h1>from a</h1>"));
+        assert_eq!(tb.read_text(PAGE).unwrap().as_deref(), Some("<h1>from a</h1>"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

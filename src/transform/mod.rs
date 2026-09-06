@@ -443,7 +443,10 @@ impl Engine {
     }
 
     pub fn build(&self, tenant: &Tenant, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
-        let data = tenant.read(path).ok_or_else(|| BuildError::not_found(path))?;
+        let data = tenant
+            .read(path)
+            .map_err(|e| BuildError::compile(format!("{path}: {e}"), vec![]))?
+            .ok_or_else(|| BuildError::not_found(path))?;
         let built = self.build_bytes(tenant, path, kind, &data)?;
         self.remember(tenant, path, kind, &built);
         Ok(built)
@@ -453,7 +456,7 @@ impl Engine {
     /// the bytes of a write before it lands is the compile the next module request would have paid
     /// for anyway.
     fn build_bytes(&self, tenant: &Tenant, path: &str, kind: Kind, data: &[u8]) -> Result<Arc<Built>, BuildError> {
-        let site = crate::resolve::tenant_site(tenant);
+        let site = crate::resolve::tenant_site(tenant).map_err(|e| BuildError::compile(e, vec![]))?;
         let mut h = Vec::with_capacity(data.len() + path.len() + 32);
         h.extend_from_slice(kind.tag().as_bytes());
         h.push(0);
@@ -596,7 +599,7 @@ impl Engine {
                     }
                     "vue" | "svelte" => Ok(Built::js(sfc_loader(&ext, path, &sfc::strip_types(&ext, path, &text())?))),
                     "json" => Ok(Built::js(format!("export default JSON.parse({});\n", json_str(&text())))),
-                    "md" => Ok(Built::scanned(markdown::page_module(path, &text()))),
+                    "md" => Ok(Built::scanned(markdown::page_module(path, &text())?)),
                     "mdx" => Ok(Built::scanned(mdx::page_module(path, &text())?)),
                     "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "ico" | "bmp" | "tiff" => {
                         let (w, h) = if ext == "svg" {
@@ -749,7 +752,7 @@ mod tests {
     }
 
     fn served(engine: &Engine, tenant: &Tenant) -> String {
-        engine.serve(tenant, PAGE_PATH, Kind::Module, &Resolver::new(tenant, "https://esm.sh", 7)).unwrap().0
+        engine.serve(tenant, PAGE_PATH, Kind::Module, &Resolver::new(tenant, "https://esm.sh", 7).unwrap()).unwrap().0
     }
 
     const CAP: usize = 64 << 10;
@@ -894,14 +897,17 @@ mod tests {
     }
 
     /// `src/content.config.ts` goes to oxc from the content route, which does not go through `build`.
+    /// Issue #48: past either limit it is refused rather than read as no collections at all — a
+    /// config nobody parsed is not a tenant whose collections live in the default directory.
     #[test]
-    fn a_content_config_past_either_limit_is_not_parsed() {
+    fn a_content_config_past_either_limit_is_refused() {
         let good = "export const collections = { posts: defineCollection({}) };";
         let t = tenant_with("src/content.config.ts", good);
-        assert!(!crate::transform::content::config(&t, CAP).is_empty());
+        assert!(!crate::transform::content::config(&t, CAP).unwrap().1.is_empty());
         for source in [&"a".repeat(CAP + 1), &"[".repeat(MAX_NESTING_DEPTH + 1)] {
             let t = tenant_with("src/content.config.ts", source);
-            assert!(crate::transform::content::config(&t, CAP).is_empty());
+            let e = crate::transform::content::config(&t, CAP).unwrap_err();
+            assert!(e.message.contains("over the"), "{}", e.message);
         }
     }
 

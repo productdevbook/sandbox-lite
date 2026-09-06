@@ -8,6 +8,8 @@ mod transform;
 
 #[cfg(test)]
 mod proptests;
+#[cfg(test)]
+mod silent_failures;
 
 use std::path::PathBuf;
 use std::sync::Arc;
