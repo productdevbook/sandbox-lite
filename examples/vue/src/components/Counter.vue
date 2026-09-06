@@ -1,12 +1,12 @@
-<script setup>
-import { ref } from "vue";
+<script setup lang="ts">
+import { ref, type PropType } from "vue";
 
 const props = defineProps({
-  label: { type: String, required: true },
-  start: { type: Number, default: 0 },
+  label: { type: String as PropType<string>, required: true },
+  start: { type: Number as PropType<number>, default: 0 },
 });
 
-const n = ref(props.start);
+const n = ref<number>(props.start);
 </script>
 
 <template>

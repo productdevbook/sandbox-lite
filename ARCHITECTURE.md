@@ -181,7 +181,7 @@ What `compile` does per kind and extension:
 | `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`) |
 | `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
-| `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser |
+| `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source — its `<script lang="ts">` blocks already stripped to JavaScript by `transform::sfc` — to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser |
 | images | `export default { src: "/__sl/raw/…", width, height, format, fsPath }` |
 | `Style(i)` / `Script(i)` | builds the `.astro` module (cached) and returns its i-th CSS block or script as its own module |
 | `Raw` / `Url` | the text as a string export / the `/__sl/raw/` URL as a string export |
@@ -194,6 +194,26 @@ three-line loader that carries the source as a string literal and calls
 `/__sl/shim/vue-loader.js` or `/__sl/shim/svelte-loader.js` with it and with
 `import.meta.url`. The loader runs `@vue/compiler-sfc` or `svelte/compiler` in
 the browser and imports the result as a blob module.
+
+The script the loader receives is always JavaScript. `transform::sfc` finds
+every `<script>` element in the file, and for each one that says `lang="ts"`
+runs its text through the same oxc transform as a `.ts` file — a `.vue` file's
+`<script>` and `<script setup>`, a `.svelte` file's instance and
+`context="module"` blocks, all of them. Only the `lang` attribute is dropped;
+`setup`, `context` and the rest survive byte for byte, and the compiled script
+is padded back to the line count of the block it replaces so the SFC compiler's
+own diagnostics still name the right line of the template below it. A type
+error is reported like any other file's, at its line in the `.vue` or
+`.svelte` file, and `sandbox-lite check` sees it too.
+
+Stripping ahead of `@vue/compiler-sfc` costs the macros that take a type and no
+arguments — `defineProps<Props>()`, `defineEmits`, `defineModel`, `defineSlots`
+and `<script setup generic="…">` — because the compiler reads those types out of
+the source to generate the runtime declaration, and by then they are gone.
+Rather than emit a component with no props, the daemon refuses the file with a
+diagnostic that names the macro and asks for the runtime form. Doing better
+means stripping *after* `compileScript`, which needs a TypeScript transform on
+the browser side of the pipeline.
 
 A blob module has no import map, so the loader rewrites the compiler's output
 before creating the blob: `vue`/`svelte` specifiers become CDN URLs, relative
@@ -439,6 +459,7 @@ src/transform/js.rs    oxc transform and import scanning
 src/transform/css.rs   CSS-as-module, relative URL rewriting
 src/transform/scss.rs  grass over a tenant snapshot, size and time limits, fingerprint
 src/transform/glob.rs  import.meta.glob detection and expansion
+src/transform/sfc.rs   TypeScript out of the <script> blocks of a .vue or .svelte file
 src/transform/markdown.rs, content.rs   Markdown pages and collections
 src/transform/mdx.rs   MDX pages and entries through satteri-mdxjs
 src/check.rs           the check subcommand
