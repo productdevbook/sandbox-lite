@@ -32,7 +32,9 @@ pub struct Diag {
     pub column: u32,
 }
 
-#[derive(Debug)]
+/// Clone so one compile can answer every caller that waited on it: the followers of an in-flight
+/// build get the leader's failure, diagnostics and all, rather than compiling again to rediscover it.
+#[derive(Debug, Clone)]
 pub struct BuildError {
     pub status: u16,
     pub message: String,
@@ -251,6 +253,9 @@ pub struct CacheStats {
     pub bytes: usize,
     pub hits: u64,
     pub misses: u64,
+    /// Misses that waited on a compile of the same key already running instead of starting a second
+    /// one, so `misses - coalesced` is what the daemon actually compiled.
+    pub coalesced: u64,
 }
 
 struct Cache {
@@ -259,6 +264,7 @@ struct Cache {
     bytes: usize,
     hits: u64,
     misses: u64,
+    coalesced: u64,
 }
 
 /// How long a compile waits for a permit before its request is refused. Long enough to absorb the
@@ -421,6 +427,50 @@ impl Gate {
     }
 }
 
+/// A compile of one cache key that other callers may wait on. Issue #55: `build` looked the cache
+/// up, queued for a permit and did not look again, so N simultaneous requests for one cold module
+/// each compiled it. The results are identical — the cache is content-addressed — so what the herd
+/// costs is CPU and permits, precisely when the daemon is busiest.
+#[derive(Default)]
+struct Inflight {
+    done: Mutex<Option<Result<Arc<Built>, BuildError>>>,
+    ready: Condvar,
+}
+
+/// What a caller asking for a key gets: the right to compile it and answer for it, the right to
+/// compile it for itself alone, or the answer the compile already running for it gave.
+enum Join<'a> {
+    Lead(Lead<'a>),
+    Solo,
+    Waited(Result<Arc<Built>, BuildError>),
+}
+
+/// The one caller compiling a key. Its drop takes the key out of the map and wakes everyone
+/// waiting, so a panic on the way through hands them an answer rather than leaving them there.
+struct Lead<'a> {
+    engine: &'a Engine,
+    key: u128,
+    flight: Arc<Inflight>,
+}
+
+impl Lead<'_> {
+    fn settle(&self, outcome: &Result<Arc<Built>, BuildError>) {
+        *self.flight.done.lock().unwrap() = Some(outcome.clone());
+    }
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        self.engine.inflight.lock().unwrap().remove(&self.key);
+        let mut done = self.flight.done.lock().unwrap();
+        if done.is_none() {
+            *done = Some(Err(BuildError::busy("the compile this request was waiting on ended without an answer".into())));
+        }
+        drop(done);
+        self.flight.ready.notify_all();
+    }
+}
+
 /// Marks the thread running a permitted compile, and restores the flag on the way out so a thread
 /// that builds again afterwards queues for a permit of its own.
 struct Compiling(bool);
@@ -449,6 +499,9 @@ pub struct Engine(Arc<EngineInner>);
 pub struct EngineInner {
     pub cfg: Config,
     cache: Mutex<Cache>,
+    /// Cache keys being compiled right now, so the second caller for one waits instead of
+    /// duplicating the compile and the permit it costs.
+    inflight: Mutex<HashMap<u128, Arc<Inflight>>>,
     /// The JS each `.astro` module last compiled to, so a write can be told apart from an edit that
     /// only moved a `<style>` block. Written by every module build, read once per write.
     last_js: Mutex<HashMap<(String, String), u128>>,
@@ -471,11 +524,20 @@ impl Engine {
         Engine::with_gate(cfg, metrics, gate)
     }
 
+    /// An engine whose compile gate is built to order. Neither the queue deadline nor the runaway
+    /// cap is a flag, and a limit of zero — a gate no compile can ever pass — is how a test says
+    /// "every permit is busy" without holding one.
+    #[cfg(test)]
+    pub(crate) fn gated(cfg: Config, metrics: Arc<Metrics>, limit: usize, wait: Duration, max_runaway: usize) -> Engine {
+        Engine::with_gate(cfg, metrics, Gate::new(limit, wait, max_runaway))
+    }
+
     fn with_gate(cfg: Config, metrics: Arc<Metrics>, gate: Gate) -> Engine {
         let sass = scss::Sass::new(cfg.sass_timeout);
         Engine(Arc::new(EngineInner {
             cfg,
-            cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0 }),
+            cache: Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, hits: 0, misses: 0, coalesced: 0 }),
+            inflight: Mutex::new(HashMap::new()),
             last_js: Mutex::new(HashMap::new()),
             sass,
             gate,
@@ -494,7 +556,7 @@ impl Engine {
 
     pub fn stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
-        CacheStats { entries: c.map.len(), bytes: c.bytes, hits: c.hits, misses: c.misses }
+        CacheStats { entries: c.map.len(), bytes: c.bytes, hits: c.hits, misses: c.misses, coalesced: c.coalesced }
     }
 
     pub fn sass_stats(&self) -> scss::SassStats {
@@ -503,6 +565,35 @@ impl Engine {
 
     pub fn compile_stats(&self) -> CompileStats {
         self.gate.stats()
+    }
+
+    /// Either the right to compile `key`, or the answer the compile already running for it gave.
+    /// The wait is bounded by what the leader is bounded by — its permit deadline and its compile
+    /// deadline — and its failure is the follower's failure, so nobody is left holding the key.
+    ///
+    /// A thread that is already compiling under a permit never waits: the leader takes the key
+    /// before it takes a permit, so it may be queueing for the very permit this thread is holding —
+    /// a sweep, or the module build a `?type=style` compile makes from inside itself. Such a thread
+    /// compiles the key for itself instead, which is the duplicate the cache has always tolerated.
+    fn join(&self, key: u128) -> Join<'_> {
+        if COMPILING.get() {
+            return Join::Solo;
+        }
+        let mut map = self.inflight.lock().unwrap();
+        let Some(running) = map.get(&key).cloned() else {
+            let flight = Arc::<Inflight>::default();
+            map.insert(key, flight.clone());
+            return Join::Lead(Lead { engine: self, key, flight });
+        };
+        drop(map);
+        self.cache.lock().unwrap().coalesced += 1;
+        let mut done = running.done.lock().unwrap();
+        loop {
+            if let Some(outcome) = done.clone() {
+                return Join::Waited(outcome);
+            }
+            done = running.ready.wait(done).unwrap();
+        }
     }
 
     fn cached(&self, key: u128) -> Option<Arc<Built>> {
@@ -533,6 +624,19 @@ impl Engine {
                 c.bytes -= b.retained_bytes();
             }
         }
+    }
+
+    /// Runs a whole-project compile — `check` — under a single permit taken once, held for the
+    /// sweep and given back at the end. Issue #54: `check` builds every source file of a tenant, and
+    /// a permit per file means that on a saturated daemon the error page waits the queue deadline
+    /// once per file. A maintenance sweep should cost one place in the queue, not one per file.
+    ///
+    /// The per-file compile deadline is untouched: each build inside still runs on its own thread
+    /// with its own wall clock, so one unfinishable file does not take the sweep with it.
+    pub fn sweep<T>(&self, f: impl FnOnce() -> T) -> Result<T, BuildError> {
+        let _permit = self.gate.enter().map_err(BuildError::busy)?;
+        let _compiling = Compiling::enter();
+        Ok(f())
     }
 
     pub fn build(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
@@ -566,6 +670,29 @@ impl Engine {
             return Ok(b);
         }
         self.within_caps(path, kind, &data)?;
+        let lead = match self.join(key) {
+            Join::Lead(lead) => Some(lead),
+            Join::Solo => None,
+            Join::Waited(outcome) => return outcome,
+        };
+        let outcome = self.compile_once(tenant, path, kind, data, site, key);
+        if let Some(lead) = lead {
+            lead.settle(&outcome);
+        }
+        outcome
+    }
+
+    /// The compile itself, under a permit: the caller holds the key while this runs, so this is the
+    /// only thread compiling it however many requests are waiting.
+    fn compile_once(
+        &self,
+        tenant: &Arc<Tenant>,
+        path: &str,
+        kind: Kind,
+        data: Arc<[u8]>,
+        site: Option<String>,
+        key: u128,
+    ) -> Result<Arc<Built>, BuildError> {
         let _permit = self.gate.enter().map_err(|e| BuildError::busy(format!("{path}: {e}")))?;
         let started = Instant::now();
         let compiled = self.bounded(tenant, path, kind, data, site);
@@ -1212,6 +1339,67 @@ mod tests {
         let e = build_err(engine.build(&t, "src/b.scss", Kind::Module));
         assert_eq!(e.status, 503);
         assert!(e.message.contains("past their deadline"), "{}", e.message);
+        assert_eq!(engine.compile_stats().refused, 1);
+    }
+
+    /// Issue #55: `build` looked the cache up, queued for a permit and did not look again, so N
+    /// simultaneous requests for one cold module each compiled it. Four ask at once; one compiles,
+    /// and the three that waited are counted as waits rather than as hits.
+    #[test]
+    fn a_burst_on_one_cold_module_compiles_it_once() {
+        let t = tenant_with("src/slow.scss", &slow_source());
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let cfg = Config { compile_timeout: Duration::from_secs(1), ..capped(CAP) };
+        let engine = Engine::gated(cfg, metrics.clone(), 4, Duration::from_millis(50), MAX_RUNAWAY_COMPILES);
+
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| engine.build(&t, "src/slow.scss", Kind::Module).err().map(|e| e.message));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.compile_stats().running < 1 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let followers: Vec<_> =
+                (0..3).map(|_| scope.spawn(|| engine.build(&t, "src/slow.scss", Kind::Module).err().map(|e| e.message))).collect();
+            let first = leader.join().unwrap();
+            for f in followers {
+                assert_eq!(f.join().unwrap(), first, "a follower answers with what the one compile produced");
+            }
+        });
+
+        let cache = engine.stats();
+        assert_eq!((cache.misses, cache.coalesced), (4, 3), "four lookups missed, three of them waited");
+        assert_eq!(metrics.compiles()[0].count(), 1, "one compile, not four");
+        assert_eq!(engine.compile_stats().running, 0);
+    }
+
+    /// Issue #54: `check` builds every source file of a tenant, and a permit per file meant that on
+    /// a saturated daemon the error page waited the queue deadline once per file. The sweep takes
+    /// one permit and holds it; the builds inside take none, so a gate emptied under them still lets
+    /// every file through.
+    #[test]
+    fn a_sweep_compiles_every_file_under_one_permit() {
+        let files = ["src/a.ts", "src/b.ts", "src/c.ts"];
+        let t = tenant(&[(files[0], "export const a = 1;\n"), (files[1], "export const b = 2;\n"), (files[2], "export const c = 3;\n")]);
+        let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
+        let built = engine
+            .sweep(|| {
+                engine.gate.limit.store(0, Ordering::Relaxed);
+                files.map(|p| engine.build(&t, p, Kind::Module).is_ok())
+            })
+            .unwrap();
+        assert_eq!(built, [true, true, true]);
+        assert_eq!(engine.compile_stats().refused, 0, "the sweep queued once and nothing inside it queued again");
+    }
+
+    /// And when it cannot have that one permit it says so once, after one wait.
+    #[test]
+    fn a_saturated_sweep_is_refused_once_not_once_per_file() {
+        let engine = engine_bounded(capped(CAP), 0, Duration::from_millis(100), MAX_RUNAWAY_COMPILES);
+        let started = Instant::now();
+        let e = engine.sweep(|| 0u8).unwrap_err();
+        assert_eq!(e.status, 503);
+        assert!(e.message.contains("waited 100 ms"), "{}", e.message);
+        assert!(started.elapsed() < Duration::from_secs(1), "the sweep waited {:?}", started.elapsed());
         assert_eq!(engine.compile_stats().refused, 1);
     }
 

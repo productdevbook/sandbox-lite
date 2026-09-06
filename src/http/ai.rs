@@ -145,7 +145,7 @@ fn file_tool(st: &AppState, t: &Arc<Tenant>, name: &str, input: &Value, changes:
                 Err(e) => format!("error: {e}"),
             }
         }
-        "check_site" => check_tenant(st, t).to_string(),
+        "check_site" => check_tenant(&st.engine, t).to_string(),
         _ => format!("error: unknown tool {name}"),
     }
 }
