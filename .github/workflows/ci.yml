@@ -67,6 +67,8 @@ jobs:
           test "$(awk -F' ' '/^sandbox_lite_compile_seconds_bucket\{kind="module",le="\+Inf"\}/{print $2}' /tmp/metrics.txt)" \
              = "$(awk -F' ' '/^sandbox_lite_compile_seconds_count\{kind="module"\}/{print $2}' /tmp/metrics.txt)"
       - run: bench/mem.sh 100 4398
+      - name: one daemon against a dev server per tenant
+        run: bench/vs-astro-dev.sh examples/starter 4396
   e2e:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     needs: test

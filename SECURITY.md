@@ -34,15 +34,43 @@ every hostname that does not parse as a tenant host. Put the daemon behind a
 proxy that only forwards the hostnames you intend, and treat every request
 that reaches the editor/API router as coming from your own backend.
 
-Tenant files never run inside the daemon. The daemon compiles `.astro`
-(astro_codegen), TypeScript/JSX (oxc), Sass (grass), Markdown (pulldown-cmark)
-and parses JSON/YAML; the resulting JavaScript runs in the visitor's browser on
-the tenant origin, using Astro's own runtime bundled as `/__sl/astro.js`.
+Serving a preview evaluates no tenant code in the daemon. The daemon compiles
+`.astro` (astro_codegen), TypeScript/JSX (oxc), Sass (grass), Markdown
+(pulldown-cmark) and parses JSON/YAML; the resulting JavaScript runs in the
+visitor's browser on the tenant origin, using Astro's own runtime bundled as
+`/__sl/astro.js`. One flag changes that.
 
 Whoever can call `/api/*` owns every tenant: create, delete, read and write any
 file, drive the chat endpoint. They also decide what the daemon reads off the
 host as a base project, bounded only by `--bases` (below). There are no users,
 roles or per-tenant credentials on the API side.
+
+### What `--chrome` adds
+
+`--chrome PATH` gives the chat model a sixth tool, `screenshot` (`tools`,
+`src/http/ai.rs`). Calling it spawns the operator's Chrome binary **on the
+daemon's host** and points it at the tenant's own preview URL (`shoot`, and
+`preview_url_path` in `src/http/api.rs`). That browser then executes the
+tenant's compiled modules, its inline `<script>` blocks and everything they
+import from `--cdn`, as the daemon's user. Three consequences:
+
+- Chrome is started with `--no-sandbox`, so its renderer sandbox is off: a
+  renderer bug reaches the daemon's uid directly rather than a sandbox.
+- Tenant JavaScript gets the daemon's host and network position for the length
+  of the run — loopback services, a cloud instance-metadata endpoint, anything
+  the daemon's egress reaches. The 20 s deadline (`SHOT_TIMEOUT`) bounds how
+  long that lasts, not what it can reach.
+- The tenant's `sl_token` is passed to Chrome as a command-line argument, so it
+  is in the host's process table for the life of the browser.
+
+The URL itself stays on the tenant: `shot_path` refuses `://`, a leading `//`,
+whitespace and control characters, and the origin is built from the tenant id
+rather than from the model's input. What runs *on* that page is the exposure.
+
+The path to it is: whoever can call `POST /api/t/{id}/chat` → the model → a
+page of that tenant. So enable `--chrome` only where the tenant trees are
+trusted, and run the browser somewhere it cannot reach anything else: a
+container, or a network namespace of its own.
 
 ## What the daemon enforces
 
@@ -93,14 +121,17 @@ roles or per-tenant credentials on the API side.
   `astro_codegen`, `satteri-mdxjs` or `grass`, all of which are
   recursive-descent and so can overflow a thread stack — which aborts the whole
   daemon, since the release profile sets `panic = "abort"`. The three apply to
-  the extensions those parsers read: `.astro`, `.ts`, `.tsx`, `.jsx`, `.mts`,
-  `.js`, `.mjs`, `.mdx`, `.scss`, `.sass`.
+  the extensions those parsers read (`parses_source`, `src/transform/mod.rs`):
+  `.astro`, `.ts`, `.tsx`, `.jsx`, `.mts`, `.js`, `.mjs`, `.mdx`, `.scss`,
+  `.sass`, `.vue` and `.svelte` — the last two because `sfc::strip_types` runs
+  oxc over their `<script lang="ts">` blocks before the browser sees them.
   - **Size** is capped by `--max-source-kb` (default 64 KiB).
   - **Nesting** is capped at 2000 (`MAX_NESTING_DEPTH`) — the deepest run of
     unclosed `(`, `[`, `{` or of markdown blockquote markers, counted on the
     bytes before any parser sees them.
   - **Stack**: every compile runs on a thread whose stack is sized from the
-    size cap (`Engine::parser_stack_bytes`, 256 MiB at the default), which
+    size cap — `max_source_bytes * 4000`, never below 16 MiB
+    (`Engine::parser_stack_bytes`), so 250 MiB at the default — which
     covers the recursion the nesting scan does not model — chained unary `-`
     for oxc, `<<` for `astro_codegen`. Raising `--max-source-kb` raises the
     stack with it. The reservation is virtual address space; only the pages a
@@ -227,6 +258,9 @@ that router answers `401` unless the request carries
 - It is the only thing gating `POST /api/tenants/{id}/import`, which writes a
   whole file tree into a tenant in one request, and
   `GET /api/t/{id}/export`, which returns one.
+- It is the only thing gating `GET /api/t/{id}/chats` and
+  `GET /api/t/{id}/chats/{chat}`, which return a tenant's stored conversations
+  in full — including whatever the model quoted out of the tenant's files.
 - It is the only thing gating `POST /api/bases`, which reads a directory of
   the host into memory, and `POST /api/bases/{name}/reload`, which re-reads
   one and makes every tenant on it reload.
@@ -282,15 +316,31 @@ endpoint, including `/__sl/raw/`, `/__sl/events` and `/__sl/check`.
 ## Tenant files are public to anyone who can open the preview
 
 `/__sl/raw/<path>` returns any file of the tenant (base project plus overlay)
-as-is, and `/__sl/m/<path>?raw` returns it as a module. That includes `.env`,
-`package.json`, `sandbox-lite.json` and every source file. Only the shell's
-`import.meta.env` is filtered to `PUBLIC_*` keys; the `.env` file itself is
-not. The compiled output of every page and component is served too, because
-that is what the browser renders.
+as-is, and `/__sl/m/<path>?raw` returns it as a module. That includes
+`package.json`, `sandbox-lite.json`, `tsconfig.json` and every source file, and
+the compiled output of every page and component, because that is what the
+browser renders.
 
-Do not put secrets in base projects or tenant trees. With `--preview-secret`
-the audience is "whoever has the tenant's link"; without it, the audience is
-the network.
+Dotfiles are the exception. `is_private_path` (`src/store.rs`) refuses any path
+with a segment starting with `.`, `.well-known` excepted, and it gates all
+three preview read paths: `/__sl/m/{path}`, `/__sl/raw/{path}` and the
+`public/` fallback (`src/http/preview.rs`). A preview visitor cannot fetch
+`.env`.
+
+Put no secrets in base projects or tenant trees anyway. A dotfile is not a
+secret store, and three things reach past that rule:
+
+- The `PUBLIC_*` keys of `.env` are read into the shell's `import.meta.env`
+  (`env_map`, `src/http/preview.rs`) and exported by the `astro:env` shim, so
+  they are in the page every visitor loads.
+- The editor/API router serves the file itself: `GET /api/t/{id}/file/.env`
+  goes through `clean_path` alone, and the chat's `read_file` tool does the
+  same. Both are behind `--api-token`, whose audience is already every file of
+  every tenant.
+- An export carries every dotfile of the tenant (see "Hidden files" above).
+
+With `--preview-secret` the preview's audience is "whoever has the tenant's
+link"; without it, the audience is the network.
 
 ## Put previews on their own registrable domain
 
@@ -317,15 +367,19 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 ## What leaves the machine
 
 - **Anthropic API.** When `ANTHROPIC_API_KEY` is set, `POST /api/t/{id}/chat`
-  sends to `https://api.anthropic.com/v1/messages`: the conversation the
-  caller supplies, a system prompt containing the tenant id and base name, and
-  every tool result — the file listing, the contents of any file the model
-  reads (up to 200 KiB per file, any path in the tenant), and `check`
-  diagnostics. `write_file` and `delete_file` take effect on the tenant
+  sends to `{api_base}/v1/messages` (`src/http/ai.rs`), where `api_base` is
+  `https://api.anthropic.com` unless `SANDBOX_LITE_ANTHROPIC_BASE` names
+  another endpoint (`src/main.rs`). What is sent: the conversation the caller
+  supplies, the stored turns of the conversation it continues, a system prompt
+  containing the tenant id and base name, and every tool result — the file
+  listing, the contents of any file the model reads (up to 200 KiB per file,
+  any path in the tenant, dotfiles included), `check` diagnostics, and, under
+  `--chrome`, a PNG of the rendered page up to 4 MiB (`MAX_SHOT`) base64-encoded
+  into the tool result. `write_file` and `delete_file` take effect on the tenant
   immediately, without confirmation. A conversation that has passed
-  `--chat-window` costs one further call, which sends the turns being folded
-  away and takes back the summary that replaces them. Without the key the
-  endpoint answers `503` and nothing is sent.
+  `--chat-window` costs one further call to the same endpoint, which sends the
+  turns being folded away and takes back the summary that replaces them.
+  Without the key the endpoint answers `503` and nothing is sent.
 - **CDN, in the visitor's browser.** Bare imports (`react`, `dayjs`) resolve to
   `--cdn` (default `https://esm.sh`) with the version range from
   `package.json`; React and Preact client entrypoints come from the same CDN.
@@ -337,10 +391,13 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 ## Limits that do not exist
 
 - No rate limiting on any route.
-- Compilation is CPU work per request; `/__sl/check` and `/api/t/{id}/check`
-  build every source file of a tenant on every call — a cache hit for an
-  unchanged file, a compile for a changed one. Only Sass has a deadline and a
-  thread cap (above); nothing bounds the total CPU a caller can ask for.
+- **No deadline on a single non-Sass compile.** `--max-compiles` bounds how
+  many run at once (above), and Sass has a deadline of its own, but an
+  `.astro`, `.ts` or `.mdx` compile runs to completion however long it takes,
+  holding its permit throughout. Nothing bounds the total CPU a caller can ask
+  for over time either: compilation is CPU work per request, and `/__sl/check`
+  and `/api/t/{id}/check` build every source file of a tenant on every call — a
+  cache hit for an unchanged file, a compile for a changed one.
 - No timeout once a request head has arrived: a body may trickle in, and a
   response may be read slowly, for as long as the client likes.
 - The transform cache is bounded by `--cache-mb` and each tenant's overlay by
@@ -349,7 +406,9 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
   persistence every write goes to disk under `--data-dir`, and files over
   256 KiB are kept only there and re-read on demand; with `--no-persist`,
   every written file is held in memory whatever its size.
-- Tenant code is limited only by the visitor's browser.
+- Tenant code is limited only by the visitor's browser — except under
+  `--chrome`, where the screenshot tool runs it in a browser on the daemon's
+  own host, unsandboxed (see "What `--chrome` adds").
 
 ## Deployment checklist
 
@@ -365,4 +424,9 @@ editor stores the API token in `localStorage` and embeds tenant previews in an
 5. Your own limits on tenant count and request rate; `--tenant-quota-mb`
    bounds each tenant's write volume, not how many tenants there are.
 6. `ANTHROPIC_API_KEY` only if the chat endpoint is wanted, knowing what it
-   sends and that the API token is the only thing gating it.
+   sends and that the API token is the only thing gating it;
+   `SANDBOX_LITE_ANTHROPIC_BASE` set only to an endpoint you trust with all of
+   that.
+7. `--chrome` only where the tenant trees are trusted, and then with the
+   browser confined — a container, or a network namespace — because it runs
+   tenant JavaScript on the daemon's host, unsandboxed.

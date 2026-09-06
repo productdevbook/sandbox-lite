@@ -22,10 +22,13 @@ one per request from the `Host` header (lowercased, port stripped):
   it.
 - Any other host goes to the **editor/API router**: `/` (the editor page),
   `/health`, `/metrics`, `/api/stats`, `/api/bases`,
-  `/api/bases/{name}/reload`, `/api/tenants`,
-  `/api/tenants/{id}`, `/api/t/{id}/files`, `/api/t/{id}/file/{*path}`,
-  `/api/t/{id}/events`, `/api/t/{id}/check`, `/api/t/{id}/chat`, with a 64 MiB
-  body limit. `require_api_token` wraps all of it.
+  `/api/bases/{name}/reload`, `/api/tenants`, `/api/tenants/{id}`,
+  `/api/tenants/{id}/import`, `/api/t/{id}/files`, `/api/t/{id}/export`,
+  `/api/t/{id}/file/{*path}`, `/api/t/{id}/events`, `/api/t/{id}/check`,
+  `/api/t/{id}/chat`, `/api/t/{id}/chats` and `/api/t/{id}/chats/{chat}`, with
+  a 64 MiB body limit. `require_api_token` wraps all of it, so that whole list
+  is the `--api-token` surface — `import` and `export` included, which move
+  whole file trees.
 
 `SECURITY.md` describes the two middlewares.
 
@@ -134,12 +137,16 @@ exact.
 
 1. **Shell.** No route matches, so `preview::page` (`src/http/preview.rs`)
    runs. It percent-decodes the path, and if `public/<path>` exists in the
-   tenant it serves that file. Otherwise it answers `assets/shell.html` with
-   `%TENANT%`, `%VERSION%` (the tenant's version), `%ASSETS%` (a hash of
-   `astro.js`, `shell.js`, `live.js`) and `%ENV%` filled in, `Cache-Control:
-   no-store`. `%ENV%` is `import.meta.env`: `DEV`, `PROD`, `MODE`, `SSR`,
-   `BASE_URL`, `SITE` (from `sandbox-lite.json`), and the `PUBLIC_*` lines of
-   the tenant's `.env`.
+   tenant it serves that file — unless the path is private (`is_private_path`:
+   any segment starting with `.`, `.well-known` excepted), which is also what
+   keeps `/__sl/m/` and `/__sl/raw/` off a tenant's dotfiles. Otherwise it
+   answers `assets/shell.html` with `%TENANT%`, `%VERSION%` (the tenant's
+   version), `%ASSETS%` (a hash of `astro.js`, `shell.js`, `live.js`),
+   `%TOKEN%`/`%TOKENQ%` (the preview token, empty without `--preview-secret`)
+   and `%ENV%` filled in, `Cache-Control: no-store`. `%ENV%` is
+   `import.meta.env`: `DEV`, `PROD`, `MODE`, `SSR`, `BASE_URL`, `SITE` (from
+   `sandbox-lite.json`), `ASSETS_PREFIX`, and the `PUBLIC_*` lines of the
+   tenant's `.env`.
 2. **Scripts.** The shell loads `/__sl/live.js` and `/__sl/shell.js`
    (`no-cache`, ETag = the assets hash). `live.js` opens an `EventSource` on
    `/__sl/events`.
@@ -190,7 +197,10 @@ exact.
    `cookies`, `locals`. No renderers are registered for it: nothing renders.
 8. **Document.** A `3xx` with `Location` becomes `location.replace`. A response
    that is not `text/html` (an endpoint's XML, JSON or text) is shown escaped in
-   a `<pre>` under its status and content-type, JSON pretty-printed.
+   a `<pre>` under its status and content-type, JSON pretty-printed. A `4xx` or
+   `5xx` with an empty body becomes an error overlay naming the status rather
+   than a blank page, so a failed render never looks like a site with nothing
+   on it (#48).
    Otherwise every CSS string that modules registered in
    `globalThis.__sl_css` becomes a `<style data-sl=key>` (with
    `type="text/tailwindcss"` when it contains `@import "tailwindcss"` or
@@ -264,8 +274,12 @@ before creating the blob: `vue`/`svelte` specifiers become CDN URLs, relative
 ones are resolved against the component's own `/__sl/m/…` URL. The CDN URLs are
 substituted into the loader shim by `preview::shim` (`%VUE%`, `%VUE_COMPILER%`,
 `%SVELTE%`) rather than baked into the cached module, because the transform
-cache is content-addressed and does not see `package.json`. Each `<style>`
-block is registered in `globalThis.__sl_css` the way a `.css` module is.
+cache is content-addressed and does not see `package.json`. The compiled CSS
+is registered in `globalThis.__sl_css` like any other module's, though the two
+loaders key it differently: `vue-loader.js` registers one entry per `<style>`
+block as `<path>?<index>`, the way an `.astro` style module is keyed, while
+`svelte-loader.js` registers the component's single combined output under the
+bare path.
 
 The island imports that same module URL to hydrate, so the loader's default
 export is the *client* build. Vue's one component object serves both — Vue's
@@ -513,8 +527,10 @@ a config it could not read at all is the error above.
 
 `sandbox-lite check DIR…` loads each directory as a base, creates an
 in-memory tenant on it, and calls `Engine::build(…, Kind::Module)` on every
-source file under `src/` (`.astro`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`,
-`.mts`, `.md`, `.mdx`). It prints diagnostics and a census — islands, glob calls,
+source file under `src/` — `is_source`: `.astro`, `.ts`, `.tsx`, `.js`,
+`.jsx`, `.mjs`, `.mts`, `.md`, `.mdx`, `.vue`, `.svelte`, which is what makes
+the `.vue` type errors above reachable from the command line. It prints
+diagnostics and a census — islands, glob calls,
 Sass, MDX, endpoints, `@astrojs/*` integrations, bare imports — and exits 1 on
 compile errors, 2 when a directory cannot be loaded. `/api/t/{id}/check` and
 `/__sl/check` run the same loop (`api::check_tenant`) on a live tenant; the
@@ -552,11 +568,33 @@ bearer token whenever `--api-token` is set; `http::tests` asserts both halves.
 
 ## Chat (`src/http/ai.rs`)
 
-`POST /api/t/{id}/chat` runs a tool loop against the Anthropic Messages API
-with five tools scoped to the tenant — `list_files`, `read_file`,
-`write_file`, `delete_file`, `check_site` — for at most 16 rounds, and returns
-the model's last text, the changed paths and the tenant version. Writes go
-through the same `Tenant::write` as the editor, so previews follow.
+`POST /api/t/{id}/chat` runs a tool loop against `{api_base}/v1/messages` —
+`https://api.anthropic.com` unless `SANDBOX_LITE_ANTHROPIC_BASE` says
+otherwise — with five tools scoped to the tenant: `list_files`, `read_file`,
+`write_file`, `delete_file` and `check_site`. With `--chrome` set there is a
+sixth, `screenshot` (`tools`), which renders one page of the tenant's own
+preview in headless Chrome on the daemon's host and hands the PNG back as an
+image block; `SECURITY.md` says what that costs. The loop runs at most 16
+rounds (`MAX_ITERATIONS`) and answers
+`{text, changes, iterations, version, chat}`. Writes go through the same
+`Tenant::write` as the editor, so previews follow.
+
+Every turn is streamed from the API whichever way the caller asked for it
+(`converse`). With `Accept: text/event-stream` the endpoint answers SSE —
+`text`, `tool`, `tool_result` events as they happen, then one `done` carrying
+that same JSON, or `error`; otherwise the JSON is buffered and returned in one
+response.
+
+The request body is `{messages, chat?}`. `chat` names a stored conversation
+(`src/http/chats.rs`, one JSON file per chat under `<data-dir>/<id>/chats/`, or
+in memory with `--no-persist`), whose turns come before `messages`.
+`Conversation::for_model` replays the last `--chat-window` turns in full; when a
+conversation crosses that, `compact` folds everything older into one summary
+written by a second call to the same API and stored with the conversation, and
+sent as its opening turn from then on. A summary the API will not write is not
+fatal: the turns stay stored and are cut from the request anyway. A save past
+`--chats-per-tenant` drops the tenant's least recently updated conversation
+(`evictable`).
 
 ## Layout
 
@@ -567,7 +605,9 @@ src/http/mod.rs        routers, host dispatch, the two token middlewares, MIME t
 src/http/api.rs        editor page, /api handlers, SSE, check_tenant
 src/http/archive.rs    tar.gz export and import of a tenant tree
 src/http/preview.rs    tenant-host handlers: shell, modules, raw, routes, renderers, shims, content
-src/http/ai.rs         chat tool loop
+src/http/ai.rs         chat tool loop, the screenshot tool, conversation compaction
+src/http/anthropic.rs  SSE frame reassembly and the streamed reply's content blocks
+src/http/chats.rs      stored conversations: the window, the cap, load/save/list
 src/metrics.rs         atomic counters, the compile histogram, the Prometheus renderer
 src/resolve.rs         Resolver, CDN URLs, renderers, sandbox-lite.json, tsconfig paths
 src/routes.rs          src/pages → route table
