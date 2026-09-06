@@ -556,13 +556,19 @@ impl Staged {
     fn tombstones(&mut self, list: &[&str]) -> io::Result<()> {
         let Some(dir) = &self.dir else { return Ok(()) };
         let file = dir.join("deleted.json");
-        self.tombstones = Some(std::fs::read(&file).ok());
+        let before = match std::fs::read(&file) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            // a list that is there and unreadable must not be undone as if there were none
+            Err(e) => return Err(e),
+        };
+        self.tombstones = Some(before);
         std::fs::write(file, serde_json::to_vec(list)?)
     }
 
     fn commit(self) {
         if let Some(aside) = &self.aside {
-            let _ = std::fs::remove_dir_all(aside);
+            sweep(aside);
         }
     }
 
@@ -571,33 +577,35 @@ impl Staged {
     fn rollback(self) -> Vec<String> {
         let mut torn = Vec::new();
         for target in self.created.iter().rev() {
-            if let Err(e) = std::fs::remove_file(target)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                torn.push(target.display().to_string());
+            if let Err(e) = remove_if_present(target) {
+                torn.push(format!("{} ({e})", target.display()));
             }
         }
         for (kept, target) in self.moved.iter().rev() {
-            if std::fs::rename(kept, target).is_err() {
-                torn.push(target.display().to_string());
+            if let Err(e) = std::fs::rename(kept, target) {
+                torn.push(format!("{} ({e})", target.display()));
             }
         }
         if let (Some(dir), Some(before)) = (&self.dir, &self.tombstones) {
             let file = dir.join("deleted.json");
             let back = match before {
                 Some(raw) => std::fs::write(&file, raw),
-                None => std::fs::remove_file(&file),
+                None => remove_if_present(&file),
             };
-            if back.is_err() {
-                torn.push(file.display().to_string());
+            if let Err(e) = back {
+                torn.push(format!("{} ({e})", file.display()));
             }
         }
-        // only ever empty ones this write made: a directory something else put a file in stays
         for d in self.dirs.iter().rev() {
-            let _ = std::fs::remove_dir(d);
+            // a directory something else has since put a file in is not empty, and stays
+            if let Err(e) = std::fs::remove_dir(d)
+                && !matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound)
+            {
+                eprintln!("write: cannot remove the directory {} the write made: {e}", d.display());
+            }
         }
         if let Some(aside) = &self.aside {
-            let _ = std::fs::remove_dir_all(aside);
+            sweep(aside);
         }
         if !torn.is_empty() {
             eprintln!("write: undoing a failed write left {} path(s) neither way: {}", torn.len(), torn.join(", "));
@@ -610,6 +618,20 @@ impl Staged {
             paths if paths.is_empty() => WriteError::Io(cause),
             paths => WriteError::Torn { cause, paths },
         }
+    }
+}
+
+/// `remove_file` on a path whose parent turned out not to be a directory answers `ENOTDIR`, not
+/// `NotFound`, so whether the file is there is asked rather than read out of the error.
+fn remove_if_present(target: &Path) -> io::Result<()> {
+    if target.exists() { std::fs::remove_file(target) } else { Ok(()) }
+}
+
+/// The copies waiting in the staging directory are dead once a write has landed or been undone, but
+/// failing to sweep them cannot fail the write: it is reported instead.
+fn sweep(aside: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(aside) {
+        eprintln!("write: cannot remove the staging directory {}: {e}", aside.display());
     }
 }
 
