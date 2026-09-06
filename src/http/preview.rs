@@ -10,7 +10,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::api::{check_tenant, err, sse};
 use super::{AppState, State, TenantId, mime};
 use crate::resolve::{Resolver, renderers};
-use crate::store::{Tenant, clean_path};
+use crate::store::{Tenant, clean_path, is_private_path};
 use crate::transform::{BuildError, JS, Kind, content, css, js, json_str};
 
 const ASTRO_JS: &str = include_str!("../../assets/astro.js");
@@ -57,6 +57,9 @@ pub async fn module(
         Err(r) => return r,
     };
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
+    if is_private_path(&path) {
+        return err(StatusCode::NOT_FOUND, format!("{path}: not found"));
+    }
     let query = query.unwrap_or_default();
     let kind = Kind::from_query(&query);
     let versioned = query.split('&').any(|p| p.starts_with("v="));
@@ -81,7 +84,7 @@ pub async fn raw(AxState(st): AxState<State>, Extension(id): Extension<TenantId>
         Err(r) => return r,
     };
     let Some(path) = clean_path(&path) else { return err(StatusCode::BAD_REQUEST, "bad path") };
-    match t.read(&path) {
+    match t.read(&path).filter(|_| !is_private_path(&path)) {
         Some(bytes) => ([(header::CONTENT_TYPE, mime(&path)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("{path}: not found")),
     }
@@ -254,7 +257,7 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
         Err(r) => return r,
     };
     let decoded = percent_decode(uri.path());
-    if let Some(rel) = clean_path(&decoded) {
+    if let Some(rel) = clean_path(&decoded).filter(|rel| !is_private_path(rel)) {
         let public = format!("public/{rel}");
         if let Some(bytes) = t.read(&public) {
             return ([(header::CONTENT_TYPE, mime(&public)), (header::CACHE_CONTROL, "no-cache")], bytes.to_vec()).into_response();

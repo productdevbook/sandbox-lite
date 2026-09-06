@@ -69,6 +69,17 @@ impl Built {
         }
     }
 
+    fn retained_bytes(&self) -> usize {
+        let scripts: usize = self
+            .scripts
+            .iter()
+            .map(|s| match s {
+                astro::Script::Inline(code) | astro::Script::External(code) => code.len(),
+            })
+            .sum();
+        self.body.len() + self.css.iter().map(String::len).sum::<usize>() + scripts
+    }
+
     fn scanned(body: String) -> Built {
         let specs = js::scan(&body);
         let globs = glob::find(&body);
@@ -176,13 +187,13 @@ impl Engine {
         if c.map.contains_key(&key) {
             return;
         }
-        c.bytes += built.body.len();
+        c.bytes += built.retained_bytes();
         c.map.insert(key, built);
         c.order.push_back(key);
         while c.bytes > self.cfg.cache_bytes {
             let Some(old) = c.order.pop_front() else { break };
             if let Some(b) = c.map.remove(&old) {
-                c.bytes -= b.body.len();
+                c.bytes -= b.retained_bytes();
             }
         }
     }

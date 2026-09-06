@@ -100,6 +100,12 @@ pub fn clean_path(raw: &str) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join("/")) }
 }
 
+/// Dotfiles (`.env`, `.git`, `.astro`) are never served to a preview visitor; `.well-known` is the one
+/// hidden directory sites publish on purpose.
+pub fn is_private_path(path: &str) -> bool {
+    path.split('/').any(|seg| seg.starts_with('.') && seg != ".well-known")
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 63
@@ -360,5 +366,21 @@ impl Store {
             n += 1;
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_path, is_private_path};
+
+    #[test]
+    fn private_paths() {
+        assert!(is_private_path(".env"));
+        assert!(is_private_path(".env.production"));
+        assert!(is_private_path("src/.secret/x.ts"));
+        assert!(is_private_path(".git/config"));
+        assert!(!is_private_path(".well-known/security.txt"));
+        assert!(!is_private_path("src/pages/index.astro"));
+        assert_eq!(clean_path("/.env").as_deref(), Some(".env"));
     }
 }
