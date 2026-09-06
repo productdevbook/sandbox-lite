@@ -182,12 +182,23 @@ container, or a network namespace of its own.
   refused with `400` naming the entry — an absolute path is refused, not
   stripped the way `clean_path` strips one from a request path — while `./` and
   `//` segments are normalised away. So an import writes only under
-  `<data-dir>/<id>/files`. Entry sizes are summed from the tar headers as
-  the archive is read and the whole import is refused with `413` once the total
-  passes the quota, so an archive that decompresses past it is rejected without
-  being decompressed. What survives is then applied under the tenant's write
-  lock as one batch, quota-checked against the resulting overlay: a refusal
-  writes nothing, and the response says so.
+  `<data-dir>/<id>/files`. Every entry costs its declared size against the
+  quota whether or not it is taken — `tar` reads those bytes to reach the next
+  header either way — and the import is refused with `413` as soon as the
+  running total passes the quota, before that entry's body is read. The
+  decompressor is capped on top of that, at the quota plus 16 MiB of tar
+  framing and never more than a thousand times the compressed body, which is
+  what bounds the bytes `tar` reads without ever surfacing them as an entry: a
+  GNU long name, a pax payload, padding. So an archive that decompresses past
+  the quota is rejected without being decompressed. What survives is then
+  applied under the tenant's write lock as one batch, quota-checked against the
+  resulting overlay. The batch is all or nothing: the disk work is staged with
+  an undo — a file it replaces or removes is moved aside, not deleted — and the
+  overlay is swapped only once every file has landed, so a refusal or an I/O
+  failure leaves the tenant exactly as it was, on disk as well as in memory,
+  and the response says so. If the undo itself fails the response says that
+  instead, naming the paths that are neither way, rather than claiming a clean
+  refusal.
 - **Hidden files** are exported and imported like any other file: an export
   carries `.env`, `sandbox-lite.json` and every dotfile of the tenant, and an
   import may write them. What the preview refuses to serve is unchanged

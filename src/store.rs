@@ -187,8 +187,17 @@ impl UpdateKind {
 
 #[derive(Debug)]
 pub enum WriteError {
-    Quota { quota: u64, after: u64 },
+    Quota {
+        quota: u64,
+        after: u64,
+    },
     Io(io::Error),
+    /// A write that failed and could not be put back. The named paths are neither what they were nor
+    /// what the write asked for, so the caller is told that rather than that nothing landed.
+    Torn {
+        cause: io::Error,
+        paths: Vec<String>,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -198,6 +207,12 @@ impl fmt::Display for WriteError {
                 write!(f, "tenant quota exceeded: edited files would total {after} bytes, the quota is {quota} bytes (--tenant-quota-mb)")
             }
             WriteError::Io(e) => fmt::Display::fmt(e, f),
+            WriteError::Torn { cause, paths } => write!(
+                f,
+                "{cause}; undoing the write failed too, so {} on disk are now neither what they were nor what the write asked for: {}",
+                paths.len(),
+                paths.join(", ")
+            ),
         }
     }
 }
@@ -320,12 +335,15 @@ impl Tenant {
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
         }
-        let data = self.store_on_disk(path, bytes)?;
-        let was_tombstone = matches!(overlay.insert(path.to_string(), Some(data)), Some(None));
+        let was_tombstone = matches!(overlay.get(path), Some(None));
+        let mut staged = Staged::new(self.dir.as_deref());
+        let data = match stage_write(&mut staged, &overlay, path, bytes, was_tombstone) {
+            Ok(data) => data,
+            Err(cause) => return Err(staged.undo(cause)),
+        };
+        overlay.insert(path.to_string(), Some(data));
         drop(overlay);
-        if was_tombstone {
-            self.persist_tombstones()?;
-        }
+        staged.commit();
         Ok(self.bump("update", path, kind))
     }
 
@@ -334,6 +352,11 @@ impl Tenant {
     /// does not carry — dropping an edit over a base file brings the base copy back, which is what
     /// makes an overlay export reproduce the source overlay exactly. The quota is checked against
     /// the resulting overlay before anything is written, so a refusal leaves the tenant untouched.
+    ///
+    /// It is all or nothing: the disk work is staged with an undo — a replaced or removed file is
+    /// moved aside rather than deleted — and the overlay is swapped only once every step has
+    /// succeeded. A failure puts the directory back, so what the caller is told and what a restart
+    /// reads are the same tenant.
     pub fn write_many(&self, files: Vec<(String, Vec<u8>)>, deleted: &[String], replace: bool) -> Result<Applied, WriteError> {
         let mut overlay = self.overlay.write().unwrap();
         let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
@@ -357,59 +380,35 @@ impl Tenant {
         let touched: BTreeSet<&str> = overlay.keys().chain(deleted.iter()).map(String::as_str).collect();
         let dropped: Vec<&str> =
             touched.into_iter().filter(|p| !incoming.contains(p) && overlaid(&overlay, p) != overlaid(&next, p)).collect();
-        for path in &dropped {
-            self.forget_on_disk(path)?;
-        }
         let (written, removed) = (files.len(), dropped.len());
-        for (path, bytes) in files {
-            next.insert(path.clone(), Some(self.store_on_disk(&path, bytes)?));
+        let mut staged = Staged::new(self.dir.as_deref());
+        if let Err(cause) = stage_batch(&mut staged, &mut next, &dropped, files) {
+            return Err(staged.undo(cause));
         }
         *overlay = next;
         drop(overlay);
-        self.persist_tombstones()?;
+        staged.commit();
         Ok(Applied { version: self.bump("update", "", UpdateKind::Module), written, deleted: removed })
     }
 
-    /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
-    /// anything past the inline limit lives on disk only.
-    fn store_on_disk(&self, path: &str, bytes: Vec<u8>) -> io::Result<FileData> {
-        let Some(dir) = &self.dir else { return Ok(FileData::Mem(bytes.into())) };
-        let target = dir.join("files").join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, &bytes)?;
-        if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
-    }
-
-    fn forget_on_disk(&self, path: &str) -> io::Result<()> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let target = dir.join("files").join(path);
-        if target.exists() {
-            std::fs::remove_file(target)?;
-        }
-        Ok(())
-    }
-
     pub fn delete(&self, path: &str) -> io::Result<u64> {
-        {
-            let mut overlay = self.overlay.write().unwrap();
-            if self.base.read().unwrap().get(path).is_some() {
-                overlay.insert(path.to_string(), None);
-            } else {
-                overlay.remove(path);
-            }
+        // held across the disk work, as a write is: the file leaves the directory and the tombstone
+        // list is rewritten before the overlay hears about it, and a failure puts both back
+        let mut overlay = self.overlay.write().unwrap();
+        let tombstone = self.base.read().unwrap().get(path).is_some();
+        let mut staged = Staged::new(self.dir.as_deref());
+        if let Err(cause) = stage_delete(&mut staged, &overlay, path, tombstone) {
+            staged.rollback();
+            return Err(cause);
         }
-        self.forget_on_disk(path)?;
-        self.persist_tombstones()?;
+        if tombstone {
+            overlay.insert(path.to_string(), None);
+        } else {
+            overlay.remove(path);
+        }
+        drop(overlay);
+        staged.commit();
         Ok(self.bump("delete", path, UpdateKind::Module))
-    }
-
-    fn persist_tombstones(&self) -> io::Result<()> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let overlay = self.overlay.read().unwrap();
-        let list: Vec<&str> = overlay.iter().filter(|(_, d)| d.is_none()).map(|(p, _)| p.as_str()).collect();
-        std::fs::write(dir.join("deleted.json"), serde_json::to_vec(&list)?)
     }
 
     fn bump(&self, event: &str, path: &str, kind: UpdateKind) -> u64 {
@@ -472,6 +471,192 @@ impl Tenant {
 
 fn overlay_bytes(overlay: &BTreeMap<String, Option<FileData>>) -> u64 {
     overlay.values().flatten().map(|d| d.size()).sum()
+}
+
+/// The disk half of one write, and what it takes to put `<data-dir>/<id>` back. Nothing there is
+/// changed that is not recorded first, and a file that is replaced or removed is moved aside rather
+/// than deleted — a `FileData::Disk` entry is the only copy of its contents there is. So a failure
+/// anywhere can leave the directory exactly as it was, which is what lets the overlay be swapped
+/// only after every file has landed.
+struct Staged {
+    dir: Option<PathBuf>,
+    aside: Option<PathBuf>,
+    /// (the copy waiting in `aside`, where it came from)
+    moved: Vec<(PathBuf, PathBuf)>,
+    created: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    /// `Some` once `deleted.json` has been rewritten: what it held before, or `None` if there was no
+    /// such file.
+    tombstones: Option<Option<Vec<u8>>>,
+}
+
+impl Staged {
+    fn new(dir: Option<&Path>) -> Staged {
+        Staged { dir: dir.map(Path::to_path_buf), aside: None, moved: Vec::new(), created: Vec::new(), dirs: Vec::new(), tombstones: None }
+    }
+
+    /// `<data-dir>/<id>/.staged-<pid>-<n>`, a sibling of `files/` rather than a directory inside it,
+    /// so a copy left behind by a process that dies mid-write is not read back as a tenant file.
+    fn aside_dir(&mut self, dir: &Path) -> io::Result<PathBuf> {
+        if let Some(p) = &self.aside {
+            return Ok(p.clone());
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = dir.join(format!(".staged-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&p)?;
+        self.aside = Some(p.clone());
+        Ok(p)
+    }
+
+    fn move_aside(&mut self, dir: &Path, target: &Path) -> io::Result<()> {
+        if !target.exists() {
+            return Ok(());
+        }
+        let kept = self.aside_dir(dir)?.join(self.moved.len().to_string());
+        std::fs::rename(target, &kept)?;
+        self.moved.push((kept, target.to_path_buf()));
+        Ok(())
+    }
+
+    /// Creates the directories `target` needs, recording the ones that did not exist so the undo can
+    /// take them away again.
+    fn create_dirs(&mut self, target: &Path) -> io::Result<()> {
+        let mut missing = Vec::new();
+        let mut parent = target.parent();
+        while let Some(d) = parent.filter(|d| !d.exists()) {
+            missing.push(d.to_path_buf());
+            parent = d.parent();
+        }
+        for d in missing.into_iter().rev() {
+            std::fs::create_dir(&d)?;
+            self.dirs.push(d);
+        }
+        Ok(())
+    }
+
+    /// Writes the file under `--data-dir` when there is one, and says how the overlay should hold it:
+    /// anything past the inline limit lives on disk only.
+    fn write(&mut self, path: &str, bytes: Vec<u8>) -> io::Result<FileData> {
+        let Some(dir) = self.dir.clone() else { return Ok(FileData::Mem(bytes.into())) };
+        let target = dir.join("files").join(path);
+        self.create_dirs(&target)?;
+        self.move_aside(&dir, &target)?;
+        // recorded before the write, because a write that fails partway still leaves a file
+        self.created.push(target.clone());
+        std::fs::write(&target, &bytes)?;
+        if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
+    }
+
+    fn remove(&mut self, path: &str) -> io::Result<()> {
+        let Some(dir) = self.dir.clone() else { return Ok(()) };
+        let target = dir.join("files").join(path);
+        self.move_aside(&dir, &target)
+    }
+
+    fn tombstones(&mut self, list: &[&str]) -> io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let file = dir.join("deleted.json");
+        self.tombstones = Some(std::fs::read(&file).ok());
+        std::fs::write(file, serde_json::to_vec(list)?)
+    }
+
+    fn commit(self) {
+        if let Some(aside) = &self.aside {
+            let _ = std::fs::remove_dir_all(aside);
+        }
+    }
+
+    /// Puts the directory back, newest step first. What it could not put back comes back as paths,
+    /// and those are the only ones the caller may not describe as untouched.
+    fn rollback(self) -> Vec<String> {
+        let mut torn = Vec::new();
+        for target in self.created.iter().rev() {
+            if let Err(e) = std::fs::remove_file(target)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                torn.push(target.display().to_string());
+            }
+        }
+        for (kept, target) in self.moved.iter().rev() {
+            if std::fs::rename(kept, target).is_err() {
+                torn.push(target.display().to_string());
+            }
+        }
+        if let (Some(dir), Some(before)) = (&self.dir, &self.tombstones) {
+            let file = dir.join("deleted.json");
+            let back = match before {
+                Some(raw) => std::fs::write(&file, raw),
+                None => std::fs::remove_file(&file),
+            };
+            if back.is_err() {
+                torn.push(file.display().to_string());
+            }
+        }
+        // only ever empty ones this write made: a directory something else put a file in stays
+        for d in self.dirs.iter().rev() {
+            let _ = std::fs::remove_dir(d);
+        }
+        if let Some(aside) = &self.aside {
+            let _ = std::fs::remove_dir_all(aside);
+        }
+        if !torn.is_empty() {
+            eprintln!("write: undoing a failed write left {} path(s) neither way: {}", torn.len(), torn.join(", "));
+        }
+        torn
+    }
+
+    fn undo(self, cause: io::Error) -> WriteError {
+        match self.rollback() {
+            paths if paths.is_empty() => WriteError::Io(cause),
+            paths => WriteError::Torn { cause, paths },
+        }
+    }
+}
+
+/// One file's disk work. The tombstone list is rewritten here rather than after the overlay changes,
+/// so a failure to record it is a failure of the whole write.
+fn stage_write(
+    staged: &mut Staged,
+    overlay: &BTreeMap<String, Option<FileData>>,
+    path: &str,
+    bytes: Vec<u8>,
+    was_tombstone: bool,
+) -> io::Result<FileData> {
+    let data = staged.write(path, bytes)?;
+    if was_tombstone {
+        let list: Vec<&str> = overlay.iter().filter(|(p, d)| d.is_none() && p.as_str() != path).map(|(p, _)| p.as_str()).collect();
+        staged.tombstones(&list)?;
+    }
+    Ok(data)
+}
+
+/// Every disk change one batch makes. Until it answers `Ok` nothing has touched the overlay, and the
+/// `next` it fills in is only worth swapping in if it did.
+fn stage_batch(
+    staged: &mut Staged,
+    next: &mut BTreeMap<String, Option<FileData>>,
+    dropped: &[&str],
+    files: Vec<(String, Vec<u8>)>,
+) -> io::Result<()> {
+    for path in dropped {
+        staged.remove(path)?;
+    }
+    for (path, bytes) in files {
+        let data = staged.write(&path, bytes)?;
+        next.insert(path, Some(data));
+    }
+    let list: Vec<&str> = next.iter().filter(|(_, d)| d.is_none()).map(|(p, _)| p.as_str()).collect();
+    staged.tombstones(&list)
+}
+
+fn stage_delete(staged: &mut Staged, overlay: &BTreeMap<String, Option<FileData>>, path: &str, tombstone: bool) -> io::Result<()> {
+    staged.remove(path)?;
+    let mut list: Vec<&str> = overlay.iter().filter(|(p, d)| d.is_none() && p.as_str() != path).map(|(p, _)| p.as_str()).collect();
+    if tombstone {
+        list.push(path);
+        list.sort_unstable();
+    }
+    staged.tombstones(&list)
 }
 
 pub struct Store {
