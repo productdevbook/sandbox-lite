@@ -43,6 +43,7 @@ pub struct AppState {
     pub preview_secret: Option<String>,
     pub cookie_samesite: SameSite,
     pub chrome: Option<PathBuf>,
+    pub shots: ai::Shots,
     pub started: Instant,
 }
 
@@ -294,6 +295,7 @@ mod tests {
             preview_secret: None,
             cookie_samesite: SameSite::Lax,
             chrome: None,
+            shots: super::ai::Shots::default(),
             started: Instant::now(),
         }))
     }

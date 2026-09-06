@@ -152,9 +152,22 @@ each tool call as they arrive. Conversations are kept per tenant under
 `<data-dir>/<id>/chats/` and are listed in the Chat tab's dropdown, so a
 customer can pick an old thread back up; the tool loop sees the earlier turns.
 
+A conversation does not grow without end. The last `--chat-window` turns
+(default 24) are replayed to the model in full; when a conversation passes that,
+everything older is folded into one summary — written once by the same API,
+stored with the conversation and sent as its opening turn from then on. Should
+that call fail, the turns stay stored and the window is applied to the request
+anyway. Conversations are outside the tenant quota, so `--chats-per-tenant`
+(default 50) is what bounds them: saving past it drops the tenant's least
+recently updated conversation.
+
 `--chrome PATH` adds a sixth tool, `screenshot`, which renders one page of the
 tenant's live preview in headless Chrome and hands the PNG back to the model,
-so it can look at the layout it just changed instead of guessing.
+so it can look at the layout it just changed instead of guessing. A browser
+costs more memory than every tenant on the daemon put together, so
+`--chrome-jobs` (default 1) of them run at once; a call that has not got a slot
+within 10 s is told the tool is busy rather than queueing, and one that overruns
+its 20 s deadline is killed and reaped before its profile directory goes.
 
 ### Flags
 
@@ -174,14 +187,18 @@ so it can look at the layout it just changed instead of guessing.
 --api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
 --preview-secret S   tenant hosts require a per-tenant token derived from S
 --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)
+--chrome-jobs N      screenshots that may run at once (default 1)
+--chat-window N      turns of a conversation replayed to the model in full (default 24)
+--chats-per-tenant N conversations a tenant may keep (default 50)
 --tenant-quota-mb N  edited files a tenant may hold, in MiB (default 64)
 --cookie-samesite lax|none
                      SameSite of the preview cookie; none also sets Secure (default lax)
 ```
 
 `SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET`,
-`SANDBOX_LITE_TENANT_QUOTA_MB`, `SANDBOX_LITE_MAX_COMPILES` and
-`SANDBOX_LITE_CHROME` are read as defaults for those flags, and
+`SANDBOX_LITE_TENANT_QUOTA_MB`, `SANDBOX_LITE_MAX_COMPILES`,
+`SANDBOX_LITE_CHROME`, `SANDBOX_LITE_CHROME_JOBS`, `SANDBOX_LITE_CHAT_WINDOW`
+and `SANDBOX_LITE_CHATS_PER_TENANT` are read as defaults for those flags, and
 `SANDBOX_LITE_ANTHROPIC_BASE` points the chat at another Messages API
 endpoint (default `https://api.anthropic.com`). With a
 preview secret set, `/api/tenants` returns each tenant's `preview_token`;
@@ -228,7 +245,7 @@ Editor host (`localhost`):
 | Method | Path | |
 |---|---|---|
 | GET | `/metrics` | Prometheus text format: gauges, cache and request counters, compile-latency histograms |
-| GET | `/api/stats` | RSS, tenant count, cache stats, module requests and compile totals |
+| GET | `/api/stats` | RSS, tenant count, cache stats, what the chats directory holds, screenshots in flight, module requests and compile totals |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
 | DELETE | `/api/tenants/{id}` | remove tenant and its edits |
 | POST | `/api/tenants/{id}/import` | tar.gz body → overlay; `?replace=1` drops the edits it does not carry |
@@ -262,7 +279,8 @@ curl -fsS -X POST --data-binary @acme.tar.gz localhost:4321/api/tenants/acme-cop
 `sandbox_lite_tenants`, `sandbox_lite_overlay_bytes`, `sandbox_lite_cache_*`,
 `sandbox_lite_sse_subscribers`, `sandbox_lite_rss_bytes`,
 `sandbox_lite_uptime_seconds`, one series per base, `sandbox_lite_sass_*`
-(running, runaway, timeouts, refusals),
+(running, runaway, timeouts, refusals), `sandbox_lite_screenshots_*` (running,
+calls told the tool was busy, browsers killed on their deadline),
 `sandbox_lite_module_requests_total{kind,status}` and
 `sandbox_lite_compile_seconds{kind}` — a histogram of what a transform-cache
 miss costs, so `histogram_quantile(0.99, …)` answers "how slow is a cold

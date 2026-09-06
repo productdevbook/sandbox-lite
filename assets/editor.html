@@ -233,6 +233,7 @@ async function openChat(id) {
   if (!id) return;
   try {
     const c = await api("GET", `/api/t/${state.tenant}/chats/${encodeURIComponent(id)}`);
+    if (c.summary) addMsg("sys", "earlier in this conversation: " + c.summary);
     for (const m of c.messages) addMsg(m.role === "user" ? "user" : "ai", m.text, (m.tools || []).map(chipLabel));
   } catch (e) { addMsg("sys", "cannot open that conversation: " + e.message); }
 }

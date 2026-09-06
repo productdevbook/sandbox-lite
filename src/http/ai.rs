@@ -11,10 +11,10 @@ use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -31,6 +31,23 @@ const SHOT_TIMEOUT: Duration = Duration::from_secs(20);
 const VIRTUAL_TIME: Duration = Duration::from_secs(8);
 const SHOT_SIZE: &str = "1280,900";
 const MAX_SHOT: usize = 4 << 20;
+
+/// Screenshots that may run at once. One headless Chrome costs more memory than every tenant on
+/// the daemon put together, so the default is the smallest number that still works.
+pub const DEFAULT_CHROME_JOBS: usize = 1;
+/// How long a screenshot waits for a free slot before telling the model the tool is busy. Short
+/// enough that the model gets an answer rather than a stalled tool call.
+const SHOT_WAIT: Duration = Duration::from_secs(10);
+
+/// Tokens the summary of a compacted conversation may use, and what one of its turns contributes
+/// to the transcript the summary is written from. Both bound a request whose whole point is that
+/// the conversation was already too long to send.
+const SUMMARY_TOKENS: u32 = 512;
+const SUMMARY_TURN_CHARS: usize = 1000;
+const SUMMARY_TRANSCRIPT: usize = 24 << 10;
+const SUMMARY_PROMPT: &str = "You compress the earlier part of a conversation between a customer and an assistant that edits their website. \
+Reply with a short summary — a few sentences, no preamble — of what the customer asked for, what was changed and what is still open, \
+so the assistant can carry on without the full transcript.";
 
 #[derive(Deserialize)]
 pub struct ChatMsg {
@@ -157,6 +174,52 @@ fn shot_path(raw: &str) -> Option<String> {
     Some(if raw.starts_with('/') { raw.to_string() } else { format!("/{raw}") })
 }
 
+#[derive(Serialize, Clone, Copy)]
+pub struct ShotStats {
+    pub running: usize,
+    pub limit: usize,
+    pub busy: u64,
+    pub timeouts: u64,
+}
+
+/// The screenshot tool, bounded. Each call spawns a browser with its own profile directory, so
+/// only `jobs` of them run at once and a call that cannot get a slot within `wait` tells the model
+/// the tool is busy rather than queueing behind an unbounded number of browsers.
+pub struct Shots {
+    permits: Semaphore,
+    jobs: usize,
+    wait: Duration,
+    deadline: Duration,
+    busy: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+impl Default for Shots {
+    fn default() -> Shots {
+        Shots::new(DEFAULT_CHROME_JOBS)
+    }
+}
+
+impl Shots {
+    pub fn new(jobs: usize) -> Shots {
+        Shots::with(jobs, SHOT_WAIT, SHOT_TIMEOUT)
+    }
+
+    fn with(jobs: usize, wait: Duration, deadline: Duration) -> Shots {
+        let jobs = jobs.max(1);
+        Shots { permits: Semaphore::new(jobs), jobs, wait, deadline, busy: AtomicU64::new(0), timeouts: AtomicU64::new(0) }
+    }
+
+    pub fn stats(&self) -> ShotStats {
+        ShotStats {
+            running: self.jobs.saturating_sub(self.permits.available_permits()),
+            limit: self.jobs,
+            busy: self.busy.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
 async fn screenshot(st: &AppState, t: &Tenant, input: &Value) -> ToolOut {
     let Some(chrome) = st.chrome.clone() else {
         return ToolOut::text("error: the screenshot tool is not configured; the daemon was started without --chrome");
@@ -164,13 +227,37 @@ async fn screenshot(st: &AppState, t: &Tenant, input: &Value) -> ToolOut {
     let Some(path) = shot_path(input.get("path").and_then(|p| p.as_str()).unwrap_or("/")) else {
         return ToolOut::text("error: bad path; pass a site path such as /blog");
     };
+    let permit = match tokio::time::timeout(st.shots.wait, st.shots.permits.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(e)) => return ToolOut::text(format!("error: the screenshot tool is closed: {e}")),
+        Err(_) => {
+            st.shots.busy.fetch_add(1, Ordering::Relaxed);
+            let (jobs, waited) = (st.shots.jobs, st.shots.wait.as_secs());
+            return ToolOut::text(format!(
+                "error: the screenshot tool is busy; {jobs} may run at once and none finished within {waited}s. Try again in a moment."
+            ));
+        }
+    };
+    let out = shoot(st, &chrome, t, &path).await;
+    drop(permit);
+    out
+}
+
+async fn shoot(st: &AppState, chrome: &std::path::Path, t: &Tenant, path: &str) -> ToolOut {
     let scratch = match Scratch::new() {
         Ok(s) => s,
         Err(e) => return ToolOut::text(format!("error: cannot create a temporary directory: {e}")),
     };
     let png = scratch.dir.join("shot.png");
-    let url = preview_url_path(st, &t.id, &path);
-    let child = Command::new(&chrome)
+    // chrome's stderr goes to a file in the profile rather than a pipe: nothing has to drain it
+    // while the browser runs, and it is removed with everything else
+    let log = scratch.dir.join("chrome.log");
+    let errors = match std::fs::File::create(&log) {
+        Ok(f) => f,
+        Err(e) => return ToolOut::text(format!("error: cannot create a temporary file: {e}")),
+    };
+    let url = preview_url_path(st, &t.id, path);
+    let child = Command::new(chrome)
         .arg("--headless=new")
         .arg("--disable-gpu")
         .arg("--no-sandbox")
@@ -184,21 +271,27 @@ async fn screenshot(st: &AppState, t: &Tenant, input: &Value) -> ToolOut {
         .arg(format!("{url}{}sl_shot=1", if url.contains('?') { '&' } else { '?' }))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(errors))
         .kill_on_drop(true)
         .spawn();
-    let child = match child {
+    let mut child = match child {
         Ok(c) => c,
         Err(e) => return ToolOut::text(format!("error: cannot run {}: {e}", chrome.display())),
     };
-    let finished = match tokio::time::timeout(SHOT_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(o)) => o,
+    let status = match tokio::time::timeout(st.shots.deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
         Ok(Err(e)) => return ToolOut::text(format!("error: chrome failed: {e}")),
-        Err(_) => return ToolOut::text(format!("error: chrome did not finish within {}s", SHOT_TIMEOUT.as_secs())),
+        Err(_) => {
+            st.shots.timeouts.fetch_add(1, Ordering::Relaxed);
+            // killed and reaped here rather than left to `kill_on_drop`, so that nothing is still
+            // writing into the profile directory when `Scratch` removes it
+            let _ = child.kill().await;
+            return ToolOut::text(format!("error: chrome did not finish within {}s", st.shots.deadline.as_secs()));
+        }
     };
     let Ok(bytes) = std::fs::read(&png) else {
-        let stderr = String::from_utf8_lossy(&finished.stderr);
-        return ToolOut::text(format!("error: chrome wrote no screenshot ({}): {}", finished.status, summarize(&stderr)));
+        let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+        return ToolOut::text(format!("error: chrome wrote no screenshot ({status}): {}", summarize(&stderr)));
     };
     if bytes.len() > MAX_SHOT {
         return ToolOut::text(format!("error: the screenshot is {} bytes, more than the {MAX_SHOT} byte limit", bytes.len()));
@@ -229,7 +322,9 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            eprintln!("cannot remove the screenshot directory {}: {e}", self.dir.display());
+        }
     }
 }
 
@@ -363,10 +458,76 @@ async fn converse(st: &State, t: &Arc<Tenant>, key: &str, mut messages: Vec<Valu
     Ok(Answer { text, changes, iterations, tools: tools_used })
 }
 
+/// The turns past the window, as one transcript for the summarizer. Newest first while the budget
+/// is spent, so what survives the cut is the part closest to the conversation still going on.
+fn transcript(previous: &str, turns: &[Turn]) -> String {
+    let mut budget = SUMMARY_TRANSCRIPT;
+    let mut lines: Vec<String> = Vec::new();
+    for turn in turns.iter().rev().filter(|t| !t.text.trim().is_empty()) {
+        let line = format!("{}: {}", turn.role, turn.text.chars().take(SUMMARY_TURN_CHARS).collect::<String>());
+        let Some(left) = budget.checked_sub(line.len()) else { break };
+        budget = left;
+        lines.push(line);
+    }
+    lines.reverse();
+    match previous.trim() {
+        "" => lines.join("\n\n"),
+        earlier => format!("Summary of what came before this transcript:\n{earlier}\n\nTranscript:\n{}", lines.join("\n\n")),
+    }
+}
+
+/// Folds everything past the window into the conversation's stored summary, with one call to the
+/// same API. It runs when a conversation crosses the window and not on the turns between, so the
+/// summary is written roughly once every half window rather than once per turn. A summary the API
+/// will not write is not fatal: the turns stay stored, and `for_model` cuts them out of the
+/// request instead.
+async fn compact(st: &State, key: &str, conv: &mut Conversation) {
+    let drop = conv.overflow(st.chats.window());
+    if drop == 0 {
+        return;
+    }
+    let prompt = transcript(&conv.summary, &conv.messages[..drop]);
+    match summarize_conversation(st, key, prompt).await {
+        Some(summary) => conv.compact(drop, summary),
+        None => eprintln!("chat {}: cannot summarize the {drop} oldest turns; they are left out of the request instead", conv.id),
+    }
+}
+
+async fn summarize_conversation(st: &State, key: &str, prompt: String) -> Option<String> {
+    let body = json!({
+        "model": st.model,
+        "max_tokens": SUMMARY_TOKENS,
+        "system": SUMMARY_PROMPT,
+        "messages": [{ "role": "user", "content": prompt }],
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", st.api_base))
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let reply: Value = resp.json().await.ok()?;
+    let text = reply["content"]
+        .as_array()?
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Runs one request end to end and records it. The value is the `done` payload, which is also the
 /// JSON body of the non-streaming reply.
 async fn run(st: State, t: Arc<Tenant>, key: String, req: ChatReq, mut conv: Conversation, out: Emitter) -> Result<Value, Fail> {
-    let mut messages = conv.for_model();
+    compact(&st, &key, &mut conv).await;
+    let mut messages = conv.for_model(st.chats.window());
     messages.extend(req.messages.iter().map(|m| json!({ "role": m.role, "content": m.content })));
     let answer = converse(&st, &t, &key, messages, &out).await?;
     for m in &req.messages {
@@ -466,7 +627,14 @@ mod tests {
         ])
     }
 
-    /// Replays `turns` in order and records every request body it was sent.
+    /// What the stub answers a summarize request with; the tool loop never asks for one.
+    const STUB_SUMMARY: &str = "The customer asked for a green headline and got one.";
+    /// A turn carrying this makes the stub refuse to summarize it.
+    const REFUSE: &str = "(unsummarizable)";
+
+    /// Replays `turns` in order and records every request body it was sent. A request that did not
+    /// ask for a stream is the summarizer's: it is answered as one plain message and does not
+    /// consume a turn, unless what it was asked to summarize says to refuse.
     async fn upstream(turns: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -475,13 +643,22 @@ mod tests {
             post(move |Json(body): Json<Value>| {
                 let (recorder, turns) = (recorder.clone(), turns.clone());
                 async move {
+                    let streaming = body["stream"] == true;
+                    let refuse = !streaming && body["messages"][0]["content"].as_str().is_some_and(|p| p.contains(REFUSE));
                     let n = {
                         let mut seen = recorder.lock().unwrap();
                         seen.push(body);
-                        seen.len()
+                        seen.iter().filter(|b| b["stream"] == true).count()
                     };
+                    if refuse {
+                        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "no" }))).into_response();
+                    }
+                    if !streaming {
+                        let reply = json!({ "content": [{ "type": "text", "text": STUB_SUMMARY }] });
+                        return ([(header::CONTENT_TYPE, "application/json")], reply.to_string()).into_response();
+                    }
                     let body = turns.get(n - 1).cloned().unwrap_or_else(|| turn_with_text("(unexpected extra turn)"));
-                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
                 }
             }),
         );
@@ -504,6 +681,10 @@ mod tests {
     }
 
     async fn fixture(turns: Vec<String>, persist: bool) -> Fixture {
+        fixture_with(turns, persist, None, Shots::default()).await
+    }
+
+    async fn fixture_with(turns: Vec<String>, persist: bool, chrome: Option<PathBuf>, shots: Shots) -> Fixture {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!("sandbox-lite-chat-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
         let (base_dir, data_dir) = (root.join("base"), root.join("data"));
@@ -528,7 +709,8 @@ mod tests {
             api_token: None,
             preview_secret: None,
             cookie_samesite: super::super::SameSite::Lax,
-            chrome: None,
+            chrome,
+            shots,
             started: Instant::now(),
         });
         Fixture { st, seen, root }
@@ -682,6 +864,7 @@ mod tests {
             preview_secret: None,
             cookie_samesite: super::super::SameSite::Lax,
             chrome: None,
+            shots: super::super::ai::Shots::default(),
             started: Instant::now(),
         });
         broken.store.add_base(Base::load("test", &f.root.join("base")).unwrap());
@@ -700,6 +883,195 @@ mod tests {
         }
         assert_eq!(base64(&[0xff, 0xff, 0xff]), "////");
         assert_eq!(base64(&[0, 0, 0]), "AAAA");
+    }
+
+    /// Issue #45: replaying every stored turn grows the request until the model's context is the
+    /// limit. Past the window the older turns become one summary, written by the same API.
+    #[tokio::test]
+    async fn a_conversation_past_the_window_is_summarized_once_and_the_summary_is_stored() {
+        let f = fixture(vec![turn_with_text("First."), turn_with_text("Second.")], true).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let window = f.st.chats.window();
+        let mut old = Conversation::new("old".into());
+        for i in 0..window * 2 {
+            old.push(Turn { role: if i % 2 == 0 { "user" } else { "assistant" }.into(), text: format!("turn {i}"), tools: Vec::new() });
+        }
+        f.st.chats.save(&t, &old).unwrap();
+        let dropped = old.overflow(window);
+
+        let (status, _) = post_chat(&f.st, None, ask("carry on", Some("old"))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stored = f.st.chats.load(&t, "old").unwrap();
+        assert_eq!(stored.summary, STUB_SUMMARY);
+        assert_eq!(stored.messages.len(), window * 2 - dropped + 2, "the window, plus this request's two turns");
+        assert_eq!(stored.messages[0].text, format!("turn {dropped}"));
+
+        let seen = f.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one summarize call and one turn of the tool loop");
+        assert!(seen[0]["stream"].is_null(), "the summarizer does not stream: {}", seen[0]);
+        assert_eq!(seen[0]["messages"].as_array().unwrap().len(), 1);
+        let prompt = seen[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(prompt.contains("turn 0") && prompt.contains(&format!("turn {}", dropped - 1)), "{prompt}");
+        assert!(!prompt.contains(&format!("turn {dropped}")), "the turns that stay are not summarized: {prompt}");
+
+        let sent = seen[1]["messages"].as_array().unwrap();
+        // the summary joins the user turn that follows it, so this is the turns left plus the new message
+        assert_eq!(sent.len(), window * 2 - dropped + 1);
+        assert!(sent[0]["content"].as_str().unwrap().contains(STUB_SUMMARY), "{}", sent[0]);
+        assert_eq!(sent[sent.len() - 1], json!({"role":"user","content":"carry on"}));
+    }
+
+    /// The summary is written once, when the conversation crosses the window — not on the turns
+    /// after it, when replaying it again would cost a call per message.
+    #[tokio::test]
+    async fn the_summary_is_not_rewritten_on_every_turn() {
+        let f = fixture(vec![turn_with_text("First."), turn_with_text("Second."), turn_with_text("Third.")], false).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let mut old = Conversation::new("old".into());
+        for i in 0..f.st.chats.window() + 1 {
+            old.push(Turn { role: if i % 2 == 0 { "user" } else { "assistant" }.into(), text: format!("turn {i}"), tools: Vec::new() });
+        }
+        f.st.chats.save(&t, &old).unwrap();
+        for _ in 0..3 {
+            assert_eq!(post_chat(&f.st, None, ask("more", Some("old"))).await.0, StatusCode::OK);
+        }
+        let summarize_calls = f.seen.lock().unwrap().iter().filter(|b| b["stream"].is_null()).count();
+        assert_eq!(summarize_calls, 1, "three requests, one summary");
+    }
+
+    /// A summary the API will not write must not lose the turns it was meant to replace — and the
+    /// request has to be bounded anyway, so `for_model` cuts them out instead.
+    #[tokio::test]
+    async fn a_summary_the_api_refuses_leaves_the_turns_stored_and_out_of_the_request() {
+        let f = fixture(vec![turn_with_text("Fine.")], false).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let window = f.st.chats.window();
+        let mut old = Conversation::new("old".into());
+        for i in 0..window * 4 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            old.push(Turn { role: role.into(), text: format!("{REFUSE} turn {i}"), tools: Vec::new() });
+        }
+        f.st.chats.save(&t, &old).unwrap();
+
+        let (status, _) = post_chat(&f.st, None, ask("carry on", Some("old"))).await;
+        assert_eq!(status, StatusCode::OK, "a summary that cannot be written is not a failed request");
+
+        let stored = f.st.chats.load(&t, "old").unwrap();
+        assert_eq!(stored.summary, "");
+        assert_eq!(stored.messages.len(), window * 4 + 2, "no turn is dropped without a summary to stand for it");
+        let seen = f.seen.lock().unwrap();
+        assert_eq!(seen[1]["messages"].as_array().unwrap().len(), window + 1, "the request is bounded by the window regardless");
+    }
+
+    /// A stand-in for chrome: it records the profile directory it was handed, sleeps, and writes
+    /// the file it was told to screenshot. Chrome itself is not on the machine that runs these,
+    /// and what the limiter has to bound is exactly this — a process that takes time and leaves a
+    /// profile directory behind.
+    #[cfg(unix)]
+    struct Stub {
+        dir: PathBuf,
+        bin: PathBuf,
+        report: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Stub {
+        fn new(sleep: &str, write_png: bool) -> Stub {
+            use std::os::unix::fs::PermissionsExt;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir =
+                std::env::temp_dir().join(format!("sandbox-lite-stub-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (bin, report) = (dir.join("chrome"), dir.join("profiles"));
+            let png = if write_png { "echo PNGSTUB > \"$out\"" } else { ":" };
+            let script = format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --user-data-dir=*) echo \"${{arg#--user-data-dir=}}\" >> \"{}\" ;;\n    --screenshot=*) out=\"${{arg#--screenshot=}}\" ;;\n  esac\ndone\nsleep {sleep}\n{png}\n",
+                report.display()
+            );
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Stub { dir, bin, report }
+        }
+
+        /// Every profile directory the stub was started with, in order.
+        fn profiles(&self) -> Vec<PathBuf> {
+            std::fs::read_to_string(&self.report).unwrap_or_default().lines().map(PathBuf::from).collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Stub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Issue #46: N concurrent chats used to spawn N browsers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_so_many_screenshots_run_at_once_and_the_rest_are_told_to_try_again() {
+        let stub = Stub::new("0.6", true);
+        let shots = Shots::with(1, Duration::from_millis(150), Duration::from_secs(20));
+        let f = fixture_with(Vec::new(), false, Some(stub.bin.clone()), shots).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let input = json!({ "path": "/" });
+        let (first, second) = tokio::join!(screenshot(&f.st, &t, &input), screenshot(&f.st, &t, &input));
+
+        let answers = [first.summary, second.summary];
+        assert!(answers.iter().any(|a| a.starts_with("screenshot of /")), "{answers:?}");
+        assert!(answers.iter().any(|a| a.contains("the screenshot tool is busy")), "{answers:?}");
+        let stats = f.st.shots.stats();
+        assert_eq!((stats.busy, stats.running, stats.limit), (1, 0, 1));
+        assert_eq!(stub.profiles().len(), 1, "the refused call never started a browser");
+        for dir in stub.profiles() {
+            assert!(!dir.exists(), "{} was left behind", dir.display());
+        }
+    }
+
+    /// The profile directory and the PNG go with the value, and the browser is killed and reaped
+    /// before they do, so nothing is still writing into the directory when it is removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_screenshot_that_overruns_its_deadline_is_killed_and_leaves_nothing_behind() {
+        let stub = Stub::new("5", false);
+        let shots = Shots::with(1, Duration::from_secs(1), Duration::from_millis(250));
+        let f = fixture_with(Vec::new(), false, Some(stub.bin.clone()), shots).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let started = Instant::now();
+        let out = screenshot(&f.st, &t, &json!({ "path": "/blog" })).await;
+
+        assert!(out.summary.contains("did not finish within"), "{}", out.summary);
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        let stats = f.st.shots.stats();
+        assert_eq!((stats.timeouts, stats.running), (1, 0));
+        let profiles = stub.profiles();
+        assert_eq!(profiles.len(), 1);
+        assert!(!profiles[0].exists(), "{} outlived the browser", profiles[0].display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_browser_that_writes_no_png_reports_what_it_said_and_still_cleans_up() {
+        let stub = Stub::new("0", false);
+        let f = fixture_with(Vec::new(), false, Some(stub.bin.clone()), Shots::default()).await;
+        let t = f.st.store.tenant("acme").unwrap();
+        let out = screenshot(&f.st, &t, &json!({ "path": "/" })).await;
+        assert!(out.summary.starts_with("error: chrome wrote no screenshot"), "{}", out.summary);
+        assert!(!stub.profiles()[0].exists());
+    }
+
+    #[test]
+    fn the_summarizer_transcript_keeps_the_newest_turns_it_can_afford() {
+        let turns: Vec<Turn> =
+            (0..500).map(|i| Turn { role: "user".into(), text: format!("turn {i} ").repeat(200), tools: Vec::new() }).collect();
+        let out = transcript("what came before", &turns);
+        assert!(out.len() <= SUMMARY_TRANSCRIPT + "what came before".len() + 256, "{}", out.len());
+        assert!(out.starts_with("Summary of what came before this transcript:\nwhat came before"), "{out}");
+        assert!(out.contains("turn 499"), "the newest turns survive the cut");
+        assert!(!out.contains("turn 0 "), "the oldest do not");
+        assert_eq!(transcript("", &turns[..1]).lines().count(), 1);
+        assert_eq!(transcript("", &[]), "");
     }
 
     #[test]

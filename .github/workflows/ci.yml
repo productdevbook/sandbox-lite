@@ -45,6 +45,9 @@ jobs:
           grep -qxF 'sandbox_lite_tenants 1' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_cache_hits_total counter' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_sass_runaway gauge' /tmp/metrics.txt
+          grep -qxF 'sandbox_lite_screenshots_running 0' /tmp/metrics.txt
+          grep -qxF '# TYPE sandbox_lite_screenshots_busy_total counter' /tmp/metrics.txt
+          curl -sf http://127.0.0.1:4399/api/stats | grep -q '"max_per_tenant"'
           grep -qxF '# TYPE sandbox_lite_compile_seconds histogram' /tmp/metrics.txt
           grep -qxF '# TYPE sandbox_lite_compiles_queued gauge' /tmp/metrics.txt
           # issue #47: the permit count is what bounds concurrent compiles, so it must never render as 0
