@@ -124,7 +124,8 @@ async function selectTenant(id) {
   state.es.onmessage = async (e) => {
     const d = JSON.parse(e.data);
     await loadFiles();
-    if (state.file && d.path === state.file && !state.dirty && d.type === "update") openFile(state.file, true);
+    // an import bumps the whole tree at once and sends no path
+    if (state.file && !state.dirty && d.type === "update" && (d.path === state.file || d.path === "")) openFile(state.file, true);
   };
   await loadFiles();
 }

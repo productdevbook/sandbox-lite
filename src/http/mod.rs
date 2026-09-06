@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod api;
+pub mod archive;
 pub mod preview;
 
 use std::io::ErrorKind;
@@ -100,7 +101,9 @@ pub fn app(state: State) -> Router {
         .route("/api/bases", get(api::bases))
         .route("/api/tenants", get(api::tenants).post(api::create_tenant))
         .route("/api/tenants/{id}", delete(api::delete_tenant))
+        .route("/api/tenants/{id}/import", post(archive::import))
         .route("/api/t/{id}/files", get(api::files))
+        .route("/api/t/{id}/export", get(archive::export))
         .route("/api/t/{id}/file/{*path}", get(api::read_file).put(api::write_file).delete(api::delete_file))
         .route("/api/t/{id}/events", get(api::events))
         .route("/api/t/{id}/check", get(api::check))

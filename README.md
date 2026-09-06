@@ -211,11 +211,30 @@ Editor host (`localhost`):
 | GET | `/api/stats` | RSS, tenant count, cache stats |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
 | DELETE | `/api/tenants/{id}` | remove tenant and its edits |
+| POST | `/api/tenants/{id}/import` | tar.gz body → overlay; `?replace=1` drops the edits it does not carry |
 | GET | `/api/t/{id}/files` | merged base + overlay listing |
+| GET | `/api/t/{id}/export` | tar.gz of the merged tree; `?overlay=1` for the edits alone |
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
 | GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version |
 | GET | `/api/t/{id}/check` | compile every source file, return diagnostics |
 | POST | `/api/t/{id}/chat` | `{messages:[{role,content}]}` → `{text, changes}` |
+
+`export` answers `application/gzip` with a `<id>.tar.gz` attachment name. By
+default it holds the merged tree — the base project with the tenant's edits
+applied and its deleted files left out — which is what `astro build` wants.
+A merged export carries no record of what the tenant deleted, so importing one
+into another tenant on the same base leaves that tenant's copy of a deleted
+file in place. `?overlay=1` holds only the tenant's own files plus a
+`.sandbox-lite/deleted.json` listing the base files it deleted; `import`
+applies that list rather than writing the file, so an overlay export
+reproduces a tenant exactly on another daemon with the same base. An import
+writes every entry through the tenant quota, bumps the version once and emits
+one `update` event, whatever the file count.
+
+```sh
+curl -fsS localhost:4321/api/t/acme/export?overlay=1 > acme.tar.gz
+curl -fsS -X POST --data-binary @acme.tar.gz localhost:4321/api/tenants/acme-copy/import
+```
 
 Tenant host (`<id>.<domain>`):
 
