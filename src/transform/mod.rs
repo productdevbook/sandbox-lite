@@ -21,6 +21,7 @@ use xxhash_rust::xxh3::{Xxh3Default, xxh3_128};
 use crate::metrics::Metrics;
 use crate::resolve::{Resolver, dirname};
 use crate::store::{Tenant, UpdateKind};
+use crate::sync::{Held, Waited};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Diag {
@@ -111,7 +112,9 @@ pub const JS: &str = "text/javascript; charset=utf-8";
 pub const JSON: &str = "application/json; charset=utf-8";
 
 /// oxc, astro_codegen, satteri-mdxjs and grass are recursive-descent, so a source byte can cost a
-/// stack frame and a stack overflow aborts the process (`panic = "abort"`). The two shapes measured
+/// stack frame. A stack overflow is not a panic and no `catch_unwind` sees it: the guard page kills
+/// the process whatever the panic strategy, which is why depth is bounded here rather than caught
+/// where a panic would be. The two shapes measured
 /// past 1 KiB of stack per source byte both nest on characters `nesting_depth` counts, so what is
 /// left for the stack to absorb is the recursion that scan cannot see — chained unary `-` through
 /// oxc and `<<` through astro_codegen, both around 300 bytes per source byte in a debug build. The
@@ -324,7 +327,7 @@ struct Permit<'a>(&'a Gate);
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.state.held();
         state.running -= 1;
         drop(state);
         self.0.free.notify_one();
@@ -346,7 +349,7 @@ impl Gate {
     }
 
     fn stats(&self) -> CompileStats {
-        let state = self.state.lock().unwrap();
+        let state = self.state.held();
         CompileStats {
             running: state.running,
             queued: state.queued,
@@ -371,7 +374,7 @@ impl Gate {
             ));
         }
         let limit = self.limit.load(Ordering::Relaxed);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.held();
         if state.running >= limit {
             let deadline = Instant::now() + self.wait;
             state.queued += 1;
@@ -383,7 +386,7 @@ impl Gate {
                     let ms = self.wait.as_millis();
                     return Err(format!("{limit} compiles are already running and this one waited {ms} ms for a slot"));
                 };
-                state = self.free.wait_timeout(state, left).unwrap().0;
+                state = self.free.waited_for(state, left);
                 if state.running < limit {
                     state.queued -= 1;
                     break;
@@ -399,7 +402,7 @@ impl Gate {
     /// this and `settled` take the gate's lock, so a compile that finishes in the same instant as
     /// the deadline is either counted and uncounted or neither.
     fn overran(&self, state: &AtomicU8) {
-        let _lock = self.state.lock().unwrap();
+        let _lock = self.state.held();
         if state.compare_exchange(RUNNING, RUNAWAY, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             self.runaway.fetch_add(1, Ordering::Relaxed);
             self.timeouts.fetch_add(1, Ordering::Relaxed);
@@ -407,7 +410,7 @@ impl Gate {
     }
 
     fn settled(&self, state: &AtomicU8) {
-        let _lock = self.state.lock().unwrap();
+        let _lock = self.state.held();
         if state.swap(SETTLED, Ordering::Relaxed) == RUNAWAY {
             self.runaway.fetch_sub(1, Ordering::Relaxed);
         }
@@ -442,14 +445,14 @@ struct Lead<'a> {
 
 impl Lead<'_> {
     fn settle(&self, outcome: &Result<Arc<Built>, BuildError>) {
-        *self.flight.done.lock().unwrap() = Some(outcome.clone());
+        *self.flight.done.held() = Some(outcome.clone());
     }
 }
 
 impl Drop for Lead<'_> {
     fn drop(&mut self) {
-        self.engine.inflight.lock().unwrap().remove(&self.key);
-        let mut done = self.flight.done.lock().unwrap();
+        self.engine.inflight.held().remove(&self.key);
+        let mut done = self.flight.done.held();
         if done.is_none() {
             *done = Some(Err(BuildError::busy("the compile this request was waiting on ended without an answer".into())));
         }
@@ -537,7 +540,7 @@ impl Engine {
     }
 
     pub fn stats(&self) -> CacheStats {
-        let c = self.cache.lock().unwrap();
+        let c = self.cache.held();
         CacheStats { entries: c.map.len(), bytes: c.bytes, hits: c.hits, misses: c.misses, coalesced: c.coalesced }
     }
 
@@ -561,25 +564,25 @@ impl Engine {
         if COMPILING.get() {
             return Join::Solo;
         }
-        let mut map = self.inflight.lock().unwrap();
+        let mut map = self.inflight.held();
         let Some(running) = map.get(&key).cloned() else {
             let flight = Arc::<Inflight>::default();
             map.insert(key, flight.clone());
             return Join::Lead(Lead { engine: self, key, flight });
         };
         drop(map);
-        self.cache.lock().unwrap().coalesced += 1;
-        let mut done = running.done.lock().unwrap();
+        self.cache.held().coalesced += 1;
+        let mut done = running.done.held();
         loop {
             if let Some(outcome) = done.clone() {
                 return Join::Waited(outcome);
             }
-            done = running.ready.wait(done).unwrap();
+            done = running.ready.waited(done);
         }
     }
 
     fn cached(&self, key: u128) -> Option<Arc<Built>> {
-        let mut c = self.cache.lock().unwrap();
+        let mut c = self.cache.held();
         match c.map.get(&key).cloned() {
             Some(b) => {
                 c.hits += 1;
@@ -593,7 +596,7 @@ impl Engine {
     }
 
     fn insert(&self, key: u128, built: Arc<Built>) {
-        let mut c = self.cache.lock().unwrap();
+        let mut c = self.cache.held();
         if c.map.contains_key(&key) {
             return;
         }
@@ -779,7 +782,7 @@ impl Engine {
             ON_PARSER_STACK.set(true);
             let _compiling = Compiling::enter();
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            *mine.done.lock().unwrap() = Some(out);
+            *mine.done.held() = Some(out);
             mine.ready.notify_all();
             engine.gate.settled(&mine.state);
         });
@@ -789,14 +792,14 @@ impl Engine {
         #[cfg(test)]
         SPAWNED.set(SPAWNED.get() + 1);
         let deadline = Instant::now() + self.cfg.compile_timeout;
-        let mut done = flight.done.lock().unwrap();
+        let mut done = flight.done.held();
         loop {
             if let Some(out) = done.take() {
                 drop(done);
                 return out.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
-            done = flight.ready.wait_timeout(done, left).unwrap().0;
+            done = flight.ready.waited_for(done, left);
         }
         drop(done);
         self.gate.overran(&flight.state);
@@ -816,7 +819,7 @@ impl Engine {
         if kind != Kind::Module || !path.ends_with(".astro") {
             return;
         }
-        let mut map = self.last_js.lock().unwrap();
+        let mut map = self.last_js.held();
         if map.len() >= LAST_JS_ENTRIES {
             map.clear();
         }
@@ -832,7 +835,7 @@ impl Engine {
         if !path.ends_with(".astro") {
             return UpdateKind::from_path(path);
         }
-        let before = self.last_js.lock().unwrap().get(&(tenant.id.clone(), path.to_string())).copied();
+        let before = self.last_js.held().get(&(tenant.id.clone(), path.to_string())).copied();
         let Some(before) = before else { return UpdateKind::Module };
         match self.build_bytes(tenant, path, Kind::Module, Arc::from(bytes)) {
             Ok(built) if module_fingerprint(&built) == before => UpdateKind::Style,
@@ -1639,5 +1642,72 @@ mod tests {
         assert_eq!(svg_size("<svg viewBox=\"0 0 NaN -1\">"), (0, 0));
         assert_eq!(svg_size("<svg width=\"24px\" height='16'>"), (24, 16));
         assert_eq!(svg_size("<svg width=\"x\" viewBox=\"0,0,100.4,50.5\">"), (100, 51));
+    }
+
+    /// Issue #93. These run under `cargo test`, which has always unwound; what makes them mean
+    /// something about the shipped daemon is `ratchets::the_release_profile_unwinds`.
+    ///
+    /// A panicking compile crosses two threads: the compile thread catches it, the request thread
+    /// resumes it. On the way out the permit and the key have to be given back, or the daemon is
+    /// one compile poorer and one deadlock nearer for every panic it survives.
+    #[test]
+    fn a_panicking_compile_gives_back_its_permit_and_stays_out_of_the_runaway_count() {
+        let e = engine_gated(Config::default(), 1, Duration::from_millis(50));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = e.gate.enter().expect("the gate has a permit");
+            e.deadlined::<()>("boom.astro", || panic!("the compiler panicked"))
+        }));
+
+        assert!(panicked.is_err(), "the panic must reach the request thread, not be swallowed");
+        let stats = e.compile_stats();
+        assert_eq!((stats.running, stats.runaway, stats.timeouts), (0, 0, 0));
+        assert!(e.gate.enter().is_ok(), "the permit went back to the pool during the unwind");
+    }
+
+    /// `Lead::drop` says it hands the waiters an answer when a panic goes through it. Under
+    /// `panic = "abort"` it could not; this is the first release in which it does.
+    #[test]
+    fn a_panic_while_leading_a_key_answers_the_callers_waiting_on_it() {
+        let e = engine();
+        let key = 0x9317u128;
+        let leader = e.clone();
+        let (took_the_key, taken) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Join::Lead(_lead) = leader.join(key) else { panic!("this thread must be the leader") };
+                    took_the_key.send(()).unwrap();
+                    // `join` counts a follower before it waits, so this is the follower arriving
+                    while leader.stats().coalesced == 0 {
+                        std::thread::yield_now();
+                    }
+                    panic!("the compile panicked while leading the key");
+                }));
+                assert!(panicked.is_err());
+            });
+            taken.recv().unwrap();
+            match e.join(key) {
+                Join::Waited(Err(answer)) => assert_eq!(answer.status, 503, "{}", answer.message),
+                Join::Waited(Ok(_)) => panic!("nothing was built"),
+                _ => panic!("the follower must wait on the leader, not take the key"),
+            }
+        });
+    }
+
+    /// A `Mutex` whose holder panicked hands every later caller an `Err`. With `unwrap()` that is
+    /// one request turning into a permanent 500 for every tenant; `src/sync.rs` takes the data back.
+    #[test]
+    fn a_poisoned_gate_lock_does_not_wedge_the_daemon() {
+        let e = engine();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = e.gate.state.held();
+            panic!("while holding the gate");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(e.gate.state.is_poisoned(), "the panic must have poisoned it, or this proves nothing");
+        assert_eq!(e.compile_stats().running, 0);
+        let t = tenant(&[("src/lib/x.ts", "export const a: number = 1;")]);
+        assert!(e.build(&t, "src/lib/x.ts", Kind::Module).is_ok(), "compiles still get through the gate");
     }
 }

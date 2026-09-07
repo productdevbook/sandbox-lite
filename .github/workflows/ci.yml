@@ -22,6 +22,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      # what a build setting costs in bytes is an argument the project keeps having: put it in the log
+      - run: stat -c 'release binary %s bytes' target/release/sandbox-lite
       - run: ./target/release/sandbox-lite check examples/starter examples/tailwind examples/react examples/vue examples/svelte
       - name: smoke test the daemon
         run: |

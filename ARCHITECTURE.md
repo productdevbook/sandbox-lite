@@ -26,9 +26,10 @@ one per request from the `Host` header (lowercased, port stripped):
   `/api/tenants/{id}/import`, `/api/t/{id}/files`, `/api/t/{id}/export`,
   `/api/t/{id}/file/{*path}`, `/api/t/{id}/events`, `/api/t/{id}/check`,
   `/api/t/{id}/chat`, `/api/t/{id}/chats` and `/api/t/{id}/chats/{chat}`, with
-  a 64 MiB body limit. `require_api_token` wraps all of it, so that whole list
-  is the `--api-token` surface — `import` and `export` included, which move
-  whole file trees.
+  a 64 MiB body limit. `require_api_token` wraps all of it and then exempts two
+  paths, `/` and `/health`, so the `--api-token` surface is everything else on
+  that list — `import` and `export`, which move whole file trees, and
+  `/metrics`, which a scrape must therefore authenticate to.
 
 `SECURITY.md` describes the two middlewares.
 
@@ -38,10 +39,14 @@ A **base** is a project directory read at startup (`Base::load`): every regular
 file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`, `.netlify`,
 `.output`. Files up to 256 KiB are held in memory (`FileData::Mem`); larger ones
 stay on disk and are re-read on each access (`FileData::Disk`). Bases come from
-every sub-directory of `--bases` (default `./examples` when it exists) that is
+every sub-directory of `--bases` that is
 a directory in its own right — `Store::bases_in_dir` reads the entry's own
 type, so a symbolic link is skipped rather than followed — from each
-`--base NAME=PATH`, and from `POST /api/bases` at run time. All three put the
+`--base NAME=PATH`, and from `POST /api/bases` at run time. `./examples` is the
+default for `--bases`, but only when neither flag names a base
+(`src/main.rs`): `--base theme=/srv/theme` alone loads exactly that one base,
+because naming a base is configuring the daemon and the default is there for
+the daemon nobody configured. All three put the
 root through `Store::base_root` first, so with `--bases` set a root outside it
 is refused whichever way it arrives. `Base::load`
 also records a `stamp`: a hash of the name, size and mtime of every file it
@@ -490,6 +495,44 @@ bytes — which is why `Engine` is a handle to a shared `EngineInner`.
 
 The size and nesting caps are checked before the permit and before the thread:
 a source that cannot be compiled has no business queueing for the right to try.
+
+### What a panic costs
+
+The release profile unwinds — there is no `panic = "abort"` (#93) — so a panic
+in `grass`, oxc, `astro_codegen` or `satteri-mdxjs`, all of which parse
+tenant-controlled input, costs one request rather than every tenant on the box.
+The compile thread catches it (`catch_unwind` in `Engine::deadlined`), the
+request thread resumes it, and on the way out `Permit::drop` puts the permit
+back and `Lead::drop` hands the callers waiting on that key a 503. The Sass
+thread does the same in `Flights::flight_body`, which is where
+"the Sass compiler panicked" comes from. A stack overflow is not a panic and
+none of that catches it — the guard page ends the process whatever the profile
+says, which is why depth is capped before a parser sees it.
+
+Unwinding through a lock poisons it, and `unwrap()` on the next caller would
+turn one failed compile into a permanent 500 for every tenant — two of those
+callers are `Drop` impls running during the unwind, where a second panic is an
+abort. So no lock in the daemon panics on poison: `src/sync.rs` gives `Mutex`,
+`RwLock` and `Condvar` a `held`/`shared`/`exclusive`/`waited`/`waited_for` that
+take the data back, because every lock here guards a counter, a map of `Arc`s
+or a `done` slot and none holds an invariant that spans an unlocked moment.
+`src/ratchets.rs` fails the build if `panic = "abort"` and `catch_unwind` ever
+appear together again, and if a lock arrives with an `unwrap()`.
+
+### What a handler may do on a worker
+
+Two worker threads answer every request, so a handler that blocks one blocks
+whatever that worker would have answered next — including `/health`, which is
+how an orchestrator decides the node is alive. Every handler's disk and process
+work therefore goes to `tokio::task::spawn_blocking`: the module and content
+builds, `api::write_file`, `api::delete_file`, `api::check`, both halves of
+`archive::import` and `archive::export`, all three of `chats::{list,get,remove}`
+and the chat endpoint's load and save, the chat totals behind `/api/stats` and
+`/metrics`, and the screenshot tool's three blocking parts — the profile
+directory and fork/exec, and the read, base64 and `remove_dir_all` afterwards
+(#94). `src/ratchets.rs` reads each `async fn` in `src/http/` for a `std::fs::`,
+a `Command::new` or a `Chats` call the closure does not cover; what it cannot
+see is such a call behind a helper's own name.
 
 Issue #63 is why the deadline exists. Heading ids in `.mdx` were assigned by
 rescanning the ids already given out, which is O(n³) in the headings of one

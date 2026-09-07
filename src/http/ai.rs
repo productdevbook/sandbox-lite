@@ -246,20 +246,15 @@ async fn screenshot(st: &AppState, t: &Tenant, input: &Value) -> ToolOut {
     out
 }
 
-async fn shoot(st: &AppState, chrome: &std::path::Path, t: &Tenant, path: &str) -> ToolOut {
-    let scratch = match Scratch::new() {
-        Ok(s) => s,
-        Err(e) => return ToolOut::text(format!("error: cannot create a temporary directory: {e}")),
-    };
+/// Everything before the browser is running: the profile directory, chrome's log file and the
+/// fork/exec itself. All three are disk or process work, so `shoot` calls this on the blocking pool
+/// rather than on one of the two async workers (#94).
+fn start(chrome: &std::path::Path, url: &str) -> Result<(Scratch, tokio::process::Child), String> {
+    let scratch = Scratch::new().map_err(|e| format!("cannot create a temporary directory: {e}"))?;
     let png = scratch.dir.join("shot.png");
     // chrome's stderr goes to a file in the profile rather than a pipe: nothing has to drain it
     // while the browser runs, and it is removed with everything else
-    let log = scratch.dir.join("chrome.log");
-    let errors = match std::fs::File::create(&log) {
-        Ok(f) => f,
-        Err(e) => return ToolOut::text(format!("error: cannot create a temporary file: {e}")),
-    };
-    let url = preview_url_path(st, &t.id, path);
+    let errors = std::fs::File::create(scratch.dir.join("chrome.log")).map_err(|e| format!("cannot create a temporary file: {e}"))?;
     let child = Command::new(chrome)
         .arg("--headless=new")
         .arg("--disable-gpu")
@@ -276,40 +271,96 @@ async fn shoot(st: &AppState, chrome: &std::path::Path, t: &Tenant, path: &str) 
         .stdout(Stdio::null())
         .stderr(Stdio::from(errors))
         .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", chrome.display()))?;
+    Ok((scratch, child))
+}
+
+/// What chrome left behind: the image, one too big to send, or none and what it complained about.
+enum Shot {
+    Image(String, u64),
+    TooBig(u64),
+    Missing(String),
+}
+
+/// Reads what chrome wrote and then removes the profile directory — the read, the base64 of up to
+/// `MAX_SHOT`, and a recursive unlink of hundreds of files, on one blocking thread. The `Scratch` is
+/// consumed here so the directory is gone by the time the tool answers.
+fn collect(scratch: Scratch) -> Shot {
+    let png = scratch.dir.join("shot.png");
+    let log = scratch.dir.join("chrome.log");
+    let complaint = || {
+        let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+        Shot::Missing(stderr)
+    };
+    // the size comes from the directory entry, so a PNG past the cap is refused without the daemon
+    // ever holding it
+    let Ok(size) = std::fs::metadata(&png).map(|md| md.len()) else { return complaint() };
+    if size > MAX_SHOT as u64 {
+        return Shot::TooBig(size);
+    }
+    match std::fs::read(&png) {
+        Ok(bytes) => Shot::Image(base64(&bytes), bytes.len() as u64),
+        Err(_) => complaint(),
+    }
+}
+
+/// The profile directory goes away on the blocking pool rather than wherever the tool happened to
+/// give up, and this awaits it, so "nothing is left behind when the call returns" still holds.
+async fn discard(scratch: Scratch) {
+    if let Err(e) = tokio::task::spawn_blocking(move || drop(scratch)).await {
+        eprintln!("cannot remove the screenshot directory: {e}");
+    }
+}
+
+async fn shoot(st: &AppState, chrome: &std::path::Path, t: &Tenant, path: &str) -> ToolOut {
+    let url = preview_url_path(st, &t.id, path);
+    let bin = chrome.to_path_buf();
+    let launched = tokio::task::spawn_blocking(move || start(&bin, &url)).await;
+    let (scratch, mut child) = match launched {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return ToolOut::text(format!("error: {e}")),
         Err(e) => return ToolOut::text(format!("error: cannot run {}: {e}", chrome.display())),
     };
     let status = match tokio::time::timeout(st.shots.deadline, child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(e)) => return ToolOut::text(format!("error: chrome failed: {e}")),
+        Ok(Err(e)) => {
+            // as on the deadline: nothing may still be writing into the profile when it is removed
+            let _ = child.kill().await;
+            discard(scratch).await;
+            return ToolOut::text(format!("error: chrome failed: {e}"));
+        }
         Err(_) => {
             st.shots.timeouts.fetch_add(1, Ordering::Relaxed);
             // killed and reaped here rather than left to `kill_on_drop`, so that nothing is still
             // writing into the profile directory when `Scratch` removes it
             let _ = child.kill().await;
+            discard(scratch).await;
             return ToolOut::text(format!("error: chrome did not finish within {}s", st.shots.deadline.as_secs()));
         }
     };
-    let Ok(bytes) = std::fs::read(&png) else {
-        let stderr = std::fs::read_to_string(&log).unwrap_or_default();
-        return ToolOut::text(format!("error: chrome wrote no screenshot ({status}): {}", summarize(&stderr)));
+    let shot = match tokio::task::spawn_blocking(move || collect(scratch)).await {
+        Ok(shot) => shot,
+        Err(e) => return ToolOut::text(format!("error: cannot read the screenshot: {e}")),
     };
-    if bytes.len() > MAX_SHOT {
-        return ToolOut::text(format!("error: the screenshot is {} bytes, more than the {MAX_SHOT} byte limit", bytes.len()));
-    }
-    let note = format!("screenshot of {path} at {SHOT_SIZE}, {} kB", bytes.len() / 1024);
-    ToolOut {
-        content: json!([
-            { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": base64(&bytes) } },
-            { "type": "text", "text": note.clone() },
-        ]),
-        summary: note,
+    match shot {
+        Shot::Image(data, bytes) => {
+            let note = format!("screenshot of {path} at {SHOT_SIZE}, {} kB", bytes / 1024);
+            ToolOut {
+                content: json!([
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } },
+                    { "type": "text", "text": note.clone() },
+                ]),
+                summary: note,
+            }
+        }
+        Shot::TooBig(bytes) => ToolOut::text(format!("error: the screenshot is {bytes} bytes, more than the {MAX_SHOT} byte limit")),
+        Shot::Missing(stderr) => ToolOut::text(format!("error: chrome wrote no screenshot ({status}): {}", summarize(&stderr))),
     }
 }
 
-/// A temporary directory that goes away with the value, however the tool returned.
+/// A temporary directory that goes away with the value, however the tool returned. `shoot` drops it
+/// on the blocking pool; this is the fallback for the paths that never populated it.
 struct Scratch {
     dir: PathBuf,
 }
@@ -538,15 +589,22 @@ async fn run(st: State, t: Arc<Tenant>, key: String, req: ChatReq, mut conv: Con
         conv.push(turn);
     }
     conv.push(Turn { role: "assistant".into(), text: answer.text.clone(), tools: answer.tools });
-    if let Err(e) = st.chats.save(&t, &conv) {
-        eprintln!("tenant {}: cannot save chat {}: {e}", t.id, conv.id);
+    // `save` writes the file and then evicts, which once a tenant is at `--chats-per-tenant` reads
+    // and parses every conversation the tenant has (#94). The answer is already produced, so a
+    // failure to store it is logged rather than thrown away with the reply.
+    let (saver, saved, chat_id) = (st.clone(), t.clone(), conv.id.clone());
+    let stored = tokio::task::spawn_blocking(move || saver.chats.save(&saved, &conv)).await;
+    match stored {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("tenant {}: cannot save chat {chat_id}: {e}", t.id),
+        Err(e) => eprintln!("tenant {}: cannot save chat {chat_id}: {e}", t.id),
     }
     Ok(json!({
         "text": answer.text,
         "changes": answer.changes,
         "iterations": answer.iterations,
         "version": t.version(),
-        "chat": conv.id,
+        "chat": chat_id,
     }))
 }
 
@@ -568,12 +626,18 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
         Ok(t) => t,
         Err(e) => return super::api::no_tenant(&id, e),
     };
-    let conv = match &req.chat {
-        Some(chat) => match st.chats.load(&t, chat) {
-            Ok(Some(c)) => c,
-            Ok(None) => return err(StatusCode::NOT_FOUND, "unknown chat"),
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        },
+    let conv = match req.chat.clone() {
+        // a read and a parse of the stored conversation, off the async workers like every other
+        // disk call on this router (#94)
+        Some(chat) => {
+            let (loader, of) = (st.clone(), t.clone());
+            match tokio::task::spawn_blocking(move || loader.chats.load(&of, &chat)).await {
+                Ok(Ok(Some(c))) => c,
+                Ok(Ok(None)) => return err(StatusCode::NOT_FOUND, "unknown chat"),
+                Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+        }
         None => Conversation::new(super::chats::new_id()),
     };
     // a message of no content is nothing to answer: the API refuses it, which reached the caller

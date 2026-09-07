@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::sync::Shared;
+
 const INLINE_LIMIT: u64 = 256 * 1024;
 /// Edited files one tenant may hold, what `--tenant-max-files` sets. The byte quota bounds none of
 /// them: 32,001 empty files fit a 1 KiB quota, and each is an inode of its own (issue #88).
@@ -336,13 +338,13 @@ impl Tenant {
     }
 
     pub fn base(&self) -> Arc<Base> {
-        self.base.read().unwrap().clone()
+        self.base.shared().clone()
     }
 
     /// Points the tenant at a freshly loaded copy of its base and tells its previews to reload: the
     /// overlay is untouched, so an edited file still wins over the new base copy.
     pub fn set_base(&self, base: Arc<Base>) -> u64 {
-        *self.base.write().unwrap() = base;
+        *self.base.exclusive() = base;
         // Every file in the tenant may have changed underneath, so the preview reloads rather
         // than swapping a stylesheet.
         self.bump("update", "", UpdateKind::Module)
@@ -358,11 +360,11 @@ impl Tenant {
     }
 
     pub fn data(&self, path: &str) -> Option<FileData> {
-        let overlay = self.overlay.read().unwrap();
+        let overlay = self.overlay.shared();
         match overlay.get(path) {
             Some(Some(d)) => Some(d.clone()),
             Some(None) => None,
-            None => self.base.read().unwrap().get(path).cloned(),
+            None => self.base.shared().get(path).cloned(),
         }
     }
 
@@ -381,8 +383,8 @@ impl Tenant {
     }
 
     pub fn list(&self) -> Vec<Entry> {
-        let overlay = self.overlay.read().unwrap();
-        let base = self.base.read().unwrap();
+        let overlay = self.overlay.shared();
+        let base = self.base.shared();
         let mut out: BTreeMap<String, (u64, bool)> = base.files.iter().map(|(p, d)| (p.clone(), (d.size(), false))).collect();
         for (p, d) in overlay.files.iter() {
             match d {
@@ -402,7 +404,7 @@ impl Tenant {
     /// is why it does not happen here.
     pub fn write(&self, path: &str, bytes: Vec<u8>, kind: UpdateKind) -> Result<u64, WriteError> {
         // held across the disk write so a concurrent write cannot slip past the quota check
-        let mut overlay = self.overlay.write().unwrap();
+        let mut overlay = self.overlay.exclusive();
         let after = overlay.bytes - overlay.size_of(path) + bytes.len() as u64;
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
@@ -434,13 +436,13 @@ impl Tenant {
     /// succeeded. A failure puts the directory back, so what the caller is told and what a restart
     /// reads are the same tenant.
     pub fn write_many(&self, files: Vec<(String, Vec<u8>)>, deleted: &[String], replace: bool) -> Result<Applied, WriteError> {
-        let mut overlay = self.overlay.write().unwrap();
+        let mut overlay = self.overlay.exclusive();
         let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         let keep = |path: &str, data: &Option<FileData>| !replace || data.is_none() || incoming.contains(path);
         let mut next: BTreeMap<String, Option<FileData>> =
             overlay.files.iter().filter(|(p, d)| keep(p, d)).map(|(p, d)| (p.clone(), d.clone())).collect();
         for path in deleted.iter().filter(|p| !incoming.contains(p.as_str())) {
-            match self.base.read().unwrap().get(path) {
+            match self.base.shared().get(path) {
                 Some(_) => next.insert(path.clone(), None),
                 None => next.remove(path),
             };
@@ -474,8 +476,8 @@ impl Tenant {
     pub fn delete(&self, path: &str) -> Result<u64, WriteError> {
         // held across the disk work, as a write is: the file leaves the directory and the tombstone
         // list is rewritten before the overlay hears about it, and a failure puts both back
-        let mut overlay = self.overlay.write().unwrap();
-        let tombstone = self.base.read().unwrap().get(path).is_some();
+        let mut overlay = self.overlay.exclusive();
+        let tombstone = self.base.shared().get(path).is_some();
         let mut staged = Staged::new(self.dir.as_deref());
         if let Err(cause) = stage_delete(&mut staged, &overlay.files, path, tombstone) {
             return Err(staged.undo(cause));
@@ -512,7 +514,7 @@ impl Tenant {
 
     /// The tenant's own edits: `Some` is a written file, `None` a tombstone over a base file.
     pub fn overlay(&self) -> Vec<(String, Option<FileData>)> {
-        self.overlay.read().unwrap().files.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
+        self.overlay.shared().files.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
     }
 
     pub fn quota(&self) -> u64 {
@@ -527,7 +529,7 @@ impl Tenant {
     /// Entries and bytes, read off the running totals rather than summed: `/api/stats` and
     /// `/metrics` add this up over every loaded tenant, and the editor polls the first every 5 s.
     pub fn overlay_stats(&self) -> (usize, u64) {
-        let overlay = self.overlay.read().unwrap();
+        let overlay = self.overlay.shared();
         (overlay.files.len(), overlay.bytes)
     }
 
@@ -540,7 +542,7 @@ impl Tenant {
                 Ok(())
             })?;
         }
-        let mut overlay = self.overlay.write().unwrap();
+        let mut overlay = self.overlay.exclusive();
         for (p, d) in loaded {
             overlay.insert(p, Some(d));
         }
@@ -815,7 +817,7 @@ impl Store {
 
     pub fn add_base(&self, base: Base) -> Arc<Base> {
         let base = Arc::new(base);
-        self.bases.write().unwrap().insert(base.name.clone(), base.clone());
+        self.bases.exclusive().insert(base.name.clone(), base.clone());
         base
     }
 
@@ -900,11 +902,11 @@ impl Store {
     }
 
     pub fn base(&self, name: &str) -> Option<Arc<Base>> {
-        self.bases.read().unwrap().get(name).cloned()
+        self.bases.shared().get(name).cloned()
     }
 
     pub fn bases(&self) -> Vec<Arc<Base>> {
-        let mut v: Vec<_> = self.bases.read().unwrap().values().cloned().collect();
+        let mut v: Vec<_> = self.bases.shared().values().cloned().collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -918,7 +920,7 @@ impl Store {
         // and released around the check, two callers of one id both read "not there" and both went
         // on to write `tenant.json` and insert, so all of them were told 201 and all but the last
         // held a tenant this node does not serve (issue #92).
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.exclusive();
         // the data directory as well as the map: a tenant another node created exists, and creating
         // over its directory would hide the files already in it. The map alone would miss one whose
         // base this node has not loaded, which is exactly when the map is empty of it.
@@ -944,14 +946,14 @@ impl Store {
     /// A directory that is there and will not load is `NoTenant::Failed`, not `Unknown`, and is
     /// remembered so `/api/stats`, `/metrics` and the editor can report it.
     pub fn resolve(&self, id: &str) -> Result<Arc<Tenant>, NoTenant> {
-        if let Some(t) = self.tenants.read().unwrap().get(id).cloned() {
+        if let Some(t) = self.tenants.shared().get(id).cloned() {
             return Ok(t);
         }
         // A miss reads the directory under the write lock, not around it: `remove_tenant` holds the
         // same lock from the drop to the last file, so what this reads back is a tenant that is
         // still there rather than one being deleted behind it (issue #92). The lock is re-checked
         // because a create or another miss may have won it first.
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.exclusive();
         if let Some(t) = tenants.get(id).cloned() {
             return Ok(t);
         }
@@ -960,13 +962,13 @@ impl Store {
         }
         match self.read_tenant(id) {
             Ok(t) => {
-                self.failed.write().unwrap().remove(id);
+                self.failed.exclusive().remove(id);
                 let restored = Arc::new(t);
                 tenants.insert(id.to_string(), restored.clone());
                 Ok(restored)
             }
             Err(e) => {
-                self.failed.write().unwrap().insert(id.to_string(), e.clone());
+                self.failed.exclusive().insert(id.to_string(), e.clone());
                 Err(NoTenant::Failed(e))
             }
         }
@@ -983,7 +985,7 @@ impl Store {
     /// The tenants whose data directory this node could not build a tenant from, id and reason, in
     /// id order. Empty is the healthy answer; anything in it is a site answering nothing.
     pub fn failed_tenants(&self) -> Vec<(String, String)> {
-        self.failed.read().unwrap().iter().map(|(id, e)| (id.clone(), e.clone())).collect()
+        self.failed.shared().iter().map(|(id, e)| (id.clone(), e.clone())).collect()
     }
 
     /// `<data-dir>/<id>` when that directory is there: the bytes a tenant is, whether or not this
@@ -1021,7 +1023,7 @@ impl Store {
     /// report of what is loaded rather than a census. Anything that acts on a tenant resolves it
     /// through `tenant` or `tenant_dir` instead.
     pub fn tenants(&self) -> Vec<Arc<Tenant>> {
-        let mut v: Vec<_> = self.tenants.read().unwrap().values().cloned().collect();
+        let mut v: Vec<_> = self.tenants.shared().values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
@@ -1036,9 +1038,9 @@ impl Store {
     /// directory was still there for `resolve` to rebuild the tenant from and put back in the map,
     /// so a 204 left a tenant serving traffic from a directory that was about to go (issue #92).
     pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
-        let mut tenants = self.tenants.write().unwrap();
+        let mut tenants = self.tenants.exclusive();
         let dropped = tenants.remove(id);
-        self.failed.write().unwrap().remove(id);
+        self.failed.exclusive().remove(id);
         let dir = dropped.as_ref().and_then(|t| t.dir.clone()).or_else(|| self.tenant_dir(id));
         let mut held = dropped.is_some();
         if let Some(dir) = dir {
@@ -1066,13 +1068,13 @@ impl Store {
             let id = entry.file_name().to_string_lossy().into_owned();
             match self.read_tenant(&id) {
                 Ok(tenant) => {
-                    self.failed.write().unwrap().remove(&id);
-                    self.tenants.write().unwrap().insert(id, Arc::new(tenant));
+                    self.failed.exclusive().remove(&id);
+                    self.tenants.exclusive().insert(id, Arc::new(tenant));
                     n += 1;
                 }
                 Err(e) => {
                     eprintln!("data dir entry '{id}': {e}, skipping");
-                    self.failed.write().unwrap().insert(id, e);
+                    self.failed.exclusive().insert(id, e);
                 }
             }
         }
@@ -1244,9 +1246,9 @@ mod tests {
         let t = store.create_tenant("acme", "theme").unwrap();
         t.write(PAGE, b"<h1>mine</h1>".to_vec(), UpdateKind::Module).unwrap();
         // what another node's daemon holds: the tenant is on disk and in nobody's map
-        store.tenants.write().unwrap().remove("acme");
+        store.tenants.exclusive().remove("acme");
         assert!(store.tenant("acme").is_some(), "the restore-on-miss path serves it");
-        store.tenants.write().unwrap().remove("acme");
+        store.tenants.exclusive().remove("acme");
 
         assert!(store.remove_tenant("acme").unwrap(), "a tenant the daemon can serve is deleted, not answered 404");
         assert!(!data.join("acme").exists(), "the tenant's bytes are gone");

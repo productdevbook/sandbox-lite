@@ -94,13 +94,23 @@ fn chat_totals(st: &AppState) -> std::io::Result<(u64, u64)> {
     Ok((conversations, bytes))
 }
 
+/// The first poll after a restart walks every tenant's `chats/` directory to seed the counters, so
+/// even the endpoint that only reports numbers goes to the blocking pool (#94).
+async fn chat_totals_off_the_workers(st: &State) -> std::io::Result<(u64, u64)> {
+    let st = st.clone();
+    match tokio::task::spawn_blocking(move || chat_totals(&st)).await {
+        Ok(totals) => totals,
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    }
+}
+
 pub async fn stats(AxState(st): AxState<State>) -> Response {
     let tenants = st.store.tenants();
     let overlay_bytes: u64 = tenants.iter().map(|t| t.overlay_stats().1).sum();
     let subscribers: usize = tenants.iter().map(|t| t.events.receiver_count()).sum();
     // A gauge that reads zero because a directory could not be listed is a wrong number, not a
     // missing one, and nothing downstream can tell the two apart.
-    let (conversations, chat_bytes) = match chat_totals(&st) {
+    let (conversations, chat_bytes) = match chat_totals_off_the_workers(&st).await {
         Ok(totals) => totals,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chats: {e}")),
     };
@@ -183,7 +193,7 @@ fn snapshot(st: &AppState, chats: (u64, u64)) -> Snapshot {
 pub async fn metrics(AxState(st): AxState<State>) -> Response {
     // As in `stats`: a chats gauge that reads zero because the store could not be read is a wrong
     // number wearing the shape of a right one, so the scrape fails instead.
-    let chats = match chat_totals(&st) {
+    let chats = match chat_totals_off_the_workers(&st).await {
         Ok(totals) => totals,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chats: {e}")),
     };
@@ -335,8 +345,12 @@ pub async fn delete_file(AxState(st): AxState<State>, Path((id, path)): Path<(St
     if !t.exists(&path) {
         return err(StatusCode::NOT_FOUND, "no such file");
     }
-    match t.delete(&path) {
-        Ok(version) => Json(json!({ "path": path, "version": version })).into_response(),
+    // A rename and a `deleted.json` rewrite under the overlay's write lock — small, but disk, and
+    // `write_file` two functions up is already careful about exactly this.
+    let p2 = path.clone();
+    match tokio::task::spawn_blocking(move || t.delete(&p2)).await {
+        Ok(Ok(version)) => Json(json!({ "path": path, "version": version })).into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
