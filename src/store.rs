@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
@@ -203,12 +204,17 @@ pub enum WriteError {
         after: usize,
     },
     Io(io::Error),
-    /// A write that failed and could not be put back. The named paths are neither what they were nor
-    /// what the write asked for, so the caller is told that rather than that nothing landed.
+    /// A write that failed and could not be put back. Every path named is one the undo itself
+    /// failed on, so it is neither what it was nor what the write asked for. A step that never ran
+    /// is not named here: `Staged::write` records a file only once the open has truncated it.
     Torn {
         cause: io::Error,
         paths: Vec<String>,
     },
+    /// A write through a handle to a tenant `Store::remove_tenant` has already taken. Its
+    /// directory is gone, and writing the file back would put `<data-dir>/<id>/files/` there
+    /// without `tenant.json` — a directory `Store::restore` skips for ever (issue #101).
+    Removed,
 }
 
 impl fmt::Display for WriteError {
@@ -230,6 +236,7 @@ impl fmt::Display for WriteError {
                 paths.len(),
                 paths.join(", ")
             ),
+            WriteError::Removed => write!(f, "the tenant has been removed"),
         }
     }
 }
@@ -306,6 +313,11 @@ pub struct Tenant {
     dir: Option<PathBuf>,
     quota: u64,
     max_files: usize,
+    /// Set by `Store::remove_tenant` before it removes anything. A request that resolved the tenant
+    /// earlier still holds the `Arc` after the delete, and every writer takes the read half of this
+    /// across its own disk work, so such a write is refused rather than recreating the directory
+    /// (issue #101).
+    removed: RwLock<bool>,
 }
 
 pub struct Entry {
@@ -334,7 +346,22 @@ impl Tenant {
             dir,
             quota,
             max_files,
+            removed: RwLock::new(false),
         }
+    }
+
+    /// A hold on the tenant being alive, `None` once it has been removed. Every writer keeps one
+    /// for as long as it touches `<data-dir>/<id>` — including `Chats::save`, which writes
+    /// `chats/` without going through the overlay — so the delete either waits for the write or
+    /// the write is refused, and neither can put the directory back (issue #101).
+    pub fn writable(&self) -> Option<RwLockReadGuard<'_, bool>> {
+        let removed = self.removed.read().unwrap();
+        (!*removed).then_some(removed)
+    }
+
+    /// Refuses every later write and waits for the ones already running.
+    fn mark_removed(&self) {
+        *self.removed.write().unwrap() = true;
     }
 
     pub fn base(&self) -> Arc<Base> {
@@ -403,6 +430,9 @@ impl Tenant {
     /// answer for a stylesheet, and proving `Style` takes a compile — `Engine::update_kind` — which
     /// is why it does not happen here.
     pub fn write(&self, path: &str, bytes: Vec<u8>, kind: UpdateKind) -> Result<u64, WriteError> {
+        // held across the disk work: a delete that has started refuses this write, and one that
+        // has not waits for it rather than leaving the file behind (issue #101)
+        let _live = self.writable().ok_or(WriteError::Removed)?;
         // held across the disk write so a concurrent write cannot slip past the quota check
         let mut overlay = self.overlay.exclusive();
         let after = overlay.bytes - overlay.size_of(path) + bytes.len() as u64;
@@ -436,6 +466,7 @@ impl Tenant {
     /// succeeded. A failure puts the directory back, so what the caller is told and what a restart
     /// reads are the same tenant.
     pub fn write_many(&self, files: Vec<(String, Vec<u8>)>, deleted: &[String], replace: bool) -> Result<Applied, WriteError> {
+        let _live = self.writable().ok_or(WriteError::Removed)?;
         let mut overlay = self.overlay.exclusive();
         let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         let keep = |path: &str, data: &Option<FileData>| !replace || data.is_none() || incoming.contains(path);
@@ -474,6 +505,9 @@ impl Tenant {
     }
 
     pub fn delete(&self, path: &str) -> Result<u64, WriteError> {
+        // a delete rewrites `deleted.json`, which is a write to the tenant's directory like any
+        // other and puts it back if the tenant has already been removed
+        let _live = self.writable().ok_or(WriteError::Removed)?;
         // held across the disk work, as a write is: the file leaves the directory and the tombstone
         // list is rewritten before the overlay hears about it, and a failure puts both back
         let mut overlay = self.overlay.exclusive();
@@ -627,9 +661,11 @@ impl Staged {
         let target = dir.join("files").join(path);
         self.create_dirs(&target)?;
         self.move_aside(&dir, &target)?;
-        // recorded before the write, because a write that fails partway still leaves a file
+        // between the open and the bytes: an open that failed created nothing to undo, and one that
+        // succeeded has already truncated the file even if not a byte of it lands (issue #101)
+        let mut file = std::fs::File::create(&target)?;
         self.created.push(target.clone());
-        std::fs::write(&target, &bytes)?;
+        file.write_all(&bytes)?;
         if bytes.len() as u64 > INLINE_LIMIT { Ok(FileData::Disk(target, bytes.len() as u64)) } else { Ok(FileData::Mem(bytes.into())) }
     }
 
@@ -1037,9 +1073,17 @@ impl Store {
     /// The map's write lock is held across the directory removal. Released after the drop, the
     /// directory was still there for `resolve` to rebuild the tenant from and put back in the map,
     /// so a 204 left a tenant serving traffic from a directory that was about to go (issue #92).
+    /// The tenant is also marked removed, which is what stops a request that resolved it before
+    /// the delete from writing its files back afterwards (issue #101).
     pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
         let mut tenants = self.tenants.exclusive();
         let dropped = tenants.remove(id);
+        // Before any directory work, and waiting for the writes already in flight: a request that
+        // resolved the tenant earlier still holds the `Arc`, and its write would otherwise put
+        // `files/` back without `tenant.json` — invisible to `restore`, on disk for ever (#101).
+        if let Some(t) = &dropped {
+            t.mark_removed();
+        }
         self.failed.exclusive().remove(id);
         let dir = dropped.as_ref().and_then(|t| t.dir.clone()).or_else(|| self.tenant_dir(id));
         let mut held = dropped.is_some();
@@ -1527,6 +1571,36 @@ mod tests {
             assert!(store.tenant("acme").is_none(), "so nothing may serve it afterwards, round {round}");
             assert!(!data.join("acme").exists(), "and its data directory is gone, round {round}");
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #101: the delete is atomic against a *lookup*, not against a request that resolved
+    /// the tenant before it. That request holds the `Arc` still, and its write used to recreate
+    /// `<data-dir>/<id>/files/` without `tenant.json` — a directory `restore` skips, so the bytes
+    /// sit there for ever and no daemon serves them.
+    #[test]
+    fn a_write_through_a_handle_to_a_deleted_tenant_is_refused_and_leaves_nothing_on_disk() {
+        let root = temp("removed-tenant");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let store = Store::new(Some(data.clone()), 1 << 20);
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+        let held = store.create_tenant("acme", "theme").unwrap();
+        held.write("a.txt", b"one".to_vec(), UpdateKind::Module).unwrap();
+
+        assert!(store.remove_tenant("acme").unwrap());
+        assert!(!data.join("acme").exists(), "the delete took the directory");
+
+        let write = held.write("b.txt", b"two".to_vec(), UpdateKind::Module).unwrap_err();
+        assert!(matches!(write, WriteError::Removed), "{write:?}");
+        assert!(write.to_string().contains("removed"), "{write}");
+        // every writer, not only the one the editor calls: the import and the delete's own
+        // rewrite of `deleted.json` put the directory back just as readily
+        assert!(matches!(held.delete(PAGE), Err(WriteError::Removed)));
+        assert!(matches!(held.write_many(vec![("c.txt".into(), b"three".to_vec())], &[], false), Err(WriteError::Removed)));
+
+        assert!(!data.join("acme").exists(), "and nothing came back on disk");
+        assert_eq!(store.restore().unwrap(), 0, "so a restart finds nothing to restore");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

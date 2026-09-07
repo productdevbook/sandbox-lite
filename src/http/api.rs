@@ -331,6 +331,8 @@ pub async fn write_file(AxState(st): AxState<State>, Path((id, path)): Path<(Str
     match written {
         Ok(Ok(version)) => Json(json!({ "path": path, "version": version })).into_response(),
         Ok(Err(e @ (WriteError::Quota { .. } | WriteError::Files { .. }))) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+        // the tenant went while this write was in flight; nothing was written (issue #101)
+        Ok(Err(e @ WriteError::Removed)) => err(StatusCode::NOT_FOUND, e.to_string()),
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -350,6 +352,7 @@ pub async fn delete_file(AxState(st): AxState<State>, Path((id, path)): Path<(St
     let p2 = path.clone();
     match tokio::task::spawn_blocking(move || t.delete(&p2)).await {
         Ok(Ok(version)) => Json(json!({ "path": path, "version": version })).into_response(),
+        Ok(Err(e @ WriteError::Removed)) => err(StatusCode::NOT_FOUND, e.to_string()),
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

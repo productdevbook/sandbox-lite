@@ -530,9 +530,17 @@ $("#chatForm").addEventListener("submit", async (e) => {
       if (name === "text") { streamed += d.text; setMsg(reply, streamed); }
       else if (name === "tool") running = addChip(reply, chipLabel({ name: d.name, path: d.input }), true);
       else if (name === "tool_result") { if (running) { running.className = ""; running.title = d.result; running = null; } }
-      else if (name === "error") { const m = typeof d.error === "string" ? d.error : JSON.stringify(d.error); setMsg(reply, streamed ? `${streamed}\n\nfailed: ${m}` : "failed: " + m); }
+      // a turn that failed part-way still edited the files it names, and the conversation it was
+      // recorded in is the one to carry on from
+      else if (name === "error") {
+        const m = typeof d.error === "string" ? d.error : JSON.stringify(d.error);
+        setMsg(reply, streamed ? `${streamed}\n\nfailed: ${m}` : "failed: " + m);
+        for (const p of d.changes || []) addChip(reply, p);
+        if (d.chat && d.chat !== state.chatId) { state.chatId = d.chat; loadChats(d.chat); }
+      }
       else if (name === "done") {
-        setMsg(reply, d.text || streamed || "(no reply)");
+        const body = d.text || streamed || "(no reply)";
+        setMsg(reply, d.note ? `${body}\n\n${d.note}` : body);
         for (const p of d.changes || []) addChip(reply, p);
         if (d.chat !== state.chatId) { state.chatId = d.chat; loadChats(d.chat); } else loadChats();
       }
