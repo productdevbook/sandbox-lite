@@ -86,6 +86,20 @@ export function rawGet(port: number, host: string, path: string, headers: Record
   });
 }
 
+// rawGet with a method and a body of its own, for a route that is not a GET.
+export function rawRequest(port: number, host: string, path: string, method: string, body: string, headers: Record<string, string> = {}): Promise<number> {
+  const length = String(Buffer.byteLength(body));
+  return new Promise((resolve, reject) => {
+    const options = { host: '127.0.0.1', port, path, method, headers: { host, 'content-length': length, ...headers } };
+    const req = http.request(options, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 export async function startDaemon(extra: string[] = []): Promise<Daemon> {
   const port = await freePort();
   const args = ['--listen', `127.0.0.1:${port}`, '--bases', path.join(root, 'examples'), '--no-persist', ...extra];
