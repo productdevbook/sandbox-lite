@@ -391,15 +391,14 @@ impl Tenant {
         Ok(Applied { version: self.bump("update", "", UpdateKind::Module), written, deleted: removed })
     }
 
-    pub fn delete(&self, path: &str) -> io::Result<u64> {
+    pub fn delete(&self, path: &str) -> Result<u64, WriteError> {
         // held across the disk work, as a write is: the file leaves the directory and the tombstone
         // list is rewritten before the overlay hears about it, and a failure puts both back
         let mut overlay = self.overlay.write().unwrap();
         let tombstone = self.base.read().unwrap().get(path).is_some();
         let mut staged = Staged::new(self.dir.as_deref());
         if let Err(cause) = stage_delete(&mut staged, &overlay, path, tombstone) {
-            staged.rollback();
-            return Err(cause);
+            return Err(staged.undo(cause));
         }
         if tombstone {
             overlay.insert(path.to_string(), None);
@@ -822,10 +821,15 @@ impl Store {
             return Err("tenant id must be lowercase letters, digits and dashes".into());
         }
         let base = self.base(base_name).ok_or_else(|| format!("unknown base '{base_name}'"))?;
+        // One acquisition for the whole operation — the refusal, the directory and the insert. Taken
+        // and released around the check, two callers of one id both read "not there" and both went
+        // on to write `tenant.json` and insert, so all of them were told 201 and all but the last
+        // held a tenant this node does not serve (issue #92).
+        let mut tenants = self.tenants.write().unwrap();
         // the data directory as well as the map: a tenant another node created exists, and creating
-        // over its directory would hide the files already in it. `tenant` alone would miss one whose
+        // over its directory would hide the files already in it. The map alone would miss one whose
         // base this node has not loaded, which is exactly when the map is empty of it.
-        if self.tenant(id).is_some() || self.tenant_dir(id).is_some() {
+        if tenants.contains_key(id) || self.tenant_dir(id).is_some() {
             return Err(format!("tenant '{id}' already exists"));
         }
         let dir = self.data_dir.as_ref().map(|d| d.join(id));
@@ -835,7 +839,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
         }
         let tenant = Arc::new(Tenant::new(id.to_string(), base, dir, self.tenant_quota));
-        self.tenants.write().unwrap().insert(id.to_string(), tenant.clone());
+        tenants.insert(id.to_string(), tenant.clone());
         Ok(tenant)
     }
 
@@ -850,6 +854,14 @@ impl Store {
         if let Some(t) = self.tenants.read().unwrap().get(id).cloned() {
             return Ok(t);
         }
+        // A miss reads the directory under the write lock, not around it: `remove_tenant` holds the
+        // same lock from the drop to the last file, so what this reads back is a tenant that is
+        // still there rather than one being deleted behind it (issue #92). The lock is re-checked
+        // because a create or another miss may have won it first.
+        let mut tenants = self.tenants.write().unwrap();
+        if let Some(t) = tenants.get(id).cloned() {
+            return Ok(t);
+        }
         if self.tenant_dir(id).is_none() {
             return Err(NoTenant::Unknown);
         }
@@ -857,7 +869,8 @@ impl Store {
             Ok(t) => {
                 self.failed.write().unwrap().remove(id);
                 let restored = Arc::new(t);
-                Ok(self.tenants.write().unwrap().entry(id.to_string()).or_insert(restored).clone())
+                tenants.insert(id.to_string(), restored.clone());
+                Ok(restored)
             }
             Err(e) => {
                 self.failed.write().unwrap().insert(id.to_string(), e.clone());
@@ -866,6 +879,10 @@ impl Store {
         }
     }
 
+    /// `resolve` for a test that only asks whether the tenant is here. Nothing in the daemon calls
+    /// it: every caller there reports *why* a tenant is missing, and `create_tenant` — the last one
+    /// that did not — now asks the map it already holds the lock on.
+    #[cfg(test)]
     pub fn tenant(&self, id: &str) -> Option<Arc<Tenant>> {
         self.resolve(id).ok()
     }
@@ -921,8 +938,13 @@ impl Store {
     /// `404`, or the next request would restore it and serve it again. `Ok(false)` is a tenant
     /// neither memory nor the data directory holds. A data directory that survives the delete is an
     /// error: it answered 204 and the tenant comes back at the next restore.
+    ///
+    /// The map's write lock is held across the directory removal. Released after the drop, the
+    /// directory was still there for `resolve` to rebuild the tenant from and put back in the map,
+    /// so a 204 left a tenant serving traffic from a directory that was about to go (issue #92).
     pub fn remove_tenant(&self, id: &str) -> io::Result<bool> {
-        let dropped = self.tenants.write().unwrap().remove(id);
+        let mut tenants = self.tenants.write().unwrap();
+        let dropped = tenants.remove(id);
         self.failed.write().unwrap().remove(id);
         let dir = dropped.as_ref().and_then(|t| t.dir.clone()).or_else(|| self.tenant_dir(id));
         let mut held = dropped.is_some();
@@ -1286,5 +1308,101 @@ mod tests {
         assert!(!is_private_path(".well-known/security.txt"));
         assert!(!is_private_path("src/pages/index.astro"));
         assert_eq!(clean_path("/.env").as_deref(), Some(".env"));
+    }
+
+    /// Issue #92: the check and the mutation used to sit under two acquisitions of the `tenants`
+    /// lock, so eight threads creating one id were all told it was theirs. Seven of them held a
+    /// tenant — its own overlay, its own version, its own event channel — that the store did not
+    /// serve.
+    #[test]
+    fn one_create_of_an_id_wins_and_every_other_caller_is_refused() {
+        let root = temp("create-race");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let store = Arc::new(Store::new(Some(data.clone()), 1 << 20));
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+
+        let gun = Arc::new(std::sync::Barrier::new(8));
+        let racing: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, gun) = (store.clone(), gun.clone());
+                std::thread::spawn(move || {
+                    gun.wait();
+                    store.create_tenant("acme", "theme")
+                })
+            })
+            .collect();
+        let answers: Vec<Result<Arc<Tenant>, String>> = racing.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let created: Vec<&Arc<Tenant>> = answers.iter().filter_map(|a| a.as_ref().ok()).collect();
+        assert_eq!(created.len(), 1, "exactly one create may be told it made the tenant");
+        for refused in answers.iter().filter_map(|a| a.as_ref().err()) {
+            assert!(refused.contains("already exists"), "the losers are refused, not served: {refused}");
+        }
+        assert!(Arc::ptr_eq(&store.tenant("acme").unwrap(), created[0]), "and the winner is the tenant the store serves");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #92: `remove_tenant` dropped the map entry, released the lock and only then removed the
+    /// directory. A request in that gap read the tenant back off disk and put it in the map, so a
+    /// 204 left it answering from a directory that was about to go — for ever, since a later write
+    /// recreates `files/` without `tenant.json` and `restore` skips such a directory.
+    #[test]
+    fn a_tenant_deleted_while_a_request_resolves_it_stays_deleted() {
+        let root = temp("remove-race");
+        seed(root.join("theme").join(PAGE), "<h1>base</h1>\n");
+        let data = root.join("data");
+        let store = Arc::new(Store::new(Some(data.clone()), 1 << 20));
+        store.add_base(Base::load("theme", &root.join("theme")).unwrap());
+
+        for round in 0..200 {
+            store.create_tenant("acme", "theme").unwrap();
+            let gun = Arc::new(std::sync::Barrier::new(2));
+            let (remover, requester) = (store.clone(), store.clone());
+            let (start, also) = (gun.clone(), gun);
+            let removing = std::thread::spawn(move || {
+                start.wait();
+                remover.remove_tenant("acme").unwrap()
+            });
+            let resolving = std::thread::spawn(move || {
+                also.wait();
+                requester.tenant("acme")
+            });
+            assert!(removing.join().unwrap(), "the delete answered 204, round {round}");
+            resolving.join().unwrap();
+            assert!(store.tenant("acme").is_none(), "so nothing may serve it afterwards, round {round}");
+            assert!(!data.join("acme").exists(), "and its data directory is gone, round {round}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #96: `delete` is the third writer, and its undo can fail like the other two. It used to
+    /// answer `io::Result`, which cannot say so — the paths its rollback could not put back went on
+    /// the floor and the caller read the bare cause as "your file is still there".
+    #[test]
+    fn a_delete_whose_undo_fails_names_the_paths_that_are_neither_way() {
+        let dir = temp("torn-delete");
+        let t = tenant(1 << 20, Some(dir.clone()));
+        t.write("a.txt", b"one".to_vec(), UpdateKind::Module).unwrap();
+        // `stage_delete` moves the file aside and then rewrites the tombstone list; the undo rewrites
+        // it back. A mode that refuses both is the failure and the failed undo in one.
+        let list = dir.join("deleted.json");
+        std::fs::write(&list, b"[]").unwrap();
+        let mut mode = std::fs::metadata(&list).unwrap().permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(&list, mode).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&list).is_ok() {
+            // running as root, where the mode is not enforced and the write this needs cannot fail
+            eprintln!("skipped: this process can write a read-only file, so a failed undo cannot be staged");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let err = t.delete("a.txt").unwrap_err();
+        let WriteError::Torn { cause, paths } = &err else { panic!("a delete whose undo failed must be Torn, not {err:?}") };
+        assert!(paths.iter().any(|p| p.contains("deleted.json")), "naming what it could not put back: {paths:?}");
+        assert!(err.to_string().contains(&cause.to_string()), "and the cause survives: {err}");
+        assert!(err.to_string().contains("neither what they were"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
