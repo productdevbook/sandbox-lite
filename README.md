@@ -318,7 +318,7 @@ Editor host (`localhost`):
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
 | GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version and a `kind` (`css`, `style`, `module`) |
 | GET | `/api/t/{id}/check` | compile every source file under one compile permit, return diagnostics |
-| POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, iterations, version, chat}`, or SSE with `Accept: text/event-stream` |
+| POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, iterations, version, stop, chat}`, or SSE with `Accept: text/event-stream` |
 | GET | `/api/t/{id}/chats` | saved conversations, newest first |
 | GET/DELETE | `/api/t/{id}/chats/{chat}` | one conversation with its turns / remove it |
 

@@ -251,6 +251,9 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
         Err(e @ WriteError::Io(_)) => (StatusCode::INTERNAL_SERVER_ERROR, refused(e.to_string())).into_response(),
         // it could not, so there are no counts to give: the message names what is neither way
         Err(e @ WriteError::Torn { .. }) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // the tenant was deleted while the archive was being unpacked, which is a 404 rather than
+        // an import that half landed: `write_many` refused before it touched the directory (#101)
+        Err(e @ WriteError::Removed) => (StatusCode::NOT_FOUND, refused(e.to_string())).into_response(),
     }
 }
 

@@ -88,7 +88,21 @@ replaces or removes aside instead of deleting it. The overlay is swapped only
 once every step has succeeded, so a failure anywhere puts the directory back
 and memory and disk cannot end up describing different tenants. The one case
 that cannot be undone — the undo itself failing — is `WriteError::Torn`, which
-names the paths that are neither way instead of reporting a clean refusal.
+names the paths that are neither way instead of reporting a clean refusal. It
+means exactly that the undo failed on those paths: a file is recorded for the
+undo only once the open has truncated it, so a write that never got that far
+leaves nothing for `Torn` to name.
+
+All three also take `Tenant::writable` before they touch the directory and hold
+it until they are done. It is the read half of a lock whose write half
+`Store::remove_tenant` takes before it removes anything, so a request that
+resolved the tenant before the delete — it still holds the `Arc` — either
+finishes before the directory goes or is refused with `WriteError::Removed`. It
+cannot write the files back afterwards, which used to put
+`<data-dir>/<id>/files/` there without `tenant.json`: invisible to
+`Store::restore`, and on disk for ever (issue #101). `Chats::save` takes the
+same hold, because `chats/` is recreated by a late save exactly as `files/` is
+by a late write.
 
 With a `--data-dir`, the overlay is persisted as
 `<data-dir>/<id>/tenant.json` (`{"base": name}`), `<data-dir>/<id>/files/<path>`
@@ -116,8 +130,9 @@ the daemon reports that reason, so `resolve` is the whole of the read path;
 
 Because that fallback makes the data directory as much a source of tenants as
 the map, the two operations that decide whether a tenant exists consult both:
-`Store::remove_tenant` drops the map entry and removes `<data-dir>/<id>`,
-answering "no such tenant" only when neither holds it, and `create_tenant`
+`Store::remove_tenant` drops the map entry, marks the tenant removed and
+removes `<data-dir>/<id>`, answering "no such tenant" only when neither holds
+it, and `create_tenant`
 refuses an id whose directory is already there even when it cannot build a
 tenant from it — its base may not be loaded on this node. `Store::tenants` is
 the exception, and stays a list of what this daemon has loaded: it answers
@@ -827,14 +842,29 @@ sixth, `screenshot` (`tools`), which renders one page of the tenant's own
 preview in headless Chrome on the daemon's host and hands the PNG back as an
 image block; `SECURITY.md` says what that costs. The loop runs at most 16
 rounds (`MAX_ITERATIONS`) and answers
-`{text, changes, iterations, version, chat}`. Writes go through the same
+`{text, changes, iterations, version, stop, chat}`. Writes go through the same
 `Tenant::write` as the editor, so previews follow.
+
+`stop` is why the loop ended, and only `end_turn` is a turn the model
+finished: `max_tokens` is a turn cut off part-way — possibly inside a
+`tool_use` block, whose tool therefore never ran — and `max_iterations` is the
+ceiling reached with the model still asking for tools. Both carry a `note` for
+the customer, and neither leaves the previous iteration's `text` standing as
+the reply.
 
 Every turn is streamed from the API whichever way the caller asked for it
 (`converse`). With `Accept: text/event-stream` the endpoint answers SSE —
 `text`, `tool`, `tool_result` events as they happen, then one `done` carrying
 that same JSON, or `error`; otherwise the JSON is buffered and returned in one
 response.
+
+The tool loop edits the tenant's files as it goes, so what it did is recorded
+before any failure is reported (issue #91): the turn and its tool calls are
+pushed to the conversation and saved whether or not the request as a whole
+succeeded, and the `error` body carries the same `changes` and `version` a
+`done` would, so the editor can reconcile. A save that fails is a 500 rather
+than a 200 carrying a `chat` id that answers 404 on the next turn; the id is in
+the reply only once the conversation behind it is stored.
 
 The request body is `{messages, chat?}`. `chat` names a stored conversation
 (`src/http/chats.rs`, one JSON file per chat under `<data-dir>/<id>/chats/`, or

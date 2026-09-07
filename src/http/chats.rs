@@ -297,6 +297,11 @@ impl Chats {
     }
 
     pub fn save(&self, t: &Tenant, chat: &Conversation) -> io::Result<()> {
+        // `chats/` is a sibling of `files/` and a save after the delete recreates the tenant's
+        // directory exactly as a write of its files would, so it takes the same hold (issue #101)
+        let Some(_live) = t.writable() else {
+            return Err(io::Error::other(format!("tenant '{}' has been removed", t.id)));
+        };
         self.seed(t)?;
         let raw = serde_json::to_vec(chat)?;
         let bytes = raw.len() as u64;
@@ -673,6 +678,28 @@ mod tests {
         assert!(matches!(over, TooBig::Conversation { limit: 4096, .. }), "{over}");
         assert!(over.to_string().contains("--chat-quota-kb"), "{over}");
         assert_eq!(chats.tenant_quota(), 4 * 4096, "the cap is spent in bytes: four conversations of the budget");
+    }
+
+    /// Issue #101: `chats/` is recreated by a save that outlives the delete exactly as `files/` is
+    /// by a write, and the directory it puts back holds no `tenant.json` for `Store::restore`.
+    #[test]
+    fn a_save_through_a_handle_to_a_deleted_tenant_fails_and_writes_nothing() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root =
+            std::env::temp_dir().join(format!("sandbox-lite-chats-removed-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::new(Some(root.clone()), u64::MAX);
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &base).unwrap());
+        let held = store.create_tenant("acme", "starter").unwrap();
+        let chats = Chats::default();
+        chats.save(&held, &conversation("c0", 2)).unwrap();
+
+        assert!(store.remove_tenant("acme").unwrap());
+        let e = chats.save(&held, &conversation("c1", 2)).unwrap_err();
+        assert!(e.to_string().contains("removed"), "{e}");
+        assert!(!root.join("acme").exists(), "no chat file put the tenant directory back");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn tenant(persist: bool) -> (Arc<Tenant>, PathBuf) {

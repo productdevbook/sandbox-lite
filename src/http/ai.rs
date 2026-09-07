@@ -413,32 +413,105 @@ impl Emitter {
 
 struct Fail {
     status: StatusCode,
-    error: Value,
+    /// The whole error body, `{ "error": … }` and whatever `with` has folded under it. One field
+    /// rather than two: a `Fail` is the `Err` half of every result in this module, and two
+    /// `Value`s put that half past what clippy will carry unboxed.
+    body: Value,
 }
 
 impl Fail {
     fn gateway(message: impl Into<String>) -> Fail {
-        Fail { status: StatusCode::BAD_GATEWAY, error: Value::String(message.into()) }
+        Fail::new(StatusCode::BAD_GATEWAY, Value::String(message.into()))
+    }
+
+    fn new(status: StatusCode, error: Value) -> Fail {
+        Fail { status, body: json!({ "error": error }) }
+    }
+
+    /// Folds in what the turn had already done when it failed. The tool loop writes the tenant's
+    /// files as it goes, so the error carries the same `changes` and `version` a `done` would, or
+    /// the editor cannot find out which files moved under it (issue #91).
+    fn with(mut self, progress: Value) -> Fail {
+        if let Value::Object(fields) = progress
+            && let Some(body) = self.body.as_object_mut()
+        {
+            for (key, value) in fields {
+                body.entry(key).or_insert(value);
+            }
+        }
+        self
+    }
+
+    fn payload(self) -> Value {
+        self.body
     }
 }
 
+/// Why the tool loop stopped. Only `Done` is a turn the model finished: a `max_tokens` turn can be
+/// cut off inside a `tool_use` block, whose input never parses and whose tool therefore never runs,
+/// and the iteration ceiling leaves the model still asking for tools. Both used to reach the caller
+/// as an ordinary `done` (issue #91).
+#[derive(Default, Clone, Copy)]
+enum Stop {
+    Done,
+    Truncated,
+    Ceiling,
+    Gone,
+    #[default]
+    Failed,
+}
+
+impl Stop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Stop::Done => "end_turn",
+            Stop::Truncated => "max_tokens",
+            Stop::Ceiling => "max_iterations",
+            Stop::Gone => "client_gone",
+            Stop::Failed => "error",
+        }
+    }
+
+    /// What to tell the customer when the turn did not finish. The files the loop already wrote
+    /// are on disk either way, so this is a note on a `done` rather than an error.
+    fn note(self) -> Option<&'static str> {
+        match self {
+            Stop::Truncated => Some("The reply ran out of room part-way through, so whatever it was about to do was not done. Ask again."),
+            Stop::Ceiling => Some("The assistant used every step it is allowed in one turn and stopped part-way. Ask it to carry on."),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
 struct Answer {
     text: String,
     changes: Vec<String>,
     iterations: usize,
     tools: Vec<ToolCall>,
+    stop: Stop,
 }
 
 /// The tool loop. Every turn is streamed from the API, forwarded to `out` as it arrives, and put
 /// back together as content blocks so the next request can echo it as the assistant's message.
-async fn converse(st: &State, t: &Arc<Tenant>, key: &str, mut messages: Vec<Value>, out: &Emitter) -> Result<Answer, Fail> {
+/// `answer` is filled in as the loop goes rather than built at the end: a failure part-way through
+/// leaves the files the tool calls already wrote on disk, so the caller has to be able to record
+/// what happened before it reports the failure (issue #91).
+async fn converse(
+    st: &State,
+    t: &Arc<Tenant>,
+    key: &str,
+    mut messages: Vec<Value>,
+    out: &Emitter,
+    answer: &mut Answer,
+) -> Result<(), Fail> {
     let client = reqwest::Client::new();
-    let mut changes: Vec<String> = Vec::new();
-    let mut tools_used: Vec<ToolCall> = Vec::new();
-    let mut text = String::new();
-    let mut iterations = 0;
-    while iterations < MAX_ITERATIONS && !out.gone() {
-        iterations += 1;
+    while answer.iterations < MAX_ITERATIONS {
+        if out.gone() {
+            answer.stop = Stop::Gone;
+            return Ok(());
+        }
+        answer.iterations += 1;
         let body = json!({
             "model": st.model,
             "max_tokens": 8192,
@@ -460,7 +533,7 @@ async fn converse(st: &State, t: &Arc<Tenant>, key: &str, mut messages: Vec<Valu
         };
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Fail { status: StatusCode::BAD_GATEWAY, error: serde_json::from_str(&body).unwrap_or(Value::String(body)) });
+            return Err(Fail::new(StatusCode::BAD_GATEWAY, serde_json::from_str(&body).unwrap_or(Value::String(body))));
         }
         let mut frames = Frames::default();
         let mut reply = Reply::default();
@@ -491,25 +564,29 @@ async fn converse(st: &State, t: &Arc<Tenant>, key: &str, mut messages: Vec<Valu
             return Err(Fail::gateway("the upstream stream ended before the message did"));
         }
         let turn = reply.text();
-        if !turn.is_empty() {
-            text = turn;
+        let truncated = reply.stop_reason() == Some("max_tokens");
+        // A finished turn with nothing to say leaves the last one's words standing; a truncated
+        // turn must not, or the caller reads an earlier iteration's text as this turn's reply.
+        if !turn.is_empty() || truncated {
+            answer.text = turn;
         }
         if reply.stop_reason() != Some("tool_use") {
-            break;
+            answer.stop = if truncated { Stop::Truncated } else { Stop::Done };
+            return Ok(());
         }
         messages.push(json!({ "role": "assistant", "content": reply.content() }));
         let mut results = Vec::new();
         for (id, name, input) in reply.tool_calls() {
-            let done = run_tool(st, t, &name, &input, &mut changes).await;
-            tools_used.push(ToolCall { name: name.clone(), path: input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string() });
+            let done = run_tool(st, t, &name, &input, &mut answer.changes).await;
+            answer.tools.push(ToolCall { name: name.clone(), path: input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string() });
             out.send("tool_result", json!({ "name": name, "result": done.summary })).await;
             results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": done.content }));
         }
         messages.push(json!({ "role": "user", "content": results }));
     }
-    changes.sort();
-    changes.dedup();
-    Ok(Answer { text, changes, iterations, tools: tools_used })
+    // the ceiling reached with `tool_use` still set: the model is mid-task, not at the end of one
+    answer.stop = Stop::Ceiling;
+    Ok(())
 }
 
 /// The turns past the window, as one transcript for the summarizer. Newest first while the budget
@@ -584,28 +661,58 @@ async fn run(st: State, t: Arc<Tenant>, key: String, req: ChatReq, mut conv: Con
     compact(&st, &key, &mut conv).await;
     // through the same normalisation as the stored turns, not appended to the windowed list raw
     let messages = conv.for_model(st.chats.window(), &adding);
-    let answer = converse(&st, &t, &key, messages, &out).await?;
-    for turn in adding {
-        conv.push(turn);
-    }
-    conv.push(Turn { role: "assistant".into(), text: answer.text.clone(), tools: answer.tools });
-    // `save` writes the file and then evicts, which once a tenant is at `--chats-per-tenant` reads
-    // and parses every conversation the tenant has (#94). The answer is already produced, so a
-    // failure to store it is logged rather than thrown away with the reply.
-    let (saver, saved, chat_id) = (st.clone(), t.clone(), conv.id.clone());
-    let stored = tokio::task::spawn_blocking(move || saver.chats.save(&saved, &conv)).await;
-    match stored {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("tenant {}: cannot save chat {chat_id}: {e}", t.id),
-        Err(e) => eprintln!("tenant {}: cannot save chat {chat_id}: {e}", t.id),
-    }
-    Ok(json!({
+    let mut answer = Answer::default();
+    let outcome = converse(&st, &t, &key, messages, &out, &mut answer).await;
+    answer.changes.sort();
+    answer.changes.dedup();
+
+    // The tool loop has already edited the tenant's files, so the turn is recorded whether or not
+    // the request as a whole succeeded: a failure that keeps the edits and drops the record of them
+    // leaves the conversation describing a site that is no longer there (issue #91). A turn that
+    // said and did nothing is not worth a conversation, so a request that failed before the model
+    // answered at all still stores nothing.
+    let ran = !answer.tools.is_empty() || !answer.text.trim().is_empty();
+    let recorded = outcome.is_ok() || ran;
+    let saved = if recorded {
+        for turn in adding {
+            conv.push(turn);
+        }
+        conv.push(Turn { role: "assistant".into(), text: answer.text.clone(), tools: std::mem::take(&mut answer.tools) });
+        // `save` writes the file and then evicts, which once a tenant is at `--chats-per-tenant`
+        // reads and parses every conversation it has (#94), so it runs off the async workers.
+        let (saver, of, storing) = (st.clone(), t.clone(), conv.clone());
+        match tokio::task::spawn_blocking(move || saver.chats.save(&of, &storing)).await {
+            Ok(r) => r,
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        }
+    } else {
+        Ok(())
+    };
+
+    let mut done = json!({
         "text": answer.text,
         "changes": answer.changes,
         "iterations": answer.iterations,
         "version": t.version(),
-        "chat": chat_id,
-    }))
+        "stop": answer.stop.as_str(),
+    });
+    if let Some(note) = answer.stop.note() {
+        done["note"] = Value::String(note.into());
+    }
+    // The id goes back only once the conversation behind it is stored. Handed back after a failed
+    // save it answers 404 on the next turn, while the files that turn wrote stay (issue #91).
+    if let Err(e) = saved {
+        eprintln!("tenant {}: cannot save chat {}: {e}", t.id, conv.id);
+        let message = format!("the turn ran and its edits are on disk, but the conversation could not be saved: {e}");
+        return Err(Fail::new(StatusCode::INTERNAL_SERVER_ERROR, Value::String(message)).with(done));
+    }
+    if recorded {
+        done["chat"] = Value::String(conv.id.clone());
+    }
+    match outcome {
+        Ok(()) => Ok(done),
+        Err(f) => Err(f.with(done)),
+    }
 }
 
 /// The request's messages as turns, the shape both the model input and the store hold them in.
@@ -653,7 +760,7 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
     if !accept.contains("text/event-stream") {
         return match run(st, t, key, req, conv, Emitter { tx: None }).await {
             Ok(done) => Json(done).into_response(),
-            Err(f) => (f.status, Json(json!({ "error": f.error }))).into_response(),
+            Err(f) => (f.status, Json(f.payload())).into_response(),
         };
     }
     let (tx, rx) = mpsc::channel(64);
@@ -661,7 +768,7 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
         let out = Emitter { tx: Some(tx.clone()) };
         let (event, data) = match run(st, t, key, req, conv, out).await {
             Ok(done) => ("done", done),
-            Err(f) => ("error", json!({ "error": f.error })),
+            Err(f) => ("error", f.payload()),
         };
         let _ = tx.send(Ok(Event::default().event(event).data(data.to_string()))).await;
     });
@@ -710,6 +817,26 @@ mod tests {
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
             json!({"type":"content_block_stop","index":0}),
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    /// A turn that dies on the wire part-way through, the way an `overloaded_error` does.
+    fn turn_that_breaks() -> String {
+        events(&[
+            json!({"type":"message_start","message":{"id":"msg_3","role":"assistant","content":[]}}),
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+        ])
+    }
+
+    /// A turn that runs out of `max_tokens` inside a `tool_use` block: no `content_block_stop`
+    /// arrives, so the input never parses and the tool never runs.
+    fn turn_cut_off_mid_tool_call() -> String {
+        events(&[
+            json!({"type":"message_start","message":{"id":"msg_4","role":"assistant","content":[]}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_2","name":"write_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/pages/half.astro\""}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"}}),
             json!({"type":"message_stop"}),
         ])
     }
@@ -998,6 +1125,79 @@ mod tests {
         let (status, body) = post_chat(&broken, None, ask("hi", None)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(serde_json::from_str::<Value>(&body).unwrap()["error"].is_string());
+    }
+
+    /// Issue #91: every `return Err` inside the tool loop skipped the `conv.push`/`save` below it,
+    /// so a failure on the second iteration kept the file the first one wrote and threw away every
+    /// record of it — the turn, the tool call, the `changes` list and the version.
+    #[tokio::test]
+    async fn a_failure_after_a_write_still_reports_the_file_and_records_the_turn() {
+        let f = fixture(vec![turn_with_tool(), turn_that_breaks()], true).await;
+        let (status, body) = post_chat(&f.st, None, ask("add a page", None)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "Overloaded");
+        assert_eq!(v["stop"], "error");
+        assert_eq!(v["iterations"], 2);
+        assert_eq!(v["changes"], json!(["src/pages/new.astro"]), "the error names what the loop wrote: {v}");
+        assert!(v["version"].as_u64().unwrap() > 0, "and the version it wrote it at: {v}");
+
+        let t = f.st.store.tenant("acme").unwrap();
+        assert_eq!(t.read_text("src/pages/new.astro").unwrap().as_deref(), Some("<h1>hi</h1>"), "the write landed");
+
+        let chat_id = v["chat"].as_str().expect("a chat the caller can carry on");
+        let stored = f.st.chats.load(&t, chat_id).unwrap().expect("the turn is stored, not dropped with the error");
+        assert_eq!(stored.messages[0].text, "add a page");
+        assert_eq!(stored.messages[1].tools, vec![ToolCall { name: "write_file".into(), path: "src/pages/new.astro".into() }]);
+    }
+
+    /// Issue #91: a save that failed was printed and then answered 200 with the id it had not
+    /// written, so the client's next turn was a 404 while the files that turn wrote stayed.
+    #[tokio::test]
+    async fn a_conversation_that_cannot_be_saved_is_an_error_rather_than_a_dangling_id() {
+        let f = fixture(vec![turn_with_tool(), turn_with_text("All done.")], true).await;
+        // `chats/` cannot be created because a file of that name is in the way
+        std::fs::write(f.root.join("data").join("acme").join("chats"), b"in the way").unwrap();
+
+        let (status, body) = post_chat(&f.st, None, ask("add a page", None)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("could not be saved"), "{v}");
+        assert!(v["chat"].is_null(), "no id the next turn would 404 on: {v}");
+        assert_eq!(v["changes"], json!(["src/pages/new.astro"]), "and the edits it made are still named: {v}");
+
+        let t = f.st.store.tenant("acme").unwrap();
+        assert_eq!(t.read_text("src/pages/new.astro").unwrap().as_deref(), Some("<h1>hi</h1>"));
+    }
+
+    /// Issue #91: a turn cut off inside a `tool_use` block emits no `Emit::Tool`, so the tool never
+    /// runs — and `max_tokens` is not `tool_use`, so the loop used to break and call it a finished
+    /// turn, carrying the previous iteration's text over as the reply.
+    #[tokio::test]
+    async fn a_turn_truncated_mid_tool_call_says_so_and_does_not_carry_the_last_text_over() {
+        let f = fixture(vec![turn_with_tool(), turn_cut_off_mid_tool_call()], true).await;
+        let (status, body) = post_chat(&f.st, None, ask("add two pages", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["stop"], "max_tokens", "distinguishable from a finished turn: {v}");
+        assert!(v["note"].as_str().unwrap().contains("ran out of room"), "{v}");
+        assert_eq!(v["text"], "", "not 'Adding the page.' from the iteration before it: {v}");
+        assert_eq!(v["changes"], json!(["src/pages/new.astro"]), "the first iteration's write is still reported: {v}");
+
+        let t = f.st.store.tenant("acme").unwrap();
+        assert!(!t.exists("src/pages/half.astro"), "the truncated call never ran");
+    }
+
+    /// The other way the loop ends mid-task: the model is still asking for tools at the ceiling.
+    #[tokio::test]
+    async fn the_iteration_ceiling_is_not_reported_as_a_finished_turn() {
+        let f = fixture(vec![turn_with_tool(); MAX_ITERATIONS], false).await;
+        let (status, body) = post_chat(&f.st, None, ask("keep going", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["stop"], "max_iterations", "{v}");
+        assert_eq!(v["iterations"], json!(MAX_ITERATIONS));
+        assert!(v["note"].as_str().unwrap().contains("carry on"), "{v}");
     }
 
     #[test]
