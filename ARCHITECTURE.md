@@ -220,8 +220,15 @@ exact.
    `</head>`, and `document.write` replaces the shell. If Tailwind was seen,
    its browser build is loaded from jsDelivr. The `data-sl` key is what lets a
    later CSS write find the block again — see "CSS without a reload".
-9. **Errors.** Any exception fetches `/__sl/check` and renders an error page
-   with the daemon's diagnostics; a missing route lists the routes. Error
+9. **Errors.** Any exception renders an error page with the daemon's
+   diagnostics; a missing route lists the routes. Where those diagnostics come
+   from is issue #54: a module that does not compile is answered `500` with
+   `{"error", "diagnostics"}`, and the browser hides that body behind "failed
+   to fetch dynamically imported module", so `shell.js` re-fetches the module
+   URLs it can name — the page module it tried to import, and any `/__sl/m/`
+   URL in the error's message or stack — and reads the diagnostics out of the
+   first one that carries them. Only when none does is `/__sl/check` fetched,
+   because that compiles every source file of the tenant. Error
    pages also load `live.js`, so they reload when the file is fixed; their
    `<body data-sl-overlay>` is how `live.js` knows not to swap CSS into them.
 
@@ -337,7 +344,28 @@ The cache (`Engine::cache`) is a `HashMap<u128, Arc<Built>>` behind a mutex
 with a `VecDeque` of insertion order. The budget (`--cache-mb`, default 64
 MiB) counts `body` bytes; when exceeded, the oldest-inserted entries are
 dropped (FIFO, not LRU). `/api/stats` and `/metrics` report entries, bytes,
-hits and misses.
+hits, misses and coalesced waits.
+
+### One compile per key, however many ask for it
+
+A miss also takes the key in `Engine::inflight`, a `HashMap<u128,
+Arc<Inflight>>`. A second caller for a key already being compiled waits on it
+instead of compiling it too: issue #55, where a burst on one cold module took a
+permit and a compile each, all producing the same bytes, precisely when the
+daemon was busiest. The waiter gets the leader's answer — its `BuildError`
+included, which is why `BuildError` is `Clone` — and the leader's `Lead` guard
+takes the key out of the map and wakes the waiters on its way out, panic or
+not, so nobody waits on a compile that will never answer. The wait is bounded
+by what the leader is bounded by: its permit deadline and its compile deadline.
+
+Such a wait is counted as `coalesced`, not as a hit: it is a miss that did not
+compile, so `misses - coalesced` is what the daemon actually compiled.
+
+One caller never waits: a thread already compiling under a permit — a sweep, or
+the module build a `?type=style` compile makes from inside itself. The leader
+takes the key before it takes a permit, so it can be queueing for the very
+permit that thread is holding; it compiles the key for itself instead, which is
+the duplicate the cache has always tolerated.
 
 ### How many compiles run at once
 
@@ -350,12 +378,19 @@ than queueing without end. `/api/stats` reports the permits held, the builds
 waiting, the limit, the refusals, and the two deadline counters below under
 `compiles`; `/metrics` has the same six.
 
-Two builds take no permit. A cache hit is not a compile, so a warm daemon
-serving cached modules never queues. And a `?type=style` or `?type=script`
+Three builds take no permit. A cache hit is not a compile, so a warm daemon
+serving cached modules never queues, and neither does a miss that waits on a
+compile of the same key already running. And a `?type=style` or `?type=script`
 build asks for the module from inside its own compile: that inner build runs
 under the permit — and on the stack, and under the deadline — its parent is
 already holding, which a thread-local marks for each. A second permit there
 would deadlock as soon as the gate was full.
+
+`Engine::sweep` marks a thread the same way for a different reason: a
+whole-project compile takes one permit and holds it for the whole run, so
+`check` costs one place in the queue rather than one per file (#54). The
+per-file compile deadline is untouched — each build inside still gets its own
+thread and its own wall clock.
 
 ### How long one compile may run
 
@@ -575,7 +610,13 @@ diagnostics and a census — islands, glob calls,
 Sass, MDX, endpoints, `@astrojs/*` integrations, bare imports — and exits 1 on
 compile errors, 2 when a directory cannot be loaded. `/api/t/{id}/check` and
 `/__sl/check` run the same loop (`api::check_tenant`) on a live tenant; the
-error page uses the latter.
+error page uses the latter as its fallback.
+
+That loop runs inside `Engine::sweep`, so the whole project compiles under one
+permit taken once. A sweep that cannot have one waits the queue deadline once
+and answers with that refusal as its single diagnostic — not once per file,
+which is what made the page that explains a failure the slowest thing on the
+site (#54).
 
 ## Metrics (`src/metrics.rs`)
 
@@ -596,6 +637,7 @@ observation.
 
 `GET /metrics` (`api::metrics`) renders those counters plus the gauges
 `/api/stats` already had — tenants, overlay bytes, cache entries and bytes,
+cache hits, misses and coalesced waits, stored conversations and their bytes,
 SSE subscribers, RSS, uptime, one series per base, `Sass::stats`'s running,
 runaway, timed-out and refused compilations, and the compile gate's permits
 held, builds queued, limit and refusals — as Prometheus text format 0.0.4,
@@ -636,6 +678,16 @@ sent as its opening turn from then on. A summary the API will not write is not
 fatal: the turns stay stored and are cut from the request anyway. A save past
 `--chats-per-tenant` drops the tenant's least recently updated conversation
 (`evictable`).
+
+`Chats::sizes` holds what each tenant's conversations weigh, `<tenant> → <chat
+id> → bytes`, seeded from the store the first time a tenant is touched and
+moved by every save and delete after that. `usage` reads it, so `/api/stats`
+and `/metrics` count conversations without listing a directory: the editor
+polls `/api/stats` every five seconds, and a walk per tenant per poll is
+O(tenants) of disk on the one endpoint whose numbers say this daemon's cost
+does not grow with tenant count (#60). The cap is the exception and still reads
+the directory on a save, because it decides which files to delete and must see
+what another node's writer left there.
 
 ## Layout
 

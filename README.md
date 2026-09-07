@@ -282,7 +282,7 @@ Editor host (`localhost`):
 | Method | Path | |
 |---|---|---|
 | GET | `/metrics` | Prometheus text format: gauges, cache and request counters, compile-latency histograms |
-| GET | `/api/stats` | RSS, tenant count, cache stats, what the chats directory holds, screenshots in flight, module requests and compile totals |
+| GET | `/api/stats` | RSS, tenant count, cache stats, what the stored conversations hold, screenshots in flight, module requests and compile totals |
 | GET/POST | `/api/bases` | list / add `{name, path}`; the path must be inside `--bases` when that flag is set |
 | POST | `/api/bases/{name}/reload` | re-read the base from disk and re-point every tenant on it |
 | GET/POST | `/api/tenants` | list / create `{id, base}` |
@@ -292,7 +292,7 @@ Editor host (`localhost`):
 | GET | `/api/t/{id}/export` | tar.gz of the merged tree; `?overlay=1` for the edits alone |
 | GET/PUT/DELETE | `/api/t/{id}/file/{path}` | raw file bytes |
 | GET | `/api/t/{id}/events` | SSE: `update` / `delete` with the new version and a `kind` (`css`, `style`, `module`) |
-| GET | `/api/t/{id}/check` | compile every source file, return diagnostics |
+| GET | `/api/t/{id}/check` | compile every source file under one compile permit, return diagnostics |
 | POST | `/api/t/{id}/chat` | `{messages:[{role,content}], chat?}` → `{text, changes, iterations, version, chat}`, or SSE with `Accept: text/event-stream` |
 | GET | `/api/t/{id}/chats` | saved conversations, newest first |
 | GET/DELETE | `/api/t/{id}/chats/{chat}` | one conversation with its turns / remove it |

@@ -131,7 +131,7 @@ pub async fn check(AxState(st): AxState<State>, Extension(id): Extension<TenantI
         Err(r) => return r,
     };
     let st2 = st.clone();
-    let out = match tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await {
+    let out = match tokio::task::spawn_blocking(move || check_tenant(&st2.engine, &t)).await {
         Ok(out) => out,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };

@@ -15,7 +15,7 @@ use tokio_stream::{Stream, StreamExt};
 use super::{AppState, State, mime};
 use crate::metrics::{BaseSize, KINDS, STATUSES, Snapshot, render};
 use crate::store::{Base, Tenant, WriteError, clean_path, valid_id};
-use crate::transform::{Kind, is_source};
+use crate::transform::{Engine, Kind, is_source};
 
 pub async fn editor() -> Html<&'static str> {
     Html(include_str!("../../assets/editor.html"))
@@ -72,20 +72,17 @@ fn module_stats(st: &AppState) -> Vec<Value> {
 }
 
 /// Conversations and the bytes they hold across every tenant. They are outside the tenant quota,
-/// so `overlay_bytes` does not see them and this is the only place the chats directory is counted.
-fn chat_stats(st: &AppState) -> std::io::Result<Value> {
-    let (mut conversations, mut bytes) = (0usize, 0u64);
+/// so `overlay_bytes` does not see them and this is the only place they are counted. `Chats` keeps
+/// the numbers as it writes and evicts, so this is memory rather than a directory walk per tenant:
+/// the editor polls `/api/stats` every five seconds, and #60 is what that cost at 1000 tenants.
+fn chat_totals(st: &AppState) -> std::io::Result<(u64, u64)> {
+    let (mut conversations, mut bytes) = (0u64, 0u64);
     for t in st.store.tenants() {
         let (n, b) = st.chats.usage(&t)?;
-        conversations += n;
+        conversations += n as u64;
         bytes += b;
     }
-    Ok(json!({
-        "conversations": conversations,
-        "bytes": bytes,
-        "max_per_tenant": st.chats.cap(),
-        "window_turns": st.chats.window(),
-    }))
+    Ok((conversations, bytes))
 }
 
 pub async fn stats(AxState(st): AxState<State>) -> Response {
@@ -94,10 +91,16 @@ pub async fn stats(AxState(st): AxState<State>) -> Response {
     let subscribers: usize = tenants.iter().map(|t| t.events.receiver_count()).sum();
     // A gauge that reads zero because a directory could not be listed is a wrong number, not a
     // missing one, and nothing downstream can tell the two apart.
-    let chats = match chat_stats(&st) {
-        Ok(chats) => chats,
+    let (conversations, chat_bytes) = match chat_totals(&st) {
+        Ok(totals) => totals,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chats: {e}")),
     };
+    let chats = json!({
+        "conversations": conversations,
+        "bytes": chat_bytes,
+        "max_per_tenant": st.chats.cap(),
+        "window_turns": st.chats.window(),
+    });
     Json(json!({
         "rss_kb": rss_kb(),
         "uptime_s": st.started.elapsed().as_secs(),
@@ -121,7 +124,7 @@ pub async fn stats(AxState(st): AxState<State>) -> Response {
     .into_response()
 }
 
-fn snapshot(st: &AppState) -> Snapshot {
+fn snapshot(st: &AppState, chats: (u64, u64)) -> Snapshot {
     let tenants = st.store.tenants();
     let cache = st.engine.stats();
     let sass = st.engine.sass_stats();
@@ -137,6 +140,9 @@ fn snapshot(st: &AppState) -> Snapshot {
         cache_bytes: cache.bytes as u64,
         cache_hits: cache.hits,
         cache_misses: cache.misses,
+        cache_coalesced: cache.coalesced,
+        chat_conversations: chats.0,
+        chat_bytes: chats.1,
         sse_subscribers: tenants.iter().map(|t| t.events.receiver_count() as u64).sum(),
         sass_running: sass.running as u64,
         sass_runaway: sass.runaway as u64,
@@ -157,7 +163,13 @@ fn snapshot(st: &AppState) -> Snapshot {
 }
 
 pub async fn metrics(AxState(st): AxState<State>) -> Response {
-    let body = render(&snapshot(&st));
+    // As in `stats`: a chats gauge that reads zero because the store could not be read is a wrong
+    // number wearing the shape of a right one, so the scrape fails instead.
+    let chats = match chat_totals(&st) {
+        Ok(totals) => totals,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chats: {e}")),
+    };
+    let body = render(&snapshot(&st, chats));
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
@@ -328,32 +340,30 @@ pub async fn events(AxState(st): AxState<State>, Path(id): Path<String>) -> Resp
     }
 }
 
-pub fn check_tenant(st: &AppState, t: &Arc<Tenant>) -> Value {
-    let mut diagnostics = Vec::new();
-    let mut files = 0;
-    for e in t.list() {
-        if !is_source(&e.path) {
-            continue;
-        }
-        files += 1;
-        match st.engine.build(t, &e.path, Kind::Module) {
-            Ok(b) => diagnostics.extend(b.warnings.iter().cloned()),
-            Err(be) => {
-                if be.diagnostics.is_empty() {
-                    diagnostics.push(crate::transform::Diag {
-                        severity: "error".into(),
-                        text: be.message,
-                        hint: String::new(),
-                        file: e.path.clone(),
-                        line: 0,
-                        column: 0,
-                    });
-                } else {
-                    diagnostics.extend(be.diagnostics);
-                }
+fn diag(file: &str, text: String) -> crate::transform::Diag {
+    crate::transform::Diag { severity: "error".into(), text, hint: String::new(), file: file.to_string(), line: 0, column: 0 }
+}
+
+/// Every source file of the tenant, compiled. Issue #54: the sweep takes one compile permit and
+/// holds it for the whole run, so a saturated daemon costs this one wait rather than one per file —
+/// the error page fetches `/__sl/check`, and it is the page that has to explain a failure.
+pub fn check_tenant(engine: &Engine, t: &Arc<Tenant>) -> Value {
+    let sources: Vec<String> = t.list().into_iter().map(|e| e.path).filter(|p| is_source(p)).collect();
+    let files = sources.len();
+    let swept = engine.sweep(|| {
+        let mut diagnostics = Vec::new();
+        for path in &sources {
+            match engine.build(t, path, Kind::Module) {
+                Ok(b) => diagnostics.extend(b.warnings.iter().cloned()),
+                Err(be) if be.diagnostics.is_empty() => diagnostics.push(diag(path, be.message)),
+                Err(be) => diagnostics.extend(be.diagnostics),
             }
         }
-    }
+        diagnostics
+    });
+    // A sweep that never got a permit is a saturated daemon, not a project with nothing wrong: the
+    // one refusal is the answer, and it is what the error overlay shows.
+    let diagnostics = swept.unwrap_or_else(|be| vec![diag("", be.message)]);
     let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
     json!({ "files": files, "errors": errors, "diagnostics": diagnostics })
 }
@@ -364,8 +374,69 @@ pub async fn check(AxState(st): AxState<State>, Path(id): Path<String>) -> Respo
         Err(r) => return r,
     };
     let st2 = st.clone();
-    match tokio::task::spawn_blocking(move || check_tenant(&st2, &t)).await {
+    match tokio::task::spawn_blocking(move || check_tenant(&st2.engine, &t)).await {
         Ok(out) => Json(out).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::check_tenant;
+    use crate::metrics::Metrics;
+    use crate::store::{Base, Store, Tenant, UpdateKind};
+    use crate::transform::{Config, Engine};
+
+    fn tenant(files: &[(&str, &str)]) -> Arc<Tenant> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let store = Store::new(None, u64::MAX);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &root).unwrap());
+        let id = format!("acme{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let t = store.create_tenant(&id, "starter").unwrap();
+        for (path, body) in files {
+            t.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
+        }
+        t
+    }
+
+    fn engine(limit: usize, wait: Duration) -> Engine {
+        Engine::gated(Config { cache_bytes: 1 << 20, ..Config::default() }, Arc::new(Metrics::default()), limit, wait, 8)
+    }
+
+    #[test]
+    fn check_names_the_file_that_does_not_compile() {
+        let t = tenant(&[("src/pages/bad.astro", "---\nconst n = ;\n---\n")]);
+        let engine = engine(2, Duration::from_millis(50));
+        let out = check_tenant(&engine, &t);
+        assert!(out["files"].as_u64().unwrap() > 1, "{out}");
+        assert_eq!(out["errors"], 1, "{out}");
+        let named = out["diagnostics"].as_array().unwrap().iter().any(|d| d["file"] == "src/pages/bad.astro" && d["severity"] == "error");
+        assert!(named, "{out}");
+        assert_eq!(engine.compile_stats().running, 0, "the sweep gave its permit back");
+    }
+
+    /// Issue #54: `check` took a permit per source file, so with every permit busy the page that
+    /// exists to explain a failure waited the queue deadline once per file — the slowest thing on
+    /// the site, exactly when the site is already broken. One wait now answers for the whole sweep.
+    #[test]
+    fn check_on_a_saturated_daemon_waits_once_not_once_per_file() {
+        let t = tenant(&[]);
+        let wait = Duration::from_millis(100);
+        // a gate no compile can pass: every permit is busy, for as long as the test needs it
+        let engine = engine(0, wait);
+        let started = Instant::now();
+        let out = check_tenant(&engine, &t);
+        let files = out["files"].as_u64().unwrap();
+        assert!(files >= 5, "the starter example has source files to sweep: {files}");
+        assert!(started.elapsed() < wait * 3, "{files} files took {:?}", started.elapsed());
+        assert_eq!(out["errors"], 1, "one refusal, not one per file: {out}");
+        assert!(out["diagnostics"][0]["text"].as_str().unwrap().contains("waited 100 ms"), "{out}");
+        assert_eq!(engine.compile_stats().refused, 1);
     }
 }

@@ -113,6 +113,9 @@ pub struct Snapshot {
     pub cache_bytes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub cache_coalesced: u64,
+    pub chat_conversations: u64,
+    pub chat_bytes: u64,
     pub sse_subscribers: u64,
     pub sass_running: u64,
     pub sass_runaway: u64,
@@ -171,6 +174,21 @@ pub fn render(s: &Snapshot) -> String {
     scalar(&mut out, "sandbox_lite_cache_bytes", "gauge", "Bytes retained by the transform cache.", s.cache_bytes);
     scalar(&mut out, "sandbox_lite_cache_hits_total", "counter", "Transform cache lookups that found an entry.", s.cache_hits);
     scalar(&mut out, "sandbox_lite_cache_misses_total", "counter", "Transform cache lookups that had to compile.", s.cache_misses);
+    scalar(
+        &mut out,
+        "sandbox_lite_cache_coalesced_total",
+        "counter",
+        "Transform cache misses that waited on a compile of the same key already running; subtract these from the misses to get the compiles.",
+        s.cache_coalesced,
+    );
+    scalar(&mut out, "sandbox_lite_chats", "gauge", "Stored conversations across every tenant.", s.chat_conversations);
+    scalar(
+        &mut out,
+        "sandbox_lite_chat_bytes",
+        "gauge",
+        "Bytes those conversations hold; they are outside the tenant quota.",
+        s.chat_bytes,
+    );
     scalar(&mut out, "sandbox_lite_sse_subscribers", "gauge", "Open live-reload event streams across every tenant.", s.sse_subscribers);
 
     scalar(&mut out, "sandbox_lite_sass_running", "gauge", "Sass compilations in flight.", s.sass_running);
@@ -313,6 +331,9 @@ mod tests {
             cache_bytes: 8192,
             cache_hits: 10,
             cache_misses: 3,
+            cache_coalesced: 2,
+            chat_conversations: 4,
+            chat_bytes: 9001,
             sse_subscribers: 1,
             sass_running: 1,
             sass_runaway: 2,
@@ -366,6 +387,15 @@ sandbox_lite_cache_hits_total 10
 # HELP sandbox_lite_cache_misses_total Transform cache lookups that had to compile.
 # TYPE sandbox_lite_cache_misses_total counter
 sandbox_lite_cache_misses_total 3
+# HELP sandbox_lite_cache_coalesced_total Transform cache misses that waited on a compile of the same key already running; subtract these from the misses to get the compiles.
+# TYPE sandbox_lite_cache_coalesced_total counter
+sandbox_lite_cache_coalesced_total 2
+# HELP sandbox_lite_chats Stored conversations across every tenant.
+# TYPE sandbox_lite_chats gauge
+sandbox_lite_chats 4
+# HELP sandbox_lite_chat_bytes Bytes those conversations hold; they are outside the tenant quota.
+# TYPE sandbox_lite_chat_bytes gauge
+sandbox_lite_chat_bytes 9001
 # HELP sandbox_lite_sse_subscribers Open live-reload event streams across every tenant.
 # TYPE sandbox_lite_sse_subscribers gauge
 sandbox_lite_sse_subscribers 1
@@ -504,6 +534,9 @@ sandbox_lite_compile_seconds_count{kind="url"} 0
             cache_bytes: 0,
             cache_hits: 0,
             cache_misses: 0,
+            cache_coalesced: 0,
+            chat_conversations: 0,
+            chat_bytes: 0,
             sse_subscribers: 0,
             sass_running: 0,
             sass_runaway: 0,

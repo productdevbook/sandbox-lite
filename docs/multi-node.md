@@ -44,7 +44,7 @@ So with two daemons, A and B, sharing `--data-dir`:
 | `POST /api/bases/theme/reload` on A | Only A re-reads the base. B keeps the copy it loaded. |
 | `POST /api/t/acme/chat` on A, then `GET /api/t/acme/chats` on B | B lists it: conversations are read from the shared data directory on every call, not cached. |
 | `POST /api/tenants/acme/import` on A | A's overlay and the data directory change; B's overlay does not, exactly as for a single write. |
-| `/api/stats`, `/metrics` on B | B's own tenants, cache and subscribers. Neither number is a cluster total. |
+| `/api/stats`, `/metrics` on B | B's own tenants, cache and subscribers. Neither number is a cluster total. The chats figures are counters B keeps as it saves and evicts, seeded from the directory the first time it touches a tenant, so what A writes afterwards is not in them either. |
 
 The version being per node also means a browser that moves from A to B
 mid-session gets a lower `?v=` than it had. That is harmless — the daemon never

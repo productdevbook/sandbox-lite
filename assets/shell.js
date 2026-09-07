@@ -14,6 +14,48 @@ async function fetchJSON(url) {
   return r.json();
 }
 
+// A dynamic import that fails says only "failed to fetch dynamically imported module"; the daemon's
+// 500 body is where the diagnostic is, so the URL is kept for the error handler to ask for it.
+async function importModule(url) {
+  try {
+    return await import(slUrl(url));
+  } catch (e) {
+    if (e && typeof e === "object" && !e.slModule) e.slModule = url;
+    throw e;
+  }
+}
+
+const MODULE_URL = /\/__sl\/m\/[^\s"'`)]+/g;
+const MODULE_URLS_READ = 4;
+
+function moduleUrls(e) {
+  const urls = new Set();
+  if (e && e.slModule) urls.add(e.slModule);
+  for (const text of [e && e.message, e && e.stack]) {
+    for (const m of String(text ?? "").matchAll(MODULE_URL)) urls.add(m[0]);
+  }
+  // the token is added back by slUrl; a URL read out of an error message carries the old one
+  return [...urls].map((u) => u.replace(/[?&]sl_token=[^&]*/g, "")).slice(0, MODULE_URLS_READ);
+}
+
+// Issue #54: the module request that failed already answers `{error, diagnostics}`, so reading its
+// body costs one compile of one file. /__sl/check compiles every source file of the tenant, and on
+// a busy daemon each of those waits for a compile permit — the page explaining a failure must not
+// be the slowest thing on the site. It stays the fallback, for a failure no module body explains.
+async function failedModuleDiagnostics(e) {
+  for (const url of moduleUrls(e)) {
+    try {
+      const r = await fetch(slUrl(url));
+      if (r.ok) continue;
+      const body = await r.json();
+      const diagnostics = (body.diagnostics ?? []).filter((d) => d.severity === "error");
+      if (diagnostics.length) return diagnostics;
+      if (body.error) return [{ severity: "error", file: url.split("?")[0].replace("/__sl/m/", ""), text: body.error, hint: "" }];
+    } catch {}
+  }
+  return [];
+}
+
 function matchRoute(routes, pathname) {
   for (const r of routes) {
     const m = new RegExp(r.pattern).exec(pathname);
@@ -161,7 +203,7 @@ async function main() {
   if (!hit) return showError({ title: "404 — no matching page", message: `Nothing in src/pages matches ${location.pathname}`, routes });
   const endpoint = hit.route.kind === "endpoint";
   const astro = await import(slUrl("/__sl/astro.js"));
-  const mod = await import(slUrl(`/__sl/m/${hit.route.component}?v=${V}`));
+  const mod = await importModule(`/__sl/m/${hit.route.component}?v=${V}`);
   if (endpoint) {
     if (typeof mod.GET !== "function" && typeof mod.ALL !== "function") {
       return showError({ title: "Endpoint without a handler", message: `${hit.route.component} exports no GET or ALL function. The preview only issues GET requests.` });
@@ -206,8 +248,10 @@ async function main() {
 }
 
 main().catch(async (e) => {
-  let diagnostics = [];
-  try { diagnostics = (await fetchJSON("/__sl/check")).diagnostics.filter((d) => d.severity === "error"); } catch {}
+  let diagnostics = await failedModuleDiagnostics(e);
+  if (!diagnostics.length) {
+    try { diagnostics = (await fetchJSON("/__sl/check")).diagnostics.filter((d) => d.severity === "error"); } catch {}
+  }
   console.error(e);
   showError({ title: "Render failed", message: e && e.message ? e.message : String(e), stack: e && e.stack, diagnostics });
 });

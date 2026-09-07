@@ -148,6 +148,12 @@ pub fn evictable(newest_first: &[Conversation], cap: usize, keep: &str) -> Vec<S
 /// Disk is the store when the tenant has a data directory; the map holds everything otherwise.
 pub struct Chats {
     mem: RwLock<HashMap<String, BTreeMap<String, Conversation>>>,
+    /// What each tenant's conversations weigh, `<tenant> → <chat id> → bytes`. Seeded from the
+    /// store the first time a tenant is touched and moved by every save and delete after that, so
+    /// `usage` answers from memory: `/api/stats` is polled every five seconds by every open editor,
+    /// and a directory walk per tenant per poll is O(tenants) of disk on the endpoint whose numbers
+    /// say this daemon's cost does not grow with tenant count (#60).
+    sizes: RwLock<HashMap<String, BTreeMap<String, u64>>>,
     cap: usize,
     window: usize,
 }
@@ -160,7 +166,7 @@ impl Default for Chats {
 
 impl Chats {
     pub fn new(cap: usize, window: usize) -> Chats {
-        Chats { mem: RwLock::new(HashMap::new()), cap: cap.max(1), window: window.max(2) }
+        Chats { mem: RwLock::new(HashMap::new()), sizes: RwLock::new(HashMap::new()), cap: cap.max(1), window: window.max(2) }
     }
 
     /// Turns `for_model` replays in full; see `DEFAULT_WINDOW_TURNS`.
@@ -187,16 +193,43 @@ impl Chats {
     }
 
     pub fn save(&self, t: &Tenant, chat: &Conversation) -> io::Result<()> {
+        self.seed(t)?;
+        let raw = serde_json::to_vec(chat)?;
+        let bytes = raw.len() as u64;
         match dir(t) {
             Some(dir) => {
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join(format!("{}.json", chat.id)), serde_json::to_vec(chat)?)?;
+                std::fs::write(dir.join(format!("{}.json", chat.id)), &raw)?;
             }
             None => {
                 self.mem.write().unwrap().entry(t.id.clone()).or_default().insert(chat.id.clone(), chat.clone());
             }
         }
+        self.sizes.write().unwrap().entry(t.id.clone()).or_default().insert(chat.id.clone(), bytes);
         self.evict(t, &chat.id)
+    }
+
+    /// The bytes each of a tenant's conversations holds, read once and then maintained. A tenant
+    /// already seeded is left alone, so this is one directory walk per tenant per process.
+    fn seed(&self, t: &Tenant) -> io::Result<()> {
+        if self.sizes.read().unwrap().contains_key(&t.id) {
+            return Ok(());
+        }
+        let seeded: BTreeMap<String, u64> = match dir(t) {
+            Some(dir) => {
+                let mut out = BTreeMap::new();
+                for entry in chat_files(&dir)? {
+                    out.insert(chat_id(&entry), entry.metadata()?.len());
+                }
+                out
+            }
+            None => match self.mem.read().unwrap().get(&t.id) {
+                Some(held) => held.iter().map(|(id, c)| (id.clone(), serialized_bytes(c))).collect(),
+                None => BTreeMap::new(),
+            },
+        };
+        self.sizes.write().unwrap().entry(t.id.clone()).or_insert(seeded);
+        Ok(())
     }
 
     /// Brings the tenant back under the cap after a save. The count is taken first because it
@@ -218,21 +251,13 @@ impl Chats {
         }
     }
 
-    /// What the tenant's conversations hold: the size of the files under `<data-dir>/<id>/chats/`,
-    /// or what the in-memory ones would serialize to.
+    /// What the tenant's conversations hold, from the counters rather than the disk: the tenant is
+    /// walked once, on the first call, and every save and delete after that moves the numbers.
+    /// `/api/stats` and `/metrics` are the callers, and the editor polls the first every 5 s.
     pub fn usage(&self, t: &Tenant) -> io::Result<(usize, u64)> {
-        match dir(t) {
-            Some(dir) => {
-                let mut out = (0usize, 0u64);
-                for entry in chat_files(&dir)? {
-                    out = (out.0 + 1, out.1 + entry.metadata()?.len());
-                }
-                Ok(out)
-            }
-            None => Ok(self.mem.read().unwrap().get(&t.id).map_or((0, 0), |m| {
-                m.values().fold((0, 0), |(n, bytes), c| (n + 1, bytes + serde_json::to_vec(c).map_or(0, |v| v.len() as u64)))
-            })),
-        }
+        self.seed(t)?;
+        let sizes = self.sizes.read().unwrap();
+        Ok(sizes.get(&t.id).map_or((0, 0), |held| (held.len(), held.values().sum())))
     }
 
     /// Newest first. A conversation file that cannot be read fails the listing rather than
@@ -259,18 +284,36 @@ impl Chats {
         if !valid_id(id) {
             return Ok(false);
         }
-        let Some(dir) = dir(t) else { return Ok(self.mem.write().unwrap().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some())) };
-        match std::fs::remove_file(dir.join(format!("{id}.json"))) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
+        self.seed(t)?;
+        let removed = match dir(t) {
+            Some(dir) => match std::fs::remove_file(dir.join(format!("{id}.json"))) {
+                Ok(()) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            },
+            None => self.mem.write().unwrap().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some()),
+        };
+        if removed && let Some(held) = self.sizes.write().unwrap().get_mut(&t.id) {
+            held.remove(id);
         }
+        Ok(removed)
     }
 
-    /// A deleted tenant takes its data directory with it; the in-memory map has to be told.
+    /// A deleted tenant takes its data directory with it; the in-memory map has to be told, and so
+    /// do the counters, or a tenant re-created with the same id would start from the old numbers.
     pub fn forget(&self, tenant: &str) {
         self.mem.write().unwrap().remove(tenant);
+        self.sizes.write().unwrap().remove(tenant);
     }
+}
+
+/// What a conversation weighs in the store: exactly the bytes `save` writes for it.
+fn serialized_bytes(c: &Conversation) -> u64 {
+    serde_json::to_vec(c).map_or(0, |v| v.len() as u64)
+}
+
+fn chat_id(entry: &std::fs::DirEntry) -> String {
+    entry.file_name().to_string_lossy().trim_end_matches(".json").to_string()
 }
 
 fn dir(t: &Tenant) -> Option<PathBuf> {
@@ -521,6 +564,40 @@ mod tests {
     fn usage_is_zero_for_a_tenant_that_has_never_chatted() {
         let (t, root) = tenant(true);
         assert_eq!(Chats::default().usage(&t).unwrap(), (0, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #60: `/api/stats` walked every tenant's chats directory, and the editor polls it every
+    /// five seconds. The counters answer instead — proved here by taking the directory away — and
+    /// they still agree with the files after a save, an evict and a restore onto a fresh daemon.
+    #[test]
+    fn usage_is_counted_in_memory_and_still_matches_the_files() {
+        let (t, root) = tenant(true);
+        let chats = Chats::new(2, 8);
+        for i in 0..3 {
+            let mut c = conversation(&format!("c{i}"), 2);
+            c.updated = 1000 + i as u64;
+            chats.save(&t, &c).unwrap();
+        }
+        let counted = chats.usage(&t).unwrap();
+        assert_eq!(counted.0, 2, "the third save evicted the oldest");
+
+        let stored = super::dir(&t).unwrap();
+        let on_disk: (usize, u64) = std::fs::read_dir(&stored)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .fold((0, 0), |(n, bytes), len| (n + 1, bytes + len));
+        assert_eq!(counted, on_disk, "the counters and the files agree");
+
+        // A daemon that has never seen this tenant seeds itself from the same directory.
+        assert_eq!(Chats::new(2, 8).usage(&t).unwrap(), counted);
+
+        // And once they are warm the directory is not read again: it is not even there.
+        std::fs::remove_dir_all(&stored).unwrap();
+        assert_eq!(chats.usage(&t).unwrap(), counted);
+
+        chats.forget(&t.id);
+        assert_eq!(chats.usage(&t).unwrap(), (0, 0), "a deleted tenant starts from nothing");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
