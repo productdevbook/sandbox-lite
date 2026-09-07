@@ -458,13 +458,17 @@ pub fn new_id() -> String {
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
 
+/// `list` reads and parses every conversation the tenant has, and `load` and `delete` are each a
+/// file operation, so all three go to the blocking pool: two async workers answer every request on
+/// this daemon, and `/health` is one of them (#94).
 pub async fn list(AxState(st): AxState<State>, AxPath(id): AxPath<String>) -> Response {
     let t = match tenant_or_404(&st, &id) {
         Ok(t) => t,
         Err(r) => return r,
     };
-    match st.chats.list(&t) {
-        Ok(all) => Json(json!({ "chats": all.iter().map(Conversation::brief).collect::<Vec<_>>() })).into_response(),
+    match tokio::task::spawn_blocking(move || st.chats.list(&t)).await {
+        Ok(Ok(all)) => Json(json!({ "chats": all.iter().map(Conversation::brief).collect::<Vec<_>>() })).into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -474,9 +478,10 @@ pub async fn get(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(String
         Ok(t) => t,
         Err(r) => return r,
     };
-    match st.chats.load(&t, &chat) {
-        Ok(Some(c)) => Json(c).into_response(),
-        Ok(None) => err(StatusCode::NOT_FOUND, "unknown chat"),
+    match tokio::task::spawn_blocking(move || st.chats.load(&t, &chat)).await {
+        Ok(Ok(Some(c))) => Json(c).into_response(),
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "unknown chat"),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -486,9 +491,10 @@ pub async fn remove(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(Str
         Ok(t) => t,
         Err(r) => return r,
     };
-    match st.chats.delete(&t, &chat) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => err(StatusCode::NOT_FOUND, "unknown chat"),
+    match tokio::task::spawn_blocking(move || st.chats.delete(&t, &chat)).await {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => err(StatusCode::NOT_FOUND, "unknown chat"),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

@@ -26,9 +26,10 @@ one per request from the `Host` header (lowercased, port stripped):
   `/api/tenants/{id}/import`, `/api/t/{id}/files`, `/api/t/{id}/export`,
   `/api/t/{id}/file/{*path}`, `/api/t/{id}/events`, `/api/t/{id}/check`,
   `/api/t/{id}/chat`, `/api/t/{id}/chats` and `/api/t/{id}/chats/{chat}`, with
-  a 64 MiB body limit. `require_api_token` wraps all of it, so that whole list
-  is the `--api-token` surface — `import` and `export` included, which move
-  whole file trees.
+  a 64 MiB body limit. `require_api_token` wraps all of it and then exempts two
+  paths, `/` and `/health`, so the `--api-token` surface is everything else on
+  that list — `import` and `export`, which move whole file trees, and
+  `/metrics`, which a scrape must therefore authenticate to.
 
 `SECURITY.md` describes the two middlewares.
 
@@ -38,10 +39,14 @@ A **base** is a project directory read at startup (`Base::load`): every regular
 file, skipping `node_modules`, `.git`, `dist`, `.astro`, `.vercel`, `.netlify`,
 `.output`. Files up to 256 KiB are held in memory (`FileData::Mem`); larger ones
 stay on disk and are re-read on each access (`FileData::Disk`). Bases come from
-every sub-directory of `--bases` (default `./examples` when it exists) that is
+every sub-directory of `--bases` that is
 a directory in its own right — `Store::bases_in_dir` reads the entry's own
 type, so a symbolic link is skipped rather than followed — from each
-`--base NAME=PATH`, and from `POST /api/bases` at run time. All three put the
+`--base NAME=PATH`, and from `POST /api/bases` at run time. `./examples` is the
+default for `--bases`, but only when neither flag names a base
+(`src/main.rs`): `--base theme=/srv/theme` alone loads exactly that one base,
+because naming a base is configuring the daemon and the default is there for
+the daemon nobody configured. All three put the
 root through `Store::base_root` first, so with `--bases` set a root outside it
 is refused whichever way it arrives. `Base::load`
 also records a `stamp`: a hash of the name, size and mtime of every file it

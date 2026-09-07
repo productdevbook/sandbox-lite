@@ -212,8 +212,9 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 ```
 --listen ADDR        bind address (default 127.0.0.1:4321)
 --domain NAME        tenants are served at http://<id>.NAME:PORT/ (default localhost)
---bases DIR          directory whose sub-directories are base projects (symbolic links are skipped)
---base NAME=PATH     add one base project (repeatable)
+--bases DIR          directory whose sub-directories are base projects (symbolic links are skipped;
+                     default ./examples when it exists and no base is named another way)
+--base NAME=PATH     add one base project (repeatable); naming one turns the ./examples default off
 --watch-bases N      re-read a base project when its files change, polled every N seconds (default: off)
 --data-dir DIR       where tenant edits are persisted (default ./data)
 --no-persist         keep edits in memory only
@@ -226,7 +227,8 @@ its 20 s deadline is killed and reaped before its profile directory goes.
                      and the compiler thread is abandoned (default 10000)
 --max-compiles N     compiles that may run at once (default: one per core)
 --model NAME         Claude model for the chat endpoint (default claude-fable-5-1)
---api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) on /api/*
+--api-token TOKEN    require `Authorization: Bearer TOKEN` (or `?token=`) everywhere on the editor
+                     host but `/` and `/health` — so on `/api/*` and on `/metrics`
 --preview-secret S   tenant hosts require a per-tenant token derived from S
 --chrome PATH        chrome or chromium binary for the chat's screenshot tool (default: off)
 --chrome-jobs N      screenshots that may run at once (default 1)

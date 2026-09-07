@@ -233,7 +233,14 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
         Ok(Err((status, message))) => return (status, refused(message)).into_response(),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    match t.write_many(unpacked.files, &unpacked.deleted, replace) {
+    // 10,000 files is 766 ms of `create_dir`/`rename`/`write` under the overlay's write lock (#94),
+    // and there are two async workers: on one of them the import is also every other tenant's
+    // `/health`.
+    let applied = match tokio::task::spawn_blocking(move || t.write_many(unpacked.files, &unpacked.deleted, replace)).await {
+        Ok(applied) => applied,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match applied {
         Ok(Applied { version, written, deleted }) => {
             Json(json!({ "files": written, "deleted": deleted, "version": version })).into_response()
         }

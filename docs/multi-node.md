@@ -24,10 +24,13 @@ A daemon is not a stateless front end over the data directory. Each one holds:
   that daemon's own writes publish to.
 
 Conversations are the exception, and the only shared state here. With a
-`--data-dir`, `Chats` holds nothing: every load, save, list and delete goes
-straight to `<data-dir>/<id>/chats/*.json` (`src/http/chats.rs`), so a chat
-started on one node is readable on the other as soon as that node has the
-tenant. Two nodes saving the same chat id is last-writer-wins like any other
+`--data-dir`, every load, save, list and delete of a conversation goes straight
+to `<data-dir>/<id>/chats/*.json` (`src/http/chats.rs`) — none of it is cached
+— so a chat started on one node is readable on the other as soon as that node
+has the tenant. What `Chats` does hold is a per-tenant size counter
+(`sizes`, seeded by a directory walk on first touch and moved by every save and
+delete after that), and that is node-local: it goes stale the moment the other
+node writes, which is what the `/api/stats` row below means. Two nodes saving the same chat id is last-writer-wins like any other
 file. With `--no-persist` they are per-node memory and are not shared at all.
 
 So with two daemons, A and B, sharing `--data-dir`:
