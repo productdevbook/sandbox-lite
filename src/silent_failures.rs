@@ -67,11 +67,12 @@ const TOLERATED: [(&str, &str); 8] = [
         "let status = std::fs::read_to_string(\"/proc/self/status\").ok()?;",
         "there is no /proc off Linux; `rss_kb` is an Option and /metrics omits the gauge",
     ),
-    (
-        "None => self.mem.read().unwrap().get(&t.id).map(|m| m.values().cloned().collect()).unwrap_or_default(),",
-        "an Option: a tenant with no conversations yet genuinely has an empty list",
-    ),
     ("let _ = self.events.send(format!(", "a broadcast with no subscribers, which is the normal state of a tenant nobody is previewing"),
+    (
+        "self.read().unwrap_or_else(PoisonError::into_inner)",
+        "`RwLock::read`, not `Tenant::read` — `.read(` is in FALLIBLE for the second. Taking the data \
+         back from a poisoned lock is this daemon's answer to a panicking holder, argued in src/sync.rs",
+    ),
 ];
 
 pub fn src_dir() -> PathBuf {
@@ -95,7 +96,7 @@ pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// declaration, a `static` inside a `thread_local!`, a statement inside a function. Stopping at the
 /// attribute itself, as this did until #83, left everything below `transform/mod.rs`'s first
 /// indented one unread.
-fn production_lines(text: &str) -> Vec<(usize, String)> {
+pub fn production_lines(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut i = 0;

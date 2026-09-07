@@ -120,7 +120,10 @@ container, or a network namespace of its own.
 - **Compiled source** is bounded three ways before it reaches oxc,
   `astro_codegen`, `satteri-mdxjs` or `grass`, all of which are
   recursive-descent and so can overflow a thread stack — which aborts the whole
-  daemon, since the release profile sets `panic = "abort"`. The three apply to
+  daemon whatever the panic strategy: the guard page is not a panic and no
+  `catch_unwind` sees it. A panic in one of those parsers is different, and
+  since #93 survivable — the release profile unwinds, so the nets around each
+  compile turn it into a 500 for the one request. The three caps apply to
   the extensions those parsers read (`parses_source`, `src/transform/mod.rs`):
   `.astro`, `.ts`, `.tsx`, `.jsx`, `.mts`, `.js`, `.mjs`, `.mdx`, `.scss`,
   `.sass`, `.vue` and `.svelte` — the last two because `sfc::check_vue` and

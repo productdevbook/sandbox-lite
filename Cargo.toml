@@ -47,4 +47,5 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# No `panic = "abort"`: a panic anywhere in a tenant's compile must cost that tenant its request,
+# not every tenant on the box. See src/sync.rs and `ratchets::the_release_profile_unwinds`.

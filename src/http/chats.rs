@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use super::State;
 use super::api::{err, tenant_or_404};
 use crate::store::{Tenant, valid_id};
+use crate::sync::Shared;
 
 const TITLE_CHARS: usize = 80;
 
@@ -287,7 +288,7 @@ impl Chats {
         if !valid_id(id) {
             return Ok(None);
         }
-        let Some(dir) = dir(t) else { return Ok(self.mem.read().unwrap().get(&t.id).and_then(|m| m.get(id)).cloned()) };
+        let Some(dir) = dir(t) else { return Ok(self.mem.shared().get(&t.id).and_then(|m| m.get(id)).cloned()) };
         match std::fs::read(dir.join(format!("{id}.json"))) {
             Ok(raw) => serde_json::from_slice(&raw).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -305,17 +306,17 @@ impl Chats {
                 std::fs::write(dir.join(format!("{}.json", chat.id)), &raw)?;
             }
             None => {
-                self.mem.write().unwrap().entry(t.id.clone()).or_default().insert(chat.id.clone(), chat.clone());
+                self.mem.exclusive().entry(t.id.clone()).or_default().insert(chat.id.clone(), chat.clone());
             }
         }
-        self.sizes.write().unwrap().entry(t.id.clone()).or_default().insert(chat.id.clone(), bytes);
+        self.sizes.exclusive().entry(t.id.clone()).or_default().insert(chat.id.clone(), bytes);
         self.evict(t, &chat.id)
     }
 
     /// The bytes each of a tenant's conversations holds, read once and then maintained. A tenant
     /// already seeded is left alone, so this is one directory walk per tenant per process.
     fn seed(&self, t: &Tenant) -> io::Result<()> {
-        if self.sizes.read().unwrap().contains_key(&t.id) {
+        if self.sizes.shared().contains_key(&t.id) {
             return Ok(());
         }
         let seeded: BTreeMap<String, u64> = match dir(t) {
@@ -326,12 +327,12 @@ impl Chats {
                 }
                 out
             }
-            None => match self.mem.read().unwrap().get(&t.id) {
+            None => match self.mem.shared().get(&t.id) {
                 Some(held) => held.iter().map(|(id, c)| (id.clone(), serialized_bytes(c))).collect(),
                 None => BTreeMap::new(),
             },
         };
-        self.sizes.write().unwrap().entry(t.id.clone()).or_insert(seeded);
+        self.sizes.exclusive().entry(t.id.clone()).or_insert(seeded);
         Ok(())
     }
 
@@ -354,7 +355,7 @@ impl Chats {
     /// `/api/stats` and `/metrics` are the callers, and the editor polls the first every 5 s.
     pub fn usage(&self, t: &Tenant) -> io::Result<(usize, u64)> {
         self.seed(t)?;
-        let sizes = self.sizes.read().unwrap();
+        let sizes = self.sizes.shared();
         Ok(sizes.get(&t.id).map_or((0, 0), |held| (held.len(), held.values().sum())))
     }
 
@@ -370,7 +371,7 @@ impl Chats {
                 }
                 out
             }
-            None => self.mem.read().unwrap().get(&t.id).map(|m| m.values().cloned().collect()).unwrap_or_default(),
+            None => self.mem.shared().get(&t.id).map(|m| m.values().cloned().collect()).unwrap_or_default(),
         };
         all.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
         Ok(all)
@@ -389,9 +390,9 @@ impl Chats {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             },
-            None => self.mem.write().unwrap().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some()),
+            None => self.mem.exclusive().get_mut(&t.id).is_some_and(|m| m.remove(id).is_some()),
         };
-        if removed && let Some(held) = self.sizes.write().unwrap().get_mut(&t.id) {
+        if removed && let Some(held) = self.sizes.exclusive().get_mut(&t.id) {
             held.remove(id);
         }
         Ok(removed)
@@ -400,8 +401,8 @@ impl Chats {
     /// A deleted tenant takes its data directory with it; the in-memory map has to be told, and so
     /// do the counters, or a tenant re-created with the same id would start from the old numbers.
     pub fn forget(&self, tenant: &str) {
-        self.mem.write().unwrap().remove(tenant);
-        self.sizes.write().unwrap().remove(tenant);
+        self.mem.exclusive().remove(tenant);
+        self.sizes.exclusive().remove(tenant);
     }
 }
 

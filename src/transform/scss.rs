@@ -11,6 +11,7 @@ use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 use crate::resolve::normalize;
 use crate::store::{FileData, Tenant};
+use crate::sync::{Held, Waited};
 
 /// One Sass file, source or `@use`d, that the compiler may read.
 const MAX_FILE: usize = 1 << 20;
@@ -58,7 +59,7 @@ impl Snapshot {
     /// An `io::Error` out of `Fs::read` reaches `SassError::raw`, which panics; a file the limits
     /// refuse is hidden from the compiler instead, and the reason kept for the error it then makes.
     fn deny(&self, message: String) -> bool {
-        let mut slot = self.denied.lock().unwrap();
+        let mut slot = self.denied.held();
         if slot.is_none() {
             *slot = Some(message);
         }
@@ -66,7 +67,7 @@ impl Snapshot {
     }
 
     fn refusal(&self) -> Option<String> {
-        self.denied.lock().unwrap().take()
+        self.denied.held().take()
     }
 }
 
@@ -169,9 +170,19 @@ impl Flights {
         Ok(css)
     }
 
+    /// The compile thread's whole body. grass parses tenant-controlled input and `SassError::raw`
+    /// panics, so the net is here: whatever the compile does, the flight is settled and the waiting
+    /// request gets an answer rather than the deadline. Named so a test can drive it with a
+    /// panicking compile — grass's own panics are not reachable on demand.
+    fn flight_body(&self, key: u128, flight: &Arc<Flight>, fs: &Snapshot, work: impl FnOnce() -> Result<String, String>) {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| self.failed(fs, "the Sass compiler panicked".to_string()));
+        self.finish(key, flight, out);
+    }
+
     fn finish(&self, key: u128, flight: &Arc<Flight>, out: Result<String, String>) {
         {
-            let mut live = self.live.lock().unwrap();
+            let mut live = self.live.held();
             if live.get(&key).is_some_and(|f| Arc::ptr_eq(f, flight)) {
                 live.remove(&key);
             }
@@ -179,14 +190,14 @@ impl Flights {
                 self.runaway.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        *flight.done.lock().unwrap() = Some(Arc::new(out));
+        *flight.done.held() = Some(Arc::new(out));
         flight.ready.notify_all();
     }
 
     /// The deadline passed and grass cannot be interrupted: the thread stays, and every later
     /// request for the same source is refused rather than starting a second one beside it.
     fn overrun(&self, key: u128, flight: &Arc<Flight>) {
-        let live = self.live.lock().unwrap();
+        let live = self.live.held();
         if live.get(&key).is_some_and(|f| Arc::ptr_eq(f, flight)) && !flight.runaway.swap(true, Ordering::Relaxed) {
             self.runaway.fetch_add(1, Ordering::Relaxed);
             self.timeouts.fetch_add(1, Ordering::Relaxed);
@@ -217,7 +228,7 @@ impl Sass {
 
     pub fn stats(&self) -> SassStats {
         SassStats {
-            running: self.0.live.lock().unwrap().len(),
+            running: self.0.live.held().len(),
             runaway: self.0.runaway.load(Ordering::Relaxed),
             timeouts: self.0.timeouts.load(Ordering::Relaxed),
             refused: self.0.refused.load(Ordering::Relaxed),
@@ -241,7 +252,7 @@ impl Sass {
         let key = xxh3_128(&h);
 
         let (flight, start) = {
-            let mut live = self.0.live.lock().unwrap();
+            let mut live = self.0.live.held();
             match live.get(&key).cloned() {
                 Some(f) if f.runaway.load(Ordering::Relaxed) => {
                     let ms = self.0.timeout.as_millis();
@@ -271,22 +282,20 @@ impl Sass {
             let fs = Snapshot::of(tenant, source.len());
             let (inner, f, dir, source) = (self.0.clone(), flight.clone(), dir.to_string(), source.to_string());
             let spawned = std::thread::Builder::new().name("sass".into()).stack_size(STACK).spawn(move || {
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.run(&fs, &dir, source, indented)))
-                    .unwrap_or_else(|_| inner.failed(&fs, "the Sass compiler panicked".to_string()));
-                inner.finish(key, &f, out);
+                inner.flight_body(key, &f, &fs, || inner.run(&fs, &dir, source, indented));
             });
             if let Err(e) = spawned {
                 self.0.finish(key, &flight, Err(format!("cannot start a Sass compile thread: {e}")));
             }
         }
 
-        let mut done = flight.done.lock().unwrap();
+        let mut done = flight.done.held();
         loop {
             if let Some(out) = done.as_ref() {
                 return (**out).clone();
             }
             let Some(left) = flight.deadline.checked_duration_since(Instant::now()) else { break };
-            done = flight.ready.wait_timeout(done, left).unwrap().0;
+            done = flight.ready.waited_for(done, left);
         }
         drop(done);
         self.0.overrun(key, &flight);
@@ -326,11 +335,13 @@ pub fn fingerprint(tenant: &Tenant) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::{MAX_FILE, MAX_OUTPUT, MAX_READ, Sass, uses_sass};
+    use super::{Flight, MAX_FILE, MAX_OUTPUT, MAX_READ, Sass, Snapshot, uses_sass};
     use crate::store::{Base, Store, Tenant, UpdateKind};
+    use crate::sync::Held;
 
     fn tenant(files: &[(&str, String)]) -> Arc<Tenant> {
         let store = Store::new(None, u64::MAX);
@@ -448,6 +459,31 @@ mod tests {
             let e = sass.compile(&t, "src", &bomb(100_002), false).unwrap_err();
             assert!(e.contains("2 Sass compilations are already running"), "{e}");
         });
+    }
+
+    /// Issue #93: with `panic = "abort"` this string could not be produced by the shipped binary.
+    /// grass panics on an `io::Error` out of `Fs::read` and nothing here can make it do so on
+    /// demand, so the net is driven directly — what is under test is the net, not grass.
+    #[test]
+    fn a_panicking_sass_compile_answers_the_request_instead_of_the_deadline() {
+        let t = tenant(&[]);
+        let sass = Sass::new(Duration::from_secs(30));
+        let fs = Snapshot::of(&t, 0);
+        let flight = Arc::new(Flight {
+            deadline: Instant::now() + Duration::from_secs(30),
+            done: Mutex::new(None),
+            ready: Condvar::new(),
+            runaway: AtomicBool::new(false),
+        });
+        sass.0.live.held().insert(1, flight.clone());
+        assert_eq!(sass.stats().running, 1);
+
+        sass.0.flight_body(1, &flight, &fs, || panic!("grass panicked"));
+
+        let settled = flight.done.held().clone().expect("a panicking compile still settles its flight");
+        let Err(message) = &*settled else { panic!("it must settle as a failure") };
+        assert_eq!(message.as_str(), "the Sass compiler panicked");
+        assert_eq!(sass.stats().running, 0, "and the flight leaves the live map, so the next request may try again");
     }
 
     #[test]

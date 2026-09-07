@@ -4,10 +4,13 @@ mod metrics;
 mod resolve;
 mod routes;
 mod store;
+mod sync;
 mod transform;
 
 #[cfg(test)]
 mod proptests;
+#[cfg(test)]
+mod ratchets;
 #[cfg(test)]
 mod shared_fixtures;
 #[cfg(test)]
