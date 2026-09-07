@@ -104,8 +104,9 @@ limit `docs/multi-node.md` sets out. It answers `NoTenant::Unknown` when
 neither the map nor the data directory holds the id and `NoTenant::Failed(why)`
 when `<data-dir>/<id>` is there and would not load — recording it the way
 `restore` does — so the HTTP layer can answer 404 for a tenant that never
-existed and 500 with the reason for one that could not be loaded. `Store::tenant`
-is `resolve(…).ok()`, for the callers that only need to know whether it is here.
+existed and 500 with the reason for one that could not be loaded. Every caller in
+the daemon reports that reason, so `resolve` is the whole of the read path;
+`Store::tenant`, `resolve(…).ok()`, is `#[cfg(test)]` and only tests ask it.
 `--no-persist` keeps everything in memory.
 
 Because that fallback makes the data directory as much a source of tenants as
@@ -116,6 +117,21 @@ refuses an id whose directory is already there even when it cannot build a
 tenant from it — its base may not be loaded on this node. `Store::tenants` is
 the exception, and stays a list of what this daemon has loaded: it answers
 `/api/tenants`, `/api/stats` and `/metrics`, none of which act on a tenant.
+
+Each of them decides and acts under one acquisition of the `tenants` write
+lock, held across the directory work: `create_tenant` refuses, writes
+`tenant.json` and inserts under it; `remove_tenant` drops the entry and removes
+`<data-dir>/<id>` before releasing it; and a `resolve` miss re-reads the
+directory under it too, re-checking the map first. Deciding under one
+acquisition and mutating under another was two races reachable over HTTP —
+eight creates of one id all answered 201, and a delete that raced a request put
+the tenant back in the map from a directory that was about to go (issue #92).
+`tenants` is the outermost of the store's locks: `bases`, `failed` and a
+tenant's own `overlay` are taken under it and never the other way about, and
+neither the transform cache nor the compile gate can be held while it is taken,
+since the engine is handed an `Arc<Tenant>` and never sees the `Store`. The
+cost is that a delete or a restore-from-disk holds off every other lookup for
+as long as its directory work takes.
 
 ### Reloading a base
 
