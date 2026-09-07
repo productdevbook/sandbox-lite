@@ -17,6 +17,20 @@
 //!
 //! `TOLERATED` may only shrink. Each entry carries the reason spelling the fields out is right
 //! there, and adding one is a decision to be argued for in review — not a way to get to green.
+//!
+//! What a green run does **not** prove:
+//!
+//! - That every fixture delegates. It proves that no line inside a test module opens an `AppState`
+//!   or a `Config` literal without a `..`, and that neither engine constructor is named there. A
+//!   fixture built by a helper that spells the fields out somewhere this scan does not read is not
+//!   caught, and neither is a shared type nobody added to `SHARED`.
+//! - That the `#[cfg(test)] impl` blocks are the only place the fields are spelled out. Those two
+//!   blocks are skipped because they sit *above* their file's test module and the scan starts at
+//!   it — position, not intent. One written below the module would be flagged like any fixture.
+//! - That a literal was read to its end. `literal` trusts rustfmt to close a multi-line literal at
+//!   the opening line's indentation; where that does not hold the literal is read short and its
+//!   `..` missed, which fails the run rather than passing it. That is the right direction for a
+//!   guess to fail in, and it is a guess.
 
 use std::path::Path;
 
@@ -33,6 +47,9 @@ const TOLERATED: [(&str, &str); 0] = [];
 
 /// The test code of one file as `(1-based line number, text)`: everything from the `#[cfg(test)]`
 /// that opens a test module, or every line when the file is a module compiled only under test.
+/// Everything above that module is out of scope — including the `#[cfg(test)] impl` blocks, which
+/// is why they may spell the fields out. `silent_failures.rs` skips those same blocks from the
+/// other side, so they are the one part of the crate neither check reads.
 fn test_lines(text: &str, whole_file: bool) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let opens_test_mod = |i: usize| {
