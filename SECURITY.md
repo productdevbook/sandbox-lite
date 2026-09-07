@@ -230,18 +230,25 @@ container, or a network namespace of its own.
   import may write them. What the preview refuses to serve is unchanged
   (`is_private_path`), and both routes are on the editor/API router, whose
   audience is already every file of every tenant.
-- **Per-tenant write volume** is capped by `--tenant-quota-mb` (default 64):
-  a write that would take the tenant's edited files past it is refused with
-  `413` before anything reaches disk or memory, and the chat `write_file` tool
-  gets the same error. Rewriting a file is charged only for the difference.
-- **Conversations** are outside that quota, so they have their own two limits:
-  `--chats-per-tenant` (default 50) drops a tenant's least recently updated
-  conversation when a save would take it past the cap, and `--chat-window`
-  (default 24) is how many turns of one conversation reach the model — older
+- **Per-tenant write volume** is capped by `--tenant-quota-mb` (default 64)
+  and by `--tenant-max-files` (default 10000): a write that would take the
+  tenant's edited files past either is refused with `413` before anything
+  reaches disk or memory, and the chat `write_file` tool and the import get the
+  same error. Rewriting a file is charged only for the difference. The count is
+  a separate limit because bytes do not bound it — an empty file weighs nothing
+  and still costs an inode and a directory entry.
+- **Conversations** are outside that quota, so they have their own limits:
+  `--chat-message-kb` (default 64) is the most one request's `messages` may
+  weigh and `--chat-quota-kb` (default 2048) the most one conversation may
+  hold, both refused with `413` before the model is called and before anything
+  is stored; `--chats-per-tenant` (default 50) drops a tenant's least recently
+  updated conversation when a save would take it past the cap or past
+  `--chats-per-tenant` × `--chat-quota-kb` of chats directory; and
+  `--chat-window` (default 24) is how many stored turns reach the model — older
   turns are folded into a stored summary, and are cut from the request even
   when that summary could not be written. `/api/stats` reports what the chats
-  directory holds across every tenant it has loaded (`Store::tenants` is this
-  daemon's memory, not a census of `--data-dir`).
+  directory holds across every tenant it has loaded, and the ceiling it is held
+  to (`Store::tenants` is this daemon's memory, not a census of `--data-dir`).
 - **The screenshot tool** runs `--chrome-jobs` browsers at once (default 1).
   A call that waits 10 s without a slot is answered "busy" rather than queued,
   and one whose browser overruns its 20 s deadline is killed and reaped before

@@ -122,8 +122,10 @@ cache that is not shared — it is keyed by tenant and version, because which
 files went into it is a question only the build can answer. The cache has a byte
 budget (`--cache-mb`, default 64), so its share of the daemon's memory is
 bounded regardless of tenant count; each overlay is capped by
-`--tenant-quota-mb` (default 64), and a write that would push a tenant past it
-is refused with `413`.
+`--tenant-quota-mb` (default 64) and by `--tenant-max-files` (default 10000),
+and a write past either is refused with `413`. The count is not the bytes: an
+empty file weighs nothing and still costs an inode, a directory entry and a line
+of tombstone bookkeeping.
 
 ## Install
 
@@ -188,9 +190,14 @@ A conversation does not grow without end. The last `--chat-window` turns
 everything older is folded into one summary — written once by the same API,
 stored with the conversation and sent as its opening turn from then on. Should
 that call fail, the turns stay stored and the window is applied to the request
-anyway. Conversations are outside the tenant quota, so `--chats-per-tenant`
-(default 50) is what bounds them: saving past it drops the tenant's least
-recently updated conversation.
+anyway. Conversations are outside the tenant quota, so their own limits are
+what bound them: `--chat-message-kb` (default 64) is the most one request's
+`messages` may weigh, `--chat-quota-kb` (default 2048) the most one conversation
+may hold — a request past either is refused with `413` naming the one it hit —
+and `--chats-per-tenant` (default 50) is how many a tenant keeps, saving past it
+dropping the least recently updated. The last two multiply out to the ceiling on
+`<data-dir>/<id>/chats/`, which is what `/api/stats` reports as
+`chats.max_bytes_per_tenant`.
 
 `--chrome PATH` adds a sixth tool, `screenshot`, which renders one page of the
 tenant's live preview in headless Chrome and hands the PNG back to the model,
@@ -225,7 +232,10 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 --chrome-jobs N      screenshots that may run at once (default 1)
 --chat-window N      turns of a conversation replayed to the model in full (default 24)
 --chats-per-tenant N conversations a tenant may keep (default 50)
+--chat-message-kb N  largest one chat request's messages may be, in KiB (default 64)
+--chat-quota-kb N    largest one conversation may hold, in KiB (default 2048)
 --tenant-quota-mb N  edited files a tenant may hold, in MiB (default 64)
+--tenant-max-files N edited files a tenant may hold, whatever they weigh (default 10000)
 --cookie-samesite lax|none
                      SameSite of the preview cookie; none also sets Secure
                      (default: none with --preview-secret, lax without)
@@ -234,8 +244,10 @@ its 20 s deadline is killed and reaped before its profile directory goes.
 `SANDBOX_LITE_API_TOKEN`, `SANDBOX_LITE_PREVIEW_SECRET`,
 `SANDBOX_LITE_TENANT_QUOTA_MB`, `SANDBOX_LITE_MAX_COMPILES`,
 `SANDBOX_LITE_COMPILE_TIMEOUT_MS`,
-`SANDBOX_LITE_CHROME`, `SANDBOX_LITE_CHROME_JOBS`, `SANDBOX_LITE_CHAT_WINDOW`
-and `SANDBOX_LITE_CHATS_PER_TENANT` are read as defaults for those flags, and
+`SANDBOX_LITE_CHROME`, `SANDBOX_LITE_CHROME_JOBS`, `SANDBOX_LITE_CHAT_WINDOW`,
+`SANDBOX_LITE_CHATS_PER_TENANT`, `SANDBOX_LITE_CHAT_MESSAGE_KB`,
+`SANDBOX_LITE_CHAT_QUOTA_KB` and `SANDBOX_LITE_TENANT_MAX_FILES` are read as
+defaults for those flags, and
 `SANDBOX_LITE_ANTHROPIC_BASE` points the chat at another Messages API
 endpoint (default `https://api.anthropic.com`). With a
 preview secret set, `/api/tenants` returns each tenant's `preview_token`;

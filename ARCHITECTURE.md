@@ -796,13 +796,20 @@ response.
 The request body is `{messages, chat?}`. `chat` names a stored conversation
 (`src/http/chats.rs`, one JSON file per chat under `<data-dir>/<id>/chats/`, or
 in memory with `--no-persist`), whose turns come before `messages`.
-`Conversation::for_model` replays the last `--chat-window` turns in full; when a
-conversation crosses that, `compact` folds everything older into one summary
-written by a second call to the same API and stored with the conversation, and
-sent as its opening turn from then on. A summary the API will not write is not
-fatal: the turns stay stored and are cut from the request anyway. A save past
-`--chats-per-tenant` drops the tenant's least recently updated conversation
-(`evictable`).
+`Conversation::for_model` replays the last `--chat-window` stored turns in
+full and puts the request's own `messages` through the same normalisation after
+them — empty turns dropped, same-role neighbours joined, a leading assistant
+turn refused, all three of which the Messages API requires; when a conversation
+crosses the window, `compact` folds everything older into one summary written by
+a second call to the same API and stored with the conversation, and sent as its
+opening turn from then on. A summary the API will not write is not fatal: the
+turns stay stored and are cut from the request anyway. What bounds the request's
+own messages instead of the window is `Chats::admits`, asked in `chat` before
+the model is called: `--chat-message-kb` for what one request may add and
+`--chat-quota-kb` for what the conversation may then hold, each refused with
+`413` naming the flag. A save past `--chats-per-tenant`, or past that many times
+`--chat-quota-kb` of bytes, drops the tenant's least recently updated
+conversation (`evictable`).
 
 `Chats::sizes` holds what each tenant's conversations weigh, `<tenant> → <chat
 id> → bytes`, seeded from the store the first time a tenant is touched and

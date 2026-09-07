@@ -155,7 +155,10 @@ impl<R: Read> Read for Capped<R> {
 /// is cut off at `stream_cap`, which also bounds what `tar` reads without ever showing it as an
 /// entry (a GNU long name, a pax payload, padding). So an archive that decompresses past the quota
 /// is refused without being decompressed.
-fn unpack(body: &[u8], quota: u64) -> Result<Unpacked, (StatusCode, String)> {
+///
+/// `max_files` is the other half of it, and the half `quota` cannot do: a zero-byte entry never
+/// moves `total`, so a 64 MiB quota admitted about 160,000 empty entries per request (issue #88).
+fn unpack(body: &[u8], quota: u64, max_files: usize) -> Result<Unpacked, (StatusCode, String)> {
     let cap = stream_cap(body.len() as u64, quota);
     let tripped = Arc::new(AtomicBool::new(false));
     let mut archive = Archive::new(Capped { inner: GzDecoder::new(body), read: 0, limit: cap, tripped: tripped.clone() });
@@ -202,6 +205,12 @@ fn unpack(body: &[u8], quota: u64) -> Result<Unpacked, (StatusCode, String)> {
         }
         let Some(path) = entry_path(&name) else { return Err(reject(&name, "path escapes the tenant tree")) };
         files.insert(path, bytes);
+        // counted where the file is kept rather than per entry, so the same path twice costs once,
+        // exactly as it will in the overlay `write_many` builds
+        if files.len() > max_files {
+            let over = format!("the archive holds more than {max_files} files, the most a tenant may hold (--tenant-max-files)");
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, over));
+        }
     }
     Ok(Unpacked { files: files.into_iter().collect(), deleted })
 }
@@ -218,8 +227,8 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
         Err(r) => return r,
     };
     let replace = flag(query.as_deref(), "replace");
-    let quota = t.quota();
-    let unpacked = match tokio::task::spawn_blocking(move || unpack(&body, quota)).await {
+    let (quota, max_files) = (t.quota(), t.max_files());
+    let unpacked = match tokio::task::spawn_blocking(move || unpack(&body, quota, max_files)).await {
         Ok(Ok(u)) => u,
         Ok(Err((status, message))) => return (status, refused(message)).into_response(),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -228,7 +237,9 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
         Ok(Applied { version, written, deleted }) => {
             Json(json!({ "files": written, "deleted": deleted, "version": version })).into_response()
         }
-        Err(e @ WriteError::Quota { .. }) => (StatusCode::PAYLOAD_TOO_LARGE, refused(e.to_string())).into_response(),
+        Err(e @ (WriteError::Quota { .. } | WriteError::Files { .. })) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, refused(e.to_string())).into_response()
+        }
         // the batch put itself back, so the tenant is what it was and the counts say it
         Err(e @ WriteError::Io(_)) => (StatusCode::INTERNAL_SERVER_ERROR, refused(e.to_string())).into_response(),
         // it could not, so there are no counts to give: the message names what is neither way
@@ -268,12 +279,16 @@ mod tests {
 
     /// A base of three files, a data dir, and two tenants on it.
     fn fixture(name: &str, quota: u64) -> Fixture {
+        fixture_holding(name, quota, crate::store::DEFAULT_MAX_FILES)
+    }
+
+    fn fixture_holding(name: &str, quota: u64, max_files: usize) -> Fixture {
         let root = std::env::temp_dir().join(format!("sandbox-lite-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         seed(root.join("base/src/pages/index.astro"), "<h1>base</h1>\n");
         seed(root.join("base/src/data.ts"), "export const n = 1;\n");
         seed(root.join("base/readme.md"), "base readme\n");
-        let store = Store::new(Some(root.join("data")), quota);
+        let store = Store::new(Some(root.join("data")), quota).with_max_files(max_files);
         store.add_base(Base::load("b", &root.join("base")).unwrap());
         store.create_tenant("a", "b").unwrap();
         store.create_tenant("bb", "b").unwrap();
@@ -427,6 +442,36 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (1, 40));
         assert!(!f.root.join("data/a/files/src/huge.ts").exists());
+    }
+
+    /// Issue #88: an entry of no bytes never moved the byte total, so `--tenant-quota-mb` let an
+    /// import carry as many empty files as `stream_cap` had room to read — about 160,000 per
+    /// request at the default quota, and another 160,000 on the next one.
+    #[tokio::test]
+    async fn an_import_of_empty_files_is_refused_at_the_file_limit() {
+        let f = fixture_holding("import-count", 1 << 20, 3);
+        let flood: Vec<(&str, EntryType, &[u8])> =
+            ["src/e0.ts", "src/e1.ts", "src/e2.ts", "src/e3.ts"].iter().map(|p| (*p, EntryType::Regular, &b""[..])).collect();
+        let (status, body) = call(&f, "POST", "/api/tenants/a/import", tar_gz(&flood)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((body["files"].as_u64(), body["deleted"].as_u64()), (Some(0), Some(0)));
+        assert!(body["error"].as_str().unwrap().contains("--tenant-max-files"), "{body}");
+        assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (0, 0));
+        assert!(!f.root.join("data/a/files/src/e0.ts").exists());
+
+        // three of them fit, and a second request of three does not double up on the first
+        let three = &flood[..3];
+        let (status, _) = call(&f, "POST", "/api/tenants/a/import", tar_gz(three)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (3, 0));
+        let more: Vec<(&str, EntryType, &[u8])> =
+            ["src/f0.ts", "src/f1.ts", "src/f2.ts"].iter().map(|p| (*p, EntryType::Regular, &b""[..])).collect();
+        let (status, body) = call(&f, "POST", "/api/tenants/a/import", tar_gz(&more)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "?replace=0 adds to what the tenant already holds");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("--tenant-max-files"), "{body}");
+        assert_eq!(f.state.store.tenant("a").unwrap().overlay_stats(), (3, 0));
     }
 
     #[tokio::test]

@@ -529,12 +529,13 @@ async fn summarize_conversation(st: &State, key: &str, prompt: String) -> Option
 /// Runs one request end to end and records it. The value is the `done` payload, which is also the
 /// JSON body of the non-streaming reply.
 async fn run(st: State, t: Arc<Tenant>, key: String, req: ChatReq, mut conv: Conversation, out: Emitter) -> Result<Value, Fail> {
+    let adding = turns_of(&req);
     compact(&st, &key, &mut conv).await;
-    let mut messages = conv.for_model(st.chats.window());
-    messages.extend(req.messages.iter().map(|m| json!({ "role": m.role, "content": m.content })));
+    // through the same normalisation as the stored turns, not appended to the windowed list raw
+    let messages = conv.for_model(st.chats.window(), &adding);
     let answer = converse(&st, &t, &key, messages, &out).await?;
-    for m in &req.messages {
-        conv.push(Turn { role: m.role.clone(), text: m.content.clone(), tools: Vec::new() });
+    for turn in adding {
+        conv.push(turn);
     }
     conv.push(Turn { role: "assistant".into(), text: answer.text.clone(), tools: answer.tools });
     if let Err(e) = st.chats.save(&t, &conv) {
@@ -547,6 +548,16 @@ async fn run(st: State, t: Arc<Tenant>, key: String, req: ChatReq, mut conv: Con
         "version": t.version(),
         "chat": conv.id,
     }))
+}
+
+/// The request's messages as turns, the shape both the model input and the store hold them in.
+fn turns_of(req: &ChatReq) -> Vec<Turn> {
+    req.messages.iter().map(|m| Turn { role: m.role.clone(), text: m.content.clone(), tools: Vec::new() }).collect()
+}
+
+/// What the request would add to the conversation, counted the way it is stored.
+fn adding_bytes(req: &ChatReq) -> u64 {
+    req.messages.iter().map(|m| (m.role.len() + m.content.len()) as u64).sum()
 }
 
 pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<ChatReq>) -> Response {
@@ -565,8 +576,14 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
         },
         None => Conversation::new(super::chats::new_id()),
     };
-    if conv.messages.is_empty() && req.messages.is_empty() {
+    // a message of no content is nothing to answer: the API refuses it, which reached the caller
+    // as a 502 from a request that was never worth making (issue #89)
+    if conv.messages.is_empty() && req.messages.iter().all(|m| m.content.trim().is_empty()) {
         return err(StatusCode::BAD_REQUEST, "no messages");
+    }
+    // before the model is called and before anything is stored, so a refusal writes nothing
+    if let Err(over) = st.chats.admits(&conv, adding_bytes(&req)) {
+        return err(StatusCode::PAYLOAD_TOO_LARGE, over.to_string());
     }
     let accept = headers.get(header::ACCEPT).and_then(|a| a.to_str().ok()).unwrap_or("");
     if !accept.contains("text/event-stream") {
@@ -837,6 +854,71 @@ mod tests {
         let t = f.st.store.tenant("acme").unwrap();
         assert_eq!(f.st.chats.load(&t, &chat_id).unwrap().unwrap().messages.len(), 4, "in memory, without a data dir");
         assert_eq!(f.st.chats.list(&t).unwrap().len(), 1);
+    }
+
+    /// Issue #89: the window was applied to the stored turns and the request's own appended after
+    /// it, so one POST could store 64 MB in `chats/` — outside the tenant quota, and reported as
+    /// zero by everything that reports a tenant's size.
+    #[tokio::test]
+    async fn a_chat_request_past_the_message_budget_is_refused_and_stores_nothing() {
+        let f = fixture(vec![turn_with_text("Never asked.")], false).await;
+        let st: State = Arc::new(AppState {
+            store: Store::new(Some(f.root.join("budgets")), TEST_QUOTA),
+            api_key: Some("test-key".into()),
+            api_base: f.st.api_base.clone(),
+            chats: crate::http::chats::Chats::new(50, 24).with_budgets(1, 8),
+            ..AppState::for_tests()
+        });
+        st.store.add_base(Base::load("test", &f.root.join("base")).unwrap());
+        let t = st.store.create_tenant("acme", "test").unwrap();
+
+        let (status, body) = post_chat(&st, None, ask(&"x".repeat(2000), None)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let error = serde_json::from_str::<Value>(&body).unwrap()["error"].as_str().unwrap().to_string();
+        assert!(error.contains("--chat-message-kb"), "{error}");
+        assert!(st.chats.list(&t).unwrap().is_empty(), "a refused request writes nothing");
+        assert_eq!(st.chats.usage(&t).unwrap(), (0, 0));
+        assert!(f.seen.lock().unwrap().is_empty(), "and never calls the model");
+
+        // and a conversation already at the budget is refused by the other limit, by name
+        let mut full = Conversation::new("full".into());
+        while full.bytes() + 900 <= 8 << 10 {
+            full.push(Turn { role: "user".into(), text: "y".repeat(500), tools: Vec::new() });
+        }
+        st.chats.save(&t, &full).unwrap();
+        let (status, body) = post_chat(&st, None, ask(&"z".repeat(900), Some("full"))).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let error = serde_json::from_str::<Value>(&body).unwrap()["error"].as_str().unwrap().to_string();
+        assert!(error.contains("--chat-quota-kb"), "{error}");
+        assert_eq!(st.chats.load(&t, "full").unwrap().unwrap().messages.len(), full.messages.len(), "unchanged");
+    }
+
+    /// The same normalisation as the stored turns, asserted on what went upstream rather than on
+    /// the reply: an empty `content` used to be forwarded verbatim and come back as a 502.
+    #[tokio::test]
+    async fn the_requests_own_messages_reach_the_api_normalised() {
+        let f = fixture(vec![turn_with_text("Fine.")], false).await;
+        let req = ChatReq {
+            messages: vec![
+                ChatMsg { role: "user".into(), content: "one".into() },
+                ChatMsg { role: "user".into(), content: "   ".into() },
+                ChatMsg { role: "user".into(), content: "two".into() },
+            ],
+            chat: None,
+        };
+        let (status, body) = post_chat(&f.st, None, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seen = f.seen.lock().unwrap();
+        assert_eq!(seen[0]["messages"], json!([{"role":"user","content":"one\n\ntwo"}]));
+    }
+
+    #[tokio::test]
+    async fn a_message_of_no_content_is_refused_rather_than_forwarded() {
+        let f = fixture(Vec::new(), false).await;
+        let req = ChatReq { messages: vec![ChatMsg { role: "user".into(), content: String::new() }], chat: None };
+        let (status, body) = post_chat(&f.st, None, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(f.seen.lock().unwrap().is_empty(), "the API is never asked to answer nothing");
     }
 
     #[tokio::test]

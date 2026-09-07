@@ -10,6 +10,9 @@ use tokio::sync::broadcast;
 use xxhash_rust::xxh3::xxh3_64;
 
 const INLINE_LIMIT: u64 = 256 * 1024;
+/// Edited files one tenant may hold, what `--tenant-max-files` sets. The byte quota bounds none of
+/// them: 32,001 empty files fit a 1 KiB quota, and each is an inode of its own (issue #88).
+pub const DEFAULT_MAX_FILES: usize = 10_000;
 const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", ".astro", ".vercel", ".netlify", ".output"];
 
 #[derive(Clone)]
@@ -191,6 +194,12 @@ pub enum WriteError {
         quota: u64,
         after: u64,
     },
+    /// The other half of the quota. An empty file weighs nothing and still costs an inode, a
+    /// directory entry and a line of tombstone bookkeeping, so bytes alone bound none of them.
+    Files {
+        limit: usize,
+        after: usize,
+    },
     Io(io::Error),
     /// A write that failed and could not be put back. The named paths are neither what they were nor
     /// what the write asked for, so the caller is told that rather than that nothing landed.
@@ -205,6 +214,12 @@ impl fmt::Display for WriteError {
         match self {
             WriteError::Quota { quota, after } => {
                 write!(f, "tenant quota exceeded: edited files would total {after} bytes, the quota is {quota} bytes (--tenant-quota-mb)")
+            }
+            WriteError::Files { limit, after } => {
+                write!(
+                    f,
+                    "tenant file limit exceeded: the tenant would hold {after} edited files, the limit is {limit} (--tenant-max-files)"
+                )
             }
             WriteError::Io(e) => fmt::Display::fmt(e, f),
             WriteError::Torn { cause, paths } => write!(
@@ -225,14 +240,70 @@ impl From<io::Error> for WriteError {
     }
 }
 
+/// A tenant's edits and what they weigh. Both totals move with every insert, replace and tombstone
+/// rather than being summed when asked: the quota is checked under the write lock, and a walk of the
+/// map there makes one write O(files) and blocks every read of the tenant while it runs (issue #88).
+#[derive(Default)]
+struct Overlay {
+    files: BTreeMap<String, Option<FileData>>,
+    /// What the written files hold. A tombstone is not a file and weighs nothing.
+    bytes: u64,
+    /// How many entries are written files rather than tombstones.
+    written: usize,
+}
+
+/// What one entry contributes to the two totals.
+fn weight(data: &Option<FileData>) -> (usize, u64) {
+    match data {
+        Some(d) => (1, d.size()),
+        None => (0, 0),
+    }
+}
+
+impl Overlay {
+    fn get(&self, path: &str) -> Option<&Option<FileData>> {
+        self.files.get(path)
+    }
+
+    /// What a write to `path` would replace, which the quota check gives back before charging it.
+    fn size_of(&self, path: &str) -> u64 {
+        self.files.get(path).and_then(|d| d.as_ref()).map_or(0, |d| d.size())
+    }
+
+    fn insert(&mut self, path: String, data: Option<FileData>) {
+        let (files, bytes) = weight(&data);
+        let (was_files, was_bytes) = self.files.insert(path, data).as_ref().map_or((0, 0), weight);
+        self.written = self.written - was_files + files;
+        self.bytes = self.bytes - was_bytes + bytes;
+    }
+
+    fn remove(&mut self, path: &str) {
+        if let Some(gone) = self.files.remove(path) {
+            let (files, bytes) = weight(&gone);
+            self.written -= files;
+            self.bytes -= bytes;
+        }
+    }
+
+    /// A whole new map, counted once. `write_many` builds one, so an import pays a single walk of
+    /// what it wrote rather than one per file.
+    fn replace(&mut self, files: BTreeMap<String, Option<FileData>>) {
+        let (written, bytes) = files.values().map(weight).fold((0, 0), |(n, b), (dn, db)| (n + dn, b + db));
+        self.files = files;
+        self.written = written;
+        self.bytes = bytes;
+    }
+}
+
 pub struct Tenant {
     pub id: String,
     base: RwLock<Arc<Base>>,
-    overlay: RwLock<BTreeMap<String, Option<FileData>>>,
+    overlay: RwLock<Overlay>,
     version: AtomicU64,
     pub events: broadcast::Sender<String>,
     dir: Option<PathBuf>,
     quota: u64,
+    max_files: usize,
 }
 
 pub struct Entry {
@@ -242,6 +313,7 @@ pub struct Entry {
 }
 
 /// What one `write_many` changed: files written, and overlay entries it dropped or hid.
+#[derive(Debug)]
 pub struct Applied {
     pub version: u64,
     pub written: usize,
@@ -249,16 +321,17 @@ pub struct Applied {
 }
 
 impl Tenant {
-    fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>, quota: u64) -> Tenant {
+    fn new(id: String, base: Arc<Base>, dir: Option<PathBuf>, quota: u64, max_files: usize) -> Tenant {
         let (events, _) = broadcast::channel(64);
         Tenant {
             id,
             base: RwLock::new(base),
-            overlay: RwLock::new(BTreeMap::new()),
+            overlay: RwLock::new(Overlay::default()),
             version: AtomicU64::new(now_millis()),
             events,
             dir,
             quota,
+            max_files,
         }
     }
 
@@ -311,7 +384,7 @@ impl Tenant {
         let overlay = self.overlay.read().unwrap();
         let base = self.base.read().unwrap();
         let mut out: BTreeMap<String, (u64, bool)> = base.files.iter().map(|(p, d)| (p.clone(), (d.size(), false))).collect();
-        for (p, d) in overlay.iter() {
+        for (p, d) in overlay.files.iter() {
             match d {
                 Some(d) => {
                     out.insert(p.clone(), (d.size(), true));
@@ -330,14 +403,17 @@ impl Tenant {
     pub fn write(&self, path: &str, bytes: Vec<u8>, kind: UpdateKind) -> Result<u64, WriteError> {
         // held across the disk write so a concurrent write cannot slip past the quota check
         let mut overlay = self.overlay.write().unwrap();
-        let replaced = overlay.get(path).and_then(|d| d.as_ref()).map_or(0, |d| d.size());
-        let after = overlay_bytes(&overlay) - replaced + bytes.len() as u64;
+        let after = overlay.bytes - overlay.size_of(path) + bytes.len() as u64;
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
         }
+        let files = overlay.written + usize::from(!matches!(overlay.get(path), Some(Some(_))));
+        if files > self.max_files {
+            return Err(WriteError::Files { limit: self.max_files, after: files });
+        }
         let was_tombstone = matches!(overlay.get(path), Some(None));
         let mut staged = Staged::new(self.dir.as_deref());
-        let data = match stage_write(&mut staged, &overlay, path, bytes, was_tombstone) {
+        let data = match stage_write(&mut staged, &overlay.files, path, bytes, was_tombstone) {
             Ok(data) => data,
             Err(cause) => return Err(staged.undo(cause)),
         };
@@ -362,7 +438,7 @@ impl Tenant {
         let incoming: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         let keep = |path: &str, data: &Option<FileData>| !replace || data.is_none() || incoming.contains(path);
         let mut next: BTreeMap<String, Option<FileData>> =
-            overlay.iter().filter(|(p, d)| keep(p, d)).map(|(p, d)| (p.clone(), d.clone())).collect();
+            overlay.files.iter().filter(|(p, d)| keep(p, d)).map(|(p, d)| (p.clone(), d.clone())).collect();
         for path in deleted.iter().filter(|p| !incoming.contains(p.as_str())) {
             match self.base.read().unwrap().get(path) {
                 Some(_) => next.insert(path.clone(), None),
@@ -374,18 +450,22 @@ impl Tenant {
         if after > self.quota {
             return Err(WriteError::Quota { quota: self.quota, after });
         }
+        let held = next.iter().filter(|(p, d)| !incoming.contains(p.as_str()) && d.is_some()).count() + files.len();
+        if held > self.max_files {
+            return Err(WriteError::Files { limit: self.max_files, after: held });
+        }
         // `None` is untouched, `Some(true)` an edit, `Some(false)` a tombstone: a dropped edit and
         // a new tombstone both read as a change, and only writes are left out
         let overlaid = |o: &BTreeMap<String, Option<FileData>>, p: &str| o.get(p).map(Option::is_some);
-        let touched: BTreeSet<&str> = overlay.keys().chain(deleted.iter()).map(String::as_str).collect();
+        let touched: BTreeSet<&str> = overlay.files.keys().chain(deleted.iter()).map(String::as_str).collect();
         let dropped: Vec<&str> =
-            touched.into_iter().filter(|p| !incoming.contains(p) && overlaid(&overlay, p) != overlaid(&next, p)).collect();
+            touched.into_iter().filter(|p| !incoming.contains(p) && overlaid(&overlay.files, p) != overlaid(&next, p)).collect();
         let (written, removed) = (files.len(), dropped.len());
         let mut staged = Staged::new(self.dir.as_deref());
         if let Err(cause) = stage_batch(&mut staged, &mut next, &dropped, files) {
             return Err(staged.undo(cause));
         }
-        *overlay = next;
+        overlay.replace(next);
         drop(overlay);
         staged.commit();
         Ok(Applied { version: self.bump("update", "", UpdateKind::Module), written, deleted: removed })
@@ -397,7 +477,7 @@ impl Tenant {
         let mut overlay = self.overlay.write().unwrap();
         let tombstone = self.base.read().unwrap().get(path).is_some();
         let mut staged = Staged::new(self.dir.as_deref());
-        if let Err(cause) = stage_delete(&mut staged, &overlay, path, tombstone) {
+        if let Err(cause) = stage_delete(&mut staged, &overlay.files, path, tombstone) {
             return Err(staged.undo(cause));
         }
         if tombstone {
@@ -432,16 +512,23 @@ impl Tenant {
 
     /// The tenant's own edits: `Some` is a written file, `None` a tombstone over a base file.
     pub fn overlay(&self) -> Vec<(String, Option<FileData>)> {
-        self.overlay.read().unwrap().iter().map(|(p, d)| (p.clone(), d.clone())).collect()
+        self.overlay.read().unwrap().files.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
     }
 
     pub fn quota(&self) -> u64 {
         self.quota
     }
 
+    /// Edited files the tenant may hold, the count the byte quota does not bound.
+    pub fn max_files(&self) -> usize {
+        self.max_files
+    }
+
+    /// Entries and bytes, read off the running totals rather than summed: `/api/stats` and
+    /// `/metrics` add this up over every loaded tenant, and the editor polls the first every 5 s.
     pub fn overlay_stats(&self) -> (usize, u64) {
         let overlay = self.overlay.read().unwrap();
-        (overlay.len(), overlay_bytes(&overlay))
+        (overlay.files.len(), overlay.bytes)
     }
 
     fn restore_overlay(&self, dir: &Path) -> io::Result<()> {
@@ -461,15 +548,13 @@ impl Tenant {
             // A tombstone list that is dropped brings deleted files back, which is not the tenant.
             let list: Vec<String> = serde_json::from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             for p in list {
-                overlay.entry(p).or_insert(None);
+                if !overlay.files.contains_key(&p) {
+                    overlay.insert(p, None);
+                }
             }
         }
         Ok(())
     }
-}
-
-fn overlay_bytes(overlay: &BTreeMap<String, Option<FileData>>) -> u64 {
-    overlay.values().flatten().map(|d| d.size()).sum()
 }
 
 /// The disk half of one write, and what it takes to put `<data-dir>/<id>` back. Nothing there is
@@ -700,6 +785,7 @@ pub struct Store {
     data_dir: Option<PathBuf>,
     bases_dir: Option<PathBuf>,
     tenant_quota: u64,
+    tenant_max_files: usize,
 }
 
 impl Store {
@@ -711,7 +797,14 @@ impl Store {
             data_dir,
             bases_dir: None,
             tenant_quota,
+            tenant_max_files: DEFAULT_MAX_FILES,
         }
+    }
+
+    /// `--tenant-max-files`: edited files one tenant may hold, whatever they weigh.
+    pub fn with_max_files(mut self, max_files: usize) -> Store {
+        self.tenant_max_files = max_files.max(1);
+        self
     }
 
     /// `--bases`: the directory a base added through the API must live under.
@@ -838,7 +931,7 @@ impl Store {
             std::fs::write(dir.join("tenant.json"), format!(r#"{{"base":{}}}"#, serde_json::to_string(base_name).unwrap()))
                 .map_err(|e| e.to_string())?;
         }
-        let tenant = Arc::new(Tenant::new(id.to_string(), base, dir, self.tenant_quota));
+        let tenant = Arc::new(Tenant::new(id.to_string(), base, dir, self.tenant_quota, self.tenant_max_files));
         tenants.insert(id.to_string(), tenant.clone());
         Ok(tenant)
     }
@@ -918,7 +1011,7 @@ impl Store {
         let meta: serde_json::Value = serde_json::from_slice(&meta).map_err(|e| format!("tenant.json does not parse: {e}"))?;
         let base_name = meta.get("base").and_then(|b| b.as_str()).unwrap_or("");
         let base = self.base(base_name).ok_or_else(|| format!("base '{base_name}' is not loaded"))?;
-        let tenant = Tenant::new(id.to_string(), base, Some(dir.clone()), self.tenant_quota);
+        let tenant = Tenant::new(id.to_string(), base, Some(dir.clone()), self.tenant_quota, self.tenant_max_files);
         tenant.restore_overlay(&dir).map_err(|e| e.to_string())?;
         Ok(tenant)
     }
@@ -992,8 +1085,12 @@ mod tests {
     use super::*;
 
     fn tenant(quota: u64, dir: Option<PathBuf>) -> Tenant {
+        tenant_holding(quota, DEFAULT_MAX_FILES, dir)
+    }
+
+    fn tenant_holding(quota: u64, max_files: usize, dir: Option<PathBuf>) -> Tenant {
         let base = Base { name: "b".into(), root: PathBuf::from("."), stamp: 0, files: BTreeMap::new() };
-        Tenant::new("t".into(), Arc::new(base), dir, quota)
+        Tenant::new("t".into(), Arc::new(base), dir, quota, max_files)
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -1217,6 +1314,61 @@ mod tests {
         assert!(!dir.join("files").join("big2").exists());
         assert_eq!(t.overlay_stats(), (1, big as u64));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Issue #88: `--tenant-quota-mb` counts bytes, and an empty file has none. A 1 KiB tenant took
+    /// 32,001 of them without one write being refused, each a real inode and a real directory entry.
+    #[test]
+    fn a_flood_of_empty_files_is_refused_at_the_file_limit() {
+        let t = tenant_holding(1024, 4, None);
+        for n in 0..4 {
+            t.write(&format!("src/e{n}.ts"), Vec::new(), UpdateKind::Module).unwrap();
+        }
+        let err = t.write("src/e4.ts", Vec::new(), UpdateKind::Module).unwrap_err();
+        assert!(matches!(err, WriteError::Files { limit: 4, after: 5 }), "{err}");
+        assert!(err.to_string().contains("--tenant-max-files"), "{err}");
+        assert_eq!(t.overlay_stats(), (4, 0), "the tenant is what it was: nothing weighed anything");
+        // the byte quota is untouched by any of it, which is the hole
+        assert!(t.write("src/e0.ts", vec![b'x'; 8], UpdateKind::Module).is_ok(), "replacing a file it already holds still fits");
+
+        // and the import cannot get round it either
+        let flood: Vec<(String, Vec<u8>)> = (0..5).map(|n| (format!("src/i{n}.ts"), Vec::new())).collect();
+        let err = tenant_holding(1024, 4, None).write_many(flood, &[], true).unwrap_err();
+        assert!(matches!(err, WriteError::Files { limit: 4, after: 5 }), "{err}");
+    }
+
+    /// Issue #88: `Tenant::write` re-summed the whole overlay under the write lock, so one write
+    /// cost O(files) — 23 s to reach 32k, with every read of that tenant blocked behind it. A
+    /// timing assertion would be flaky, so what is asserted is the property that lets the check be
+    /// O(1): the totals the overlay keeps equal a fresh sum after every kind of change, at the size
+    /// where re-summing was the cost.
+    #[test]
+    fn the_overlay_keeps_its_own_totals_at_thirty_two_thousand_files() {
+        let summed = |t: &Tenant| {
+            let held = t.overlay();
+            (held.len(), held.iter().filter_map(|(_, d)| d.as_ref()).map(|d| d.size()).sum::<u64>())
+        };
+        let t = tenant_holding(1 << 30, 40_000, None);
+        for n in 0..32_000 {
+            t.write(&format!("src/e{n}.ts"), Vec::new(), UpdateKind::Module).unwrap();
+        }
+        assert_eq!(t.overlay_stats(), (32_000, 0));
+        assert_eq!(t.overlay_stats(), summed(&t));
+
+        t.write("src/e0.ts", vec![b'x'; 100], UpdateKind::Module).unwrap();
+        assert_eq!(t.overlay_stats(), (32_000, 100), "a replacement charges the difference, not the file");
+        assert_eq!(t.overlay_stats(), summed(&t));
+
+        t.write("src/e0.ts", vec![b'x'; 10], UpdateKind::Module).unwrap();
+        assert_eq!(t.overlay_stats(), (32_000, 10));
+
+        t.delete("src/e0.ts").unwrap();
+        assert_eq!(t.overlay_stats(), (31_999, 0), "no base copy, so the entry goes rather than turning into a tombstone");
+        assert_eq!(t.overlay_stats(), summed(&t));
+
+        t.write_many(vec![("a.ts".into(), vec![b'x'; 7]), ("b.ts".into(), vec![b'y'; 3])], &[], true).unwrap();
+        assert_eq!(t.overlay_stats(), (2, 10), "`replace` dropped every edit the import did not carry");
+        assert_eq!(t.overlay_stats(), summed(&t));
     }
 
     #[test]
