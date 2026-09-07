@@ -18,6 +18,7 @@ pub struct Report {
     pub sass: usize,
     pub mdx: usize,
     pub endpoints: usize,
+    pub middleware: Option<String>,
     pub integrations: Vec<String>,
     pub bare_imports: BTreeSet<String>,
 }
@@ -38,6 +39,7 @@ impl Report {
             "sass": self.sass,
             "mdx": self.mdx,
             "endpoints": self.endpoints,
+            "middleware": self.middleware,
             "integrations": self.integrations,
             "bare_imports": self.bare_imports,
         })
@@ -75,6 +77,7 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
         sass: 0,
         mdx: 0,
         endpoints: 0,
+        middleware: None,
         integrations: package_deps(&tenant)?.into_iter().map(|(n, _)| n).filter(|n| n.starts_with("@astrojs/")).collect(),
         bare_imports: BTreeSet::new(),
     };
@@ -82,6 +85,24 @@ pub fn inspect(dir: &Path) -> Result<Report, String> {
     // preview cannot disagree about what an endpoint is: `routes::route` also takes `.mjs`/`.mts`
     // and skips any `_`-prefixed segment (issue #76).
     report.endpoints = crate::routes::build(&tenant).iter().filter(|r| r.kind == "endpoint").count();
+    // Issue #87: the preview loads the middleware and runs its `onRequest`, but the container is
+    // given the one route the URL matched, so a rewrite resolves against that route alone and
+    // reaches no other page. A project that depends on one is told here rather than at render time.
+    // The file is compiled with every other source below, which is where a read failure is reported.
+    report.middleware = crate::routes::middleware(&tenant).map(str::to_string);
+    if let Some(path) = &report.middleware
+        && let Ok(Some(text)) = tenant.read_text(path)
+        && text.contains("rewrite")
+    {
+        report.diagnostics.push(Diag {
+            severity: "warning".into(),
+            text: "names `rewrite`, which the preview cannot do: it renders one route at a time".into(),
+            hint: "a rewrite in middleware renders as a failure, not as the other page".into(),
+            file: path.clone(),
+            line: 0,
+            column: 0,
+        });
+    }
     for entry in tenant.list() {
         let path = entry.path;
         // Every `.mdx` file, not only the routed ones: a collection entry is MDX the preview has to
@@ -157,12 +178,13 @@ pub fn run(dirs: &[std::path::PathBuf], json: bool) -> i32 {
             println!("  {:<7} {loc} — {}{}", d.severity, d.text, if d.hint.is_empty() { String::new() } else { format!(" ({})", d.hint) });
         }
         println!(
-            "  islands {}  import.meta.glob {}  sass {}  mdx {}  endpoints {}  integrations [{}]  npm imports [{}]",
+            "  islands {}  import.meta.glob {}  sass {}  mdx {}  endpoints {}  middleware {}  integrations [{}]  npm imports [{}]",
             r.islands,
             r.globs,
             r.sass,
             r.mdx,
             r.endpoints,
+            r.middleware.as_deref().unwrap_or("none"),
             r.integrations.join(", "),
             r.bare_imports.iter().cloned().collect::<Vec<_>>().join(", ")
         );
