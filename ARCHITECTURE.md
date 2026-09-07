@@ -124,7 +124,8 @@ the exception, and stays a list of what this daemon has loaded: it answers
 (`Tenant::set_base`, a `RwLock<Arc<Base>>`). Each of those tenants is bumped and
 gets one `update` event, so open previews reload; overlays are untouched, so an
 edited file still wins over the new base copy. The transform cache needs no
-invalidation, being content-addressed: a changed file hashes to a new key.
+invalidation: a module entry is content-addressed, so a changed file hashes to a
+new key, and a collection entry carries the version the bump just changed.
 
 `POST /api/bases/{name}/reload` calls it on the blocking pool.
 `--watch-bases N` runs `Store::reload_changed_bases` every N seconds, also on

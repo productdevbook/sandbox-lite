@@ -57,23 +57,25 @@ and all, `defineProps<Props>()` included);
 project, edits one file in each, loads the preview module graph of each, and
 reads the daemon's RSS from `/proc`. CI runs it on every push, so the figures
 below are a CI run's and not a laptop's — `bench/mem.sh 100 4398` on
-`ubuntu-latest`, at commit `49be004`, in
-[run 34060501537](https://github.com/productdevbook/sandbox-lite/actions/runs/34060501537).
+`ubuntu-latest`, in
+[run 34085002823](https://github.com/productdevbook/sandbox-lite/actions/runs/34085002823),
+which names the commit it ran on.
 Every tenant there has one edited page and a loaded preview, with all five
 `examples/` projects loaded as bases:
 
 | | daemon RSS |
 |---|---|
 | idle | 7.4 MB |
-| after 100 tenants (edit + preview each) | 14.6 MB — 72 kB per tenant |
+| after 100 tenants (edit + preview each) | 14.6 MB — 74 kB per tenant |
 
 Creating a tenant, writing its edit and fetching its whole module graph took
-~90 ms per tenant through the HTTP API. The transform cache then held 108
-entries in 66 kB — 100 unique edited pages plus the 8 shared modules every
-tenant reuses — at 793 hits to 108 misses. 100 is the count CI runs, so 100 is
-the count this table reports; `bench/mem.sh N` takes any other, and the
-per-tenant figure is the marginal cost at the count it was measured at rather
-than a constant to multiply.
+~80 ms per tenant through the HTTP API. The transform cache then held 208
+entries in 440 kB — 100 unique edited pages, the 8 shared modules every tenant
+reuses, and each tenant's `posts` collection, which is cached per tenant
+because its key carries the tenant's version — at 793 hits to 208 misses. 100
+is the count CI runs, so 100 is the count this table reports; `bench/mem.sh N`
+takes any other, and the per-tenant figure is the marginal cost at the count it
+was measured at rather than a constant to multiply.
 
 ### The same project, the other way
 
@@ -115,10 +117,13 @@ daemon's own host; `SECURITY.md` says what that means.)
 
 Per-tenant state is the overlay (only edited files) plus a content-addressed
 transform cache shared by every tenant: two tenants with the same `Header.astro`
-share one compiled output. The cache has a byte budget (`--cache-mb`, default
-64), so its share of the daemon's memory is bounded regardless of tenant count;
-each overlay is capped by `--tenant-quota-mb` (default 64), and a write that
-would push a tenant past it is refused with `413`.
+share one compiled output. A built content collection is the one entry in that
+cache that is not shared — it is keyed by tenant and version, because which
+files went into it is a question only the build can answer. The cache has a byte
+budget (`--cache-mb`, default 64), so its share of the daemon's memory is
+bounded regardless of tenant count; each overlay is capped by
+`--tenant-quota-mb` (default 64), and a write that would push a tenant past it
+is refused with `413`.
 
 ## Install
 
