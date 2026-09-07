@@ -108,6 +108,9 @@ pub async fn stats(AxState(st): AxState<State>) -> Response {
         "conversations": conversations,
         "bytes": chat_bytes,
         "max_per_tenant": st.chats.cap(),
+        // what the count was always taken to mean: conversations are outside the tenant quota, so
+        // a number of files of no particular size said nothing about what the tenant holds (#89)
+        "max_bytes_per_tenant": st.chats.tenant_quota(),
         "window_turns": st.chats.window(),
     });
     let failed = st.store.failed_tenants();
@@ -247,6 +250,8 @@ fn tenant_json(st: &AppState, t: &Tenant) -> Value {
         "version": t.version(),
         "overlay_files": files,
         "overlay_bytes": bytes,
+        "max_files": t.max_files(),
+        "quota_bytes": t.quota(),
         "preview": preview_url(st, &t.id),
         "preview_token": st.preview_secret.as_ref().map(|s| super::preview_token(s, &t.id)),
     })
@@ -315,7 +320,7 @@ pub async fn write_file(AxState(st): AxState<State>, Path((id, path)): Path<(Str
     .await;
     match written {
         Ok(Ok(version)) => Json(json!({ "path": path, "version": version })).into_response(),
-        Ok(Err(e @ WriteError::Quota { .. })) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+        Ok(Err(e @ (WriteError::Quota { .. } | WriteError::Files { .. }))) => err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

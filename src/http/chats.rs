@@ -2,9 +2,13 @@
 //! `--no-persist`. They are not site files: they never go through the tenant overlay, so they are
 //! invisible to the preview, to `/api/t/{id}/files` and to the tenant quota. What bounds them
 //! instead is here: a window of turns per conversation, with everything older folded into a
-//! stored summary, and a cap on how many conversations one tenant keeps.
+//! stored summary, a byte budget for what one request may add and what one conversation may hold,
+//! and a cap on how many conversations one tenant keeps. The cap and the budget together are the
+//! ceiling on `<data-dir>/<tenant>/chats/`, which `evict` holds the tenant to — the count alone
+//! bounded nothing, because nothing bounded a conversation (issue #89).
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -27,9 +31,16 @@ const TITLE_CHARS: usize = 80;
 /// Turns of a conversation replayed to the model in full. Everything older is folded into
 /// `Conversation::summary`, so the request stops growing with the conversation.
 pub const DEFAULT_WINDOW_TURNS: usize = 24;
-/// Conversations one tenant may keep. They do not count against the tenant quota, so this is the
-/// only thing bounding what the chats directory holds.
+/// Conversations one tenant may keep. Together with `DEFAULT_CHAT_KB` this is what bounds the
+/// chats directory; on its own it bounded a count of files of no particular size.
 pub const DEFAULT_MAX_CHATS: usize = 50;
+/// The largest one request's `messages` may weigh, in KiB. The window is applied to the stored
+/// turns, so it never bounded these: one POST could store 64 MB (issue #89).
+pub const DEFAULT_MESSAGE_KB: usize = 64;
+/// The largest one conversation may hold, in KiB. Comfortably above `DEFAULT_WINDOW_TURNS` turns of
+/// `DEFAULT_MESSAGE_KB`, so it is the backstop for a conversation compaction could not shrink —
+/// a summary the API would not write — rather than a limit an ordinary chat runs into.
+pub const DEFAULT_CHAT_KB: usize = 2048;
 /// The summary is prompt text on every later turn, so it is capped like one.
 const MAX_SUMMARY_CHARS: usize = 2000;
 /// How the summary reaches the model: as the opening user turn, which is also the shape
@@ -79,14 +90,18 @@ impl Conversation {
     }
 
     /// The stored turns as Messages API input: the summary of what came before, then the last
-    /// `keep` turns and no more. Tool calls stay behind as a record for the editor; what they did
-    /// is already in the tenant's files. Empty turns are dropped and same-role neighbours joined,
-    /// because the API refuses empty content and two messages in a row from the same role.
+    /// `keep` turns and no more, and then `adding` — the turns this request carries. Tool calls
+    /// stay behind as a record for the editor; what they did is already in the tenant's files.
     ///
     /// `compact` normally keeps the conversation inside the window, so nothing is cut here. The
     /// cut is what bounds the request when it could not: a summary the API refused to write, or a
     /// conversation stored before the window existed.
-    pub fn for_model(&self, keep: usize) -> Vec<Value> {
+    ///
+    /// `adding` goes through the same normalisation as the stored turns rather than being appended
+    /// raw: appending it raw is how an empty `content` reached the API — a 502 to the caller — and
+    /// how two `user` messages in a row could, which the API refuses too (issue #89). The window is
+    /// not applied to it; what bounds it is `Chats::admits`, before either is sent or stored.
+    pub fn for_model(&self, keep: usize, adding: &[Turn]) -> Vec<Value> {
         let start = self.messages.len().saturating_sub(keep.max(1));
         let head = (!self.summary.is_empty()).then(|| Turn {
             role: "user".into(),
@@ -94,16 +109,8 @@ impl Conversation {
             tools: Vec::new(),
         });
         let mut out: Vec<(String, String)> = Vec::new();
-        for turn in head.iter().chain(&self.messages[start..]).filter(|t| !t.text.trim().is_empty()) {
-            if out.last().is_some_and(|(role, _)| *role == turn.role) {
-                if let Some((_, text)) = out.last_mut() {
-                    text.push_str("\n\n");
-                    text.push_str(&turn.text);
-                }
-            } else if !out.is_empty() || turn.role == "user" {
-                out.push((turn.role.clone(), turn.text.clone()));
-            }
-        }
+        normalise(&mut out, head.iter().chain(&self.messages[start..]));
+        normalise(&mut out, adding.iter());
         out.into_iter().map(|(role, content)| json!({ "role": role, "content": content })).collect()
     }
 
@@ -126,6 +133,11 @@ impl Conversation {
         self.summary = summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>().trim().to_string();
     }
 
+    /// What the conversation weighs where it is stored, which is what the budget is spent in.
+    pub fn bytes(&self) -> u64 {
+        serialized_bytes(self)
+    }
+
     fn brief(&self) -> Value {
         json!({
             "id": self.id,
@@ -138,12 +150,68 @@ impl Conversation {
     }
 }
 
-/// The ids to remove so that at most `cap` conversations remain, least recently updated first.
-/// `keep` is the conversation the save was for and is never evicted, however old it looks.
-pub fn evictable(newest_first: &[Conversation], cap: usize, keep: &str) -> Vec<String> {
-    let over = newest_first.len().saturating_sub(cap.max(1));
-    newest_first.iter().rev().filter(|c| c.id != keep).take(over).map(|c| c.id.clone()).collect()
+/// Empty turns dropped, same-role neighbours joined and a leading assistant turn refused, appended
+/// to whatever `out` already holds — the API takes none of those three.
+fn normalise<'a>(out: &mut Vec<(String, String)>, turns: impl Iterator<Item = &'a Turn>) {
+    for turn in turns.filter(|t| !t.text.trim().is_empty()) {
+        if out.last().is_some_and(|(role, _)| *role == turn.role) {
+            if let Some((_, text)) = out.last_mut() {
+                text.push_str("\n\n");
+                text.push_str(&turn.text);
+            }
+        } else if !out.is_empty() || turn.role == "user" {
+            out.push((turn.role.clone(), turn.text.clone()));
+        }
+    }
 }
+
+/// The ids to remove so that at most `cap` conversations remain and together they weigh at most
+/// `budget`, least recently updated first. `keep` is the conversation the save was for and is never
+/// evicted, however old it looks — so a tenant holding one conversation over the budget keeps it,
+/// and the next save of it is what is refused.
+pub fn evictable(newest_first: &[Conversation], cap: usize, budget: u64, keep: &str) -> Vec<String> {
+    let mut over = newest_first.len().saturating_sub(cap.max(1));
+    let mut held: u64 = newest_first.iter().map(Conversation::bytes).sum();
+    let mut out = Vec::new();
+    for c in newest_first.iter().rev().filter(|c| c.id != keep) {
+        if over == 0 && held <= budget {
+            break;
+        }
+        over = over.saturating_sub(1);
+        held -= c.bytes();
+        out.push(c.id.clone());
+    }
+    out
+}
+
+/// Why a chat request was refused, and by which of the two limits — the caller cannot tell what to
+/// send next from a bare 413.
+#[derive(Debug, PartialEq)]
+pub enum TooBig {
+    /// What this one request carries.
+    Request { bytes: u64, limit: u64 },
+    /// What the conversation it is added to would then hold.
+    Conversation { held: u64, adding: u64, limit: u64 },
+}
+
+impl fmt::Display for TooBig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TooBig::Request { bytes, limit } => {
+                write!(
+                    f,
+                    "chat request too large: its messages are {bytes} bytes, the most one request may add is {limit} (--chat-message-kb)"
+                )
+            }
+            TooBig::Conversation { held, adding, limit } => write!(
+                f,
+                "chat too large: this conversation holds {held} bytes and the request would add {adding}, past the {limit} bytes one conversation may hold (--chat-quota-kb); start a new conversation"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TooBig {}
 
 /// Disk is the store when the tenant has a data directory; the map holds everything otherwise.
 pub struct Chats {
@@ -156,6 +224,8 @@ pub struct Chats {
     sizes: RwLock<HashMap<String, BTreeMap<String, u64>>>,
     cap: usize,
     window: usize,
+    message_bytes: u64,
+    chat_bytes: u64,
 }
 
 impl Default for Chats {
@@ -166,7 +236,40 @@ impl Default for Chats {
 
 impl Chats {
     pub fn new(cap: usize, window: usize) -> Chats {
-        Chats { mem: RwLock::new(HashMap::new()), sizes: RwLock::new(HashMap::new()), cap: cap.max(1), window: window.max(2) }
+        Chats {
+            mem: RwLock::new(HashMap::new()),
+            sizes: RwLock::new(HashMap::new()),
+            cap: cap.max(1),
+            window: window.max(2),
+            message_bytes: (DEFAULT_MESSAGE_KB as u64) << 10,
+            chat_bytes: (DEFAULT_CHAT_KB as u64) << 10,
+        }
+    }
+
+    /// `--chat-message-kb` and `--chat-quota-kb`, in KiB.
+    pub fn with_budgets(mut self, message_kb: usize, chat_kb: usize) -> Chats {
+        self.message_bytes = (message_kb.max(1) as u64) << 10;
+        self.chat_bytes = (chat_kb.max(1) as u64) << 10;
+        self
+    }
+
+    /// What one request may add, and what the conversation it is added to may then hold. Asked
+    /// before the model is called, so a refusal writes nothing to `chats/`.
+    pub fn admits(&self, conv: &Conversation, adding: u64) -> Result<(), TooBig> {
+        if adding > self.message_bytes {
+            return Err(TooBig::Request { bytes: adding, limit: self.message_bytes });
+        }
+        let held = conv.bytes();
+        if held + adding > self.chat_bytes {
+            return Err(TooBig::Conversation { held, adding, limit: self.chat_bytes });
+        }
+        Ok(())
+    }
+
+    /// The ceiling on `<data-dir>/<tenant>/chats/`: `--chats-per-tenant` conversations of
+    /// `--chat-quota-kb` each. `evict` holds the tenant to it after every save.
+    pub fn tenant_quota(&self) -> u64 {
+        self.chat_bytes.saturating_mul(self.cap as u64)
     }
 
     /// Turns `for_model` replays in full; see `DEFAULT_WINDOW_TURNS`.
@@ -232,23 +335,18 @@ impl Chats {
         Ok(())
     }
 
-    /// Brings the tenant back under the cap after a save. The count is taken first because it
-    /// costs one `read_dir`, where choosing what to drop costs a parse of every conversation.
+    /// Brings the tenant back under both caps after a save — the count, and the bytes the count was
+    /// meant to stand for. Both come off the maintained counters, so the ordinary save costs two
+    /// comparisons; choosing what to drop is what costs a parse of every conversation.
     fn evict(&self, t: &Tenant, saved: &str) -> io::Result<()> {
-        if self.count(t)? <= self.cap {
+        let (count, bytes) = self.usage(t)?;
+        if count <= self.cap && bytes <= self.tenant_quota() {
             return Ok(());
         }
-        for id in evictable(&self.list(t)?, self.cap, saved) {
+        for id in evictable(&self.list(t)?, self.cap, self.tenant_quota(), saved) {
             self.delete(t, &id)?;
         }
         Ok(())
-    }
-
-    fn count(&self, t: &Tenant) -> io::Result<usize> {
-        match dir(t) {
-            Some(dir) => Ok(chat_files(&dir)?.len()),
-            None => Ok(self.mem.read().unwrap().get(&t.id).map_or(0, BTreeMap::len)),
-        }
     }
 
     /// What the tenant's conversations hold, from the counters rather than the disk: the tenant is
@@ -397,7 +495,7 @@ pub async fn remove(AxState(st): AxState<State>, AxPath((id, chat)): AxPath<(Str
 
 #[cfg(test)]
 mod tests {
-    use super::{Chats, Conversation, DEFAULT_WINDOW_TURNS, SUMMARY_PREFIX, Turn, evictable, new_id};
+    use super::{Chats, Conversation, DEFAULT_WINDOW_TURNS, SUMMARY_PREFIX, TooBig, Turn, evictable, new_id};
     use crate::store::{Base, Store, Tenant};
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -425,7 +523,7 @@ mod tests {
             c.push(t);
         }
         assert_eq!(
-            c.for_model(DEFAULT_WINDOW_TURNS),
+            c.for_model(DEFAULT_WINDOW_TURNS, &[]),
             vec![
                 json!({"role":"user","content":"one"}),
                 json!({"role":"assistant","content":"two"}),
@@ -477,7 +575,7 @@ mod tests {
         assert_eq!(c.messages.iter().map(|t| t.text.clone()).collect::<Vec<_>>(), ["turn 4", "turn 5"]);
         assert_eq!(c.title, "turn 0", "the title survives the turn it was taken from");
         assert_eq!(
-            c.for_model(4),
+            c.for_model(4, &[]),
             vec![
                 json!({"role":"user","content":format!("{SUMMARY_PREFIX}they asked for a green headline\n\nturn 4")}),
                 json!({"role":"assistant","content":"turn 5"}),
@@ -491,12 +589,12 @@ mod tests {
     #[test]
     fn for_model_never_sends_more_than_the_window() {
         let mut c = conversation("c", 100);
-        let sent = c.for_model(6);
+        let sent = c.for_model(6, &[]);
         assert_eq!(sent.len(), 6);
         assert_eq!(sent[0], json!({"role":"user","content":"turn 94"}));
         assert_eq!(sent[5], json!({"role":"assistant","content":"turn 99"}));
         c.summary = "earlier".into();
-        assert_eq!(c.for_model(0).len(), 2, "a window of zero is the summary and one turn, not a slice out of bounds");
+        assert_eq!(c.for_model(0, &[]).len(), 2, "a window of zero is the summary and one turn, not a slice out of bounds");
     }
 
     #[test]
@@ -520,11 +618,54 @@ mod tests {
             c.updated = 100 - i as u64;
         }
         // `list` is newest first, the order `Chats::list` returns
-        assert_eq!(evictable(&list, 3, "c0"), vec!["c4".to_string(), "c3".to_string()]);
-        assert_eq!(evictable(&list, 5, "c0"), Vec::<String>::new());
-        assert_eq!(evictable(&list, 9, "c0"), Vec::<String>::new());
-        assert_eq!(evictable(&list, 3, "c4"), vec!["c3".to_string(), "c2".to_string()], "the saved one is skipped, two others go");
-        assert_eq!(evictable(&list, 0, "c0"), vec!["c4".to_string(), "c3".to_string(), "c2".to_string(), "c1".to_string()]);
+        let room = u64::MAX;
+        assert_eq!(evictable(&list, 3, room, "c0"), vec!["c4".to_string(), "c3".to_string()]);
+        assert_eq!(evictable(&list, 5, room, "c0"), Vec::<String>::new());
+        assert_eq!(evictable(&list, 9, room, "c0"), Vec::<String>::new());
+        assert_eq!(evictable(&list, 3, room, "c4"), vec!["c3".to_string(), "c2".to_string()], "the saved one is skipped, two others go");
+        assert_eq!(evictable(&list, 0, room, "c0"), vec!["c4".to_string(), "c3".to_string(), "c2".to_string(), "c1".to_string()]);
+    }
+
+    /// Issue #89: `--chats-per-tenant` bounded a count of files of no particular size, so the real
+    /// per-tenant ceiling was the disk. The budget is what the count is spent in.
+    #[test]
+    fn eviction_takes_the_bytes_as_well_as_the_count() {
+        let mut list: Vec<Conversation> = (0..5).map(|i| conversation(&format!("c{i}"), 1)).collect();
+        for (i, c) in list.iter_mut().enumerate() {
+            c.updated = 100 - i as u64;
+        }
+        // taken from the conversations rather than assumed: `updated` is serialized, so two of
+        // them weigh the same only while they have the same number of digits
+        let weighing = |ids: &[&str]| list.iter().filter(|c| ids.contains(&c.id.as_str())).map(Conversation::bytes).sum::<u64>();
+        let all = weighing(&["c0", "c1", "c2", "c3", "c4"]);
+        assert_eq!(evictable(&list, 9, all, "c0"), Vec::<String>::new(), "inside the budget nothing goes");
+        assert_eq!(
+            evictable(&list, 9, weighing(&["c0", "c1", "c2"]), "c0"),
+            vec!["c4".to_string(), "c3".to_string()],
+            "oldest first, until what is left fits"
+        );
+        assert_eq!(evictable(&list, 9, 0, "c0").len(), 4, "everything but the one just saved");
+    }
+
+    /// Issue #89: what one request may add, and what the conversation may then hold. Both are
+    /// asked before the model is called, and the refusal says which one was hit.
+    #[test]
+    fn a_request_past_either_budget_is_refused_by_name() {
+        let chats = Chats::new(4, 8).with_budgets(1, 4);
+        let empty = Conversation::new("c".into());
+        assert_eq!(chats.admits(&empty, 1024), Ok(()));
+        let over = chats.admits(&empty, 1025).unwrap_err();
+        assert!(matches!(over, TooBig::Request { bytes: 1025, limit: 1024 }), "{over}");
+        assert!(over.to_string().contains("--chat-message-kb"), "{over}");
+
+        let mut long = Conversation::new("c".into());
+        while long.bytes() + 1024 <= 4096 {
+            long.push(turn("user", &"x".repeat(200)));
+        }
+        let over = chats.admits(&long, 1024).unwrap_err();
+        assert!(matches!(over, TooBig::Conversation { limit: 4096, .. }), "{over}");
+        assert!(over.to_string().contains("--chat-quota-kb"), "{over}");
+        assert_eq!(chats.tenant_quota(), 4 * 4096, "the cap is spent in bytes: four conversations of the budget");
     }
 
     fn tenant(persist: bool) -> (Arc<Tenant>, PathBuf) {
@@ -558,6 +699,57 @@ mod tests {
             assert!(bytes > 0, "persist={persist}");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// Issue #89: a conversation had no budget, so `--chats-per-tenant 50` bounded gigabytes that
+    /// `/api/t/{id}/files`, the tenant quota and 413 all reported as zero. The directory is held to
+    /// the cap times the budget, whatever a conversation that reached the store weighs.
+    #[test]
+    fn the_chats_directory_cannot_exceed_the_cap_times_the_budget() {
+        for persist in [true, false] {
+            let (t, root) = tenant(persist);
+            let chats = Chats::new(4, 8).with_budgets(64, 1);
+            assert_eq!(chats.tenant_quota(), 4 << 10);
+            for i in 0..8 {
+                // each one over the per-conversation budget on its own, which `admits` refuses at
+                // the door and `evict` has to survive anyway: an older store wrote what it liked
+                let mut c = conversation(&format!("c{i}"), 2);
+                c.push(turn("user", &"x".repeat(1500)));
+                c.updated = 1000 + i as u64;
+                chats.save(&t, &c).unwrap();
+                let (count, bytes) = chats.usage(&t).unwrap();
+                assert!(count <= 4, "persist={persist}, after {i}: {count} conversations");
+                assert!(bytes <= chats.tenant_quota(), "persist={persist}, after {i}: {bytes} bytes");
+            }
+            assert!(chats.load(&t, "c0").unwrap().is_none(), "persist={persist}");
+            assert!(chats.load(&t, "c7").unwrap().is_some(), "persist={persist}: the one just saved stays");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Issue #89: `run` windowed the stored turns and then appended the request's own raw, so an
+    /// empty `content` and two `user` messages in a row both reached an API that refuses them.
+    #[test]
+    fn the_requests_own_messages_are_normalised_like_the_stored_ones() {
+        let mut c = Conversation::new("c".into());
+        c.push(turn("user", "one"));
+        c.push(turn("assistant", ""));
+        let adding = [turn("user", "two"), turn("user", ""), turn("user", "three")];
+        assert_eq!(
+            c.for_model(DEFAULT_WINDOW_TURNS, &adding),
+            vec![json!({"role":"user","content":"one\n\ntwo\n\nthree"})],
+            "the empty turns go, and what is left joins rather than sending the same role twice"
+        );
+        assert_eq!(
+            Conversation::new("c".into()).for_model(DEFAULT_WINDOW_TURNS, &[turn("user", "  ")]),
+            Vec::<serde_json::Value>::new(),
+            "a message of nothing is nothing to send"
+        );
+        assert_eq!(
+            Conversation::new("c".into()).for_model(DEFAULT_WINDOW_TURNS, &[turn("assistant", "hi")]),
+            Vec::<serde_json::Value>::new(),
+            "the API refuses a leading assistant turn, from the request as much as from the store"
+        );
     }
 
     #[test]
