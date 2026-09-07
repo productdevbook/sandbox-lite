@@ -109,7 +109,11 @@ error away, and `src/shared_fixtures.rs` fails when a test builds `AppState`, a 
 `Config` or an `Engine` field by field. Tests build those through `AppState::for_tests()` and
 `Engine::for_tests*()` and say only the value they need (`..AppState::for_tests()` for the rest),
 so that a field added to one of them is a single edit and cannot break a fixture in a pull
-request its author never saw.
+request its author never saw. Both read text rather than an AST, and each catches only the
+spellings listed at the top of its own file: `silent_failures.rs` over every line up to a
+file's `#[cfg(test)] mod`, `shared_fixtures.rs` over every line from it. Neither is a proof
+that the class is absent, and each says at the top of the file what it does not prove — read
+that before closing an issue on the strength of a green run.
 
 Beyond what CI can see:
 
