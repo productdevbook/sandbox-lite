@@ -413,11 +413,10 @@ impl Emitter {
 
 struct Fail {
     status: StatusCode,
-    error: Value,
-    /// What the turn had already done when it failed. The tool loop writes the tenant's files as
-    /// it goes, so the error has to carry the same `changes` and `version` a `done` would, or the
-    /// editor cannot find out which files moved under it (issue #91).
-    progress: Value,
+    /// The whole error body, `{ "error": … }` and whatever `with` has folded under it. One field
+    /// rather than two: a `Fail` is the `Err` half of every result in this module, and two
+    /// `Value`s put that half past what clippy will carry unboxed.
+    body: Value,
 }
 
 impl Fail {
@@ -426,19 +425,25 @@ impl Fail {
     }
 
     fn new(status: StatusCode, error: Value) -> Fail {
-        Fail { status, error, progress: Value::Null }
+        Fail { status, body: json!({ "error": error }) }
     }
 
+    /// Folds in what the turn had already done when it failed. The tool loop writes the tenant's
+    /// files as it goes, so the error carries the same `changes` and `version` a `done` would, or
+    /// the editor cannot find out which files moved under it (issue #91).
     fn with(mut self, progress: Value) -> Fail {
-        self.progress = progress;
+        if let Value::Object(fields) = progress
+            && let Some(body) = self.body.as_object_mut()
+        {
+            for (key, value) in fields {
+                body.entry(key).or_insert(value);
+            }
+        }
         self
     }
 
-    /// The error body: what the turn managed, with the reason it stopped over the top.
     fn payload(self) -> Value {
-        let mut body = if self.progress.is_object() { self.progress } else { json!({}) };
-        body["error"] = self.error;
-        body
+        self.body
     }
 }
 
