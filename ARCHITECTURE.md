@@ -260,7 +260,20 @@ exact.
    `<body data-sl-overlay>` is how `live.js` knows not to swap CSS into them.
 
 The editor (`assets/editor.html`) is the other client: it embeds the preview
-in an `<iframe>` and edits files through `/api/t/{id}/file/{path}`.
+in an `<iframe>` and creates, edits, renames, deletes and uploads files
+through `/api/t/{id}/file/{path}`. Two things about that surface:
+
+- There is no rename endpoint. The editor writes the new path and then deletes
+  the old one, and says so in the dialog; if the delete fails the file is left
+  at both paths and the message says which one to remove by hand.
+- A refusal is shown as the daemon wrote it — `bad path` from `clean_path`, the
+  quota sentence behind the 413 — because "failed" tells a customer nothing
+  about what to do next. The one message the editor writes itself is for a path
+  the URL parser rewrites (`..`), which never reaches the daemon at all.
+
+Every value that reaches the DOM goes through `esc()` or `textContent`;
+`tests/editor-escaping.mjs` fails the build otherwise, and a file may be named
+anything the daemon accepts.
 
 ## The transform engine (`src/transform/mod.rs`)
 
