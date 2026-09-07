@@ -11,7 +11,7 @@ use super::api::{check_tenant, err, no_tenant, sse};
 use super::{AppState, State, TenantId, mime};
 use crate::resolve::{Resolver, renderers};
 use crate::store::{Tenant, clean_path, is_private_path};
-use crate::transform::{BuildError, JS, Kind, content, css, js, json_str};
+use crate::transform::{BuildError, JS, Kind, css, js, json_str};
 
 const ASTRO_JS: &str = include_str!("../../assets/astro.js");
 const SHELL_HTML: &str = include_str!("../../assets/shell.html");
@@ -145,6 +145,10 @@ pub async fn check(AxState(st): AxState<State>, Extension(id): Extension<TenantI
 
 /// Issue #48: every way this can fail answers 500 with the diagnostic. An empty collection is a
 /// tenant with no entries, and a page rendered from one looks exactly like a page that is right.
+///
+/// Issue #90: the build itself goes through `Engine::collection`, so the endpoint that reads every
+/// entry file of a project is bounded the way a compile is — one permit for the whole collection,
+/// the compile deadline, and a cache entry that stands until the tenant's next write.
 pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<TenantId>, Path(name): Path<String>) -> Response {
     let t = match tenant(&st, &id) {
         Ok(t) => t,
@@ -155,18 +159,11 @@ pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<Tenan
     }
     let st2 = st.clone();
     let collection = name.clone();
-    let joined = tokio::task::spawn_blocking(move || {
-        let max = st2.engine.cfg.max_source_bytes;
-        st2.engine.on_parser_stack(move || content::collection_json(&t, &collection, max))
-    })
-    .await;
-    let out = match joined {
-        Ok(Ok(Ok(out))) => out,
-        Ok(Ok(Err(e))) => return build_error(e),
-        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: cannot start a compiler thread: {e}")),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
-    };
-    ([(header::CACHE_CONTROL, "no-cache")], Json(out)).into_response()
+    match tokio::task::spawn_blocking(move || st2.engine.collection(&t, &collection)).await {
+        Ok(Ok(built)) => text(built.body.clone(), built.content_type, "no-cache"),
+        Ok(Err(e)) => build_error(e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
+    }
 }
 
 /// Issue #52: `@vue/compiler-sfc` builds a component's runtime props out of the types in
@@ -381,6 +378,7 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -388,8 +386,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::percent_decode;
-    use crate::http::{AppState, app};
+    use crate::http::{AppState, State, app};
+    use crate::metrics::STATUSES;
     use crate::store::{Base, Store, UpdateKind};
+    use crate::transform::{Config, Engine};
 
     #[test]
     fn percent_decode_takes_any_string() {
@@ -409,6 +409,18 @@ mod tests {
             t.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
         }
         app(Arc::new(AppState { store, ..AppState::for_tests() }))
+    }
+
+    /// A daemon with no compile permit to give anyone: a gate whose limit is zero refuses every
+    /// compile without a test having to hold one.
+    fn saturated_app() -> (axum::Router, State) {
+        let store = Store::new(None, u64::MAX);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &root).unwrap());
+        store.create_tenant("acme", "starter").unwrap();
+        let engine = Engine::for_tests_gated(Config::default(), 0, Duration::from_millis(20), 1);
+        let st = Arc::new(AppState { store, metrics: engine.metrics(), engine, ..AppState::for_tests() });
+        (app(st.clone()), st)
     }
 
     async fn collection(app: &axum::Router, name: &str) -> (StatusCode, Value) {
@@ -442,6 +454,29 @@ mod tests {
         for name in super::SHELL_HTML.split('%').skip(1).step_by(2) {
             assert!(!body.contains(&format!("%{name}%")), "%{name}% was not substituted");
         }
+    }
+
+    /// Issue #90: the endpoint that reads every entry file of a project takes a compile permit like
+    /// everything else, so a daemon that has none left says so instead of reading them anyway.
+    #[tokio::test]
+    async fn a_collection_request_with_no_permit_left_is_refused() {
+        let (app, _st) = saturated_app();
+        let (status, body) = collection(&app, "posts").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("content/posts"), "{body}");
+    }
+
+    /// Issue #95: what a saturated gate answers has a metrics row of its own. Counted as `"500"` it
+    /// was indistinguishable from a tenant whose module does not compile.
+    #[tokio::test]
+    async fn a_module_request_the_gate_refuses_is_counted_as_503() {
+        let (app, st) = saturated_app();
+        let req = Request::builder().uri("/__sl/m/src/pages/index.astro").header("host", "acme.localhost").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let at = |status: &str| STATUSES.iter().position(|s| *s == status).expect("status label");
+        let row = st.metrics.requests()[0];
+        assert_eq!((row[at("503")], row[at("500")]), (1, 0));
     }
 
     async fn strip_ts(app: &axum::Router, query: &str, script: &str) -> (StatusCode, String) {

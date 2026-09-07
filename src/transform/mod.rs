@@ -100,9 +100,15 @@ impl Built {
         let globs = glob::find(&body);
         Built { specs, globs, env_banner: true, ..Built::js(body) }
     }
+
+    /// A collection's JSON, cached in the same map a module build's is.
+    fn json(body: String) -> Built {
+        Built { content_type: JSON, ..Built::js(body) }
+    }
 }
 
 pub const JS: &str = "text/javascript; charset=utf-8";
+pub const JSON: &str = "application/json; charset=utf-8";
 
 /// oxc, astro_codegen, satteri-mdxjs and grass are recursive-descent, so a source byte can cost a
 /// stack frame and a stack overflow aborts the process (`panic = "abort"`). The two shapes measured
@@ -154,26 +160,6 @@ thread_local! {
     /// Counted per calling thread so parallel tests cannot see each other's spawns.
     #[cfg(test)]
     static SPAWNED: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Runs `f` on a thread with a stack the parsers cannot walk off. The reservation is virtual
-/// address space; only the pages a compile actually touches become resident. A `?type=style` or
-/// `?type=script` build asks for the module first, so the flag keeps that inner build on the stack
-/// this one already reserved instead of reserving a second one.
-fn with_big_stack<T: Send>(stack_bytes: usize, f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
-    if ON_PARSER_STACK.get() {
-        return Ok(f());
-    }
-    std::thread::scope(|scope| {
-        let body = || {
-            ON_PARSER_STACK.set(true);
-            f()
-        };
-        let handle = std::thread::Builder::new().stack_size(stack_bytes).spawn_scoped(scope, body)?;
-        #[cfg(test)]
-        SPAWNED.set(SPAWNED.get() + 1);
-        Ok(handle.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
-    })
 }
 
 fn refused(path: &str, text: String, hint: &str) -> BuildError {
@@ -550,11 +536,6 @@ impl Engine {
         self.cfg.max_source_bytes.saturating_mul(STACK_PER_SOURCE_BYTE).max(MIN_PARSER_STACK)
     }
 
-    /// For the parsers reached outside `build` — the content config, which oxc walks.
-    pub fn on_parser_stack<T: Send>(&self, f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
-        with_big_stack(self.parser_stack_bytes(), f)
-    }
-
     pub fn stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
         CacheStats { entries: c.map.len(), bytes: c.bytes, hits: c.hits, misses: c.misses, coalesced: c.coalesced }
@@ -638,6 +619,51 @@ impl Engine {
         let _permit = self.gate.enter().map_err(BuildError::busy)?;
         let _compiling = Compiling::enter();
         Ok(f())
+    }
+
+    /// A collection's `{entries, dates}` JSON, built the way a module is. Issue #90: this reads and
+    /// parses every entry file of a collection — the one thing the daemon does that touches every
+    /// file of a project — and it went through none of what bounds a compile, so a 200-entry blog
+    /// cost 1.3 s of CPU per page view with nothing limiting how many ran at once.
+    ///
+    /// The key is the tenant's version rather than the bytes that went into the build: what the
+    /// entries are is itself a question only the build can answer, and every write and every base
+    /// reload bumps the version, so an edit anywhere invalidates the collection.
+    pub fn collection(&self, tenant: &Arc<Tenant>, name: &str) -> Result<Arc<Built>, BuildError> {
+        let mut h = Vec::with_capacity(tenant.id.len() + name.len() + 32);
+        h.extend_from_slice(b"c\0");
+        h.extend_from_slice(tenant.id.as_bytes());
+        h.push(0);
+        h.extend_from_slice(&tenant.version().to_le_bytes());
+        h.extend_from_slice(name.as_bytes());
+        let key = xxh3_128(&h);
+        if let Some(b) = self.cached(key) {
+            return Ok(b);
+        }
+        let lead = match self.join(key) {
+            Join::Lead(lead) => Some(lead),
+            Join::Solo => None,
+            Join::Waited(outcome) => return outcome,
+        };
+        let outcome = self.collection_once(tenant, name, key);
+        if let Some(lead) = lead {
+            lead.settle(&outcome);
+        }
+        outcome
+    }
+
+    /// One permit for the whole collection, as `sweep` takes one for a whole project (#54): a page
+    /// asking for two hundred entries should cost one place in the queue, not two hundred. Inside
+    /// it is one `deadlined` thread, so an entry file nobody can parse in time is given up on
+    /// rather than held open.
+    fn collection_once(&self, tenant: &Arc<Tenant>, name: &str, key: u128) -> Result<Arc<Built>, BuildError> {
+        let path = format!("content/{name}");
+        let _permit = self.gate.enter().map_err(|e| BuildError::busy(format!("{path}: {e}")))?;
+        let (t, collection, max) = (tenant.clone(), name.to_string(), self.cfg.max_source_bytes);
+        let json = self.deadlined(&path, move || content::collection_json(&t, &collection, max).map(|v| v.to_string()))?;
+        let built = Arc::new(Built::json(json));
+        self.insert(key, built.clone());
+        Ok(built)
     }
 
     pub fn build(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind) -> Result<Arc<Built>, BuildError> {
@@ -1493,6 +1519,66 @@ mod tests {
         assert!(e.message.contains("waited 100 ms"), "{}", e.message);
         assert!(started.elapsed() < Duration::from_secs(1), "the sweep waited {:?}", started.elapsed());
         assert_eq!(engine.compile_stats().refused, 1);
+    }
+
+    const POST: &str = "---\ntitle: a post\n---\n# heading\n\nbody\n";
+
+    /// Issue #90: the collection endpoint read and parsed every entry of a collection on every
+    /// request, so a page calling `getCollection` paid for the whole collection on every load. The
+    /// second request for an unchanged collection must cost nothing — no build, and no permit.
+    #[test]
+    fn a_second_collection_build_is_a_cache_hit_and_takes_no_permit() {
+        let t = tenant(&[("src/content/posts/a.md", POST), ("src/content/posts/b.md", POST)]);
+        let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
+        let first = engine.collection(&t, "posts").unwrap();
+        assert!(first.body.contains("heading"), "{}", first.body);
+        engine.gate.limit.store(0, Ordering::Relaxed);
+        let second = engine.collection(&t, "posts").unwrap();
+        assert_eq!(first.body, second.body);
+        let cache = engine.stats();
+        assert_eq!((cache.misses, cache.hits), (1, 1), "one build, then a hit");
+        assert_eq!(engine.compile_stats().refused, 0, "the hit never asked the gate for anything");
+    }
+
+    /// And an edit invalidates it: the key carries the tenant's version, which every write bumps.
+    #[test]
+    fn an_edit_rebuilds_the_collection() {
+        let t = tenant(&[("src/content/posts/a.md", POST)]);
+        let engine = engine_gated(capped(CAP), 1, Duration::from_millis(50));
+        assert!(!engine.collection(&t, "posts").unwrap().body.contains("written later"));
+        let later = "---\ntitle: written later\n---\n";
+        t.write("src/content/posts/b.md", later.as_bytes().to_vec(), UpdateKind::Module).unwrap();
+        assert!(engine.collection(&t, "posts").unwrap().body.contains("written later"));
+        assert_eq!(engine.stats().misses, 2, "the write invalidated what the first build cached");
+    }
+
+    /// One permit for the whole collection, taken before a single entry is read: a build that
+    /// cannot have one waits for it and is refused with the 503 a module build gives.
+    #[test]
+    fn a_collection_build_that_cannot_have_a_permit_is_refused() {
+        let t = tenant(&[("src/content/posts/a.md", POST)]);
+        let engine = engine_gated(capped(CAP), 0, Duration::from_millis(100));
+        let started = Instant::now();
+        let e = build_err(engine.collection(&t, "posts"));
+        assert_eq!(e.status, 503);
+        assert!(e.message.contains("content/posts"), "{}", e.message);
+        assert!(e.message.contains("waited 100 ms"), "{}", e.message);
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited {:?}", started.elapsed());
+        assert_eq!((engine.compile_stats().refused, engine.stats().entries), (1, 0));
+    }
+
+    /// A collection the deadline runs out on is answered with a diagnostic rather than held open:
+    /// nothing caps the size of an entry file, so a 60 MiB `.md` under the tenant's quota is parsed
+    /// on a thread the request must be able to give up on.
+    #[test]
+    fn a_collection_past_the_deadline_answers_with_a_diagnostic() {
+        let long = format!("---\ntitle: long\n---\n{}", "# heading\n\n".repeat(20_000));
+        let t = tenant(&[("src/content/posts/long.md", long.as_str())]);
+        let engine = engine_gated(Config { compile_timeout: Duration::from_millis(1), ..capped(CAP) }, 1, Duration::from_millis(50));
+        let e = build_err(engine.collection(&t, "posts"));
+        assert!(e.message.contains("content/posts: compile did not finish within 1 ms"), "{}", e.message);
+        assert_eq!(e.diagnostics.len(), 1);
+        assert_eq!(engine.compile_stats().timeouts, 1);
     }
 
     const CARD: &str = "---\nconst n = 1;\n---\n<p>{n}</p>\n<style>p{color:red}</style>\n<script>console.log(1)</script>\n";

@@ -450,6 +450,11 @@ whole-project compile takes one permit and holds it for the whole run, so
 per-file compile deadline is untouched — each build inside still gets its own
 thread and its own wall clock.
 
+`Engine::collection` takes one permit for the same reason and gives it back the
+same way: a collection is read and parsed as a whole, so it costs one place in
+the queue however many entries it has, and a build that cannot have that permit
+is refused with 503 before a single entry file is read (#90).
+
 ### How long one compile may run
 
 A permit is only a bound if something takes it back. `astro_codegen`, oxc and
@@ -649,6 +654,25 @@ collection with no entries and nothing else — a page rendered from a failed
 build is indistinguishable from a page rendered from a tenant that has no posts
 (issue #48).
 
+The build runs through `Engine::collection`, so the one endpoint that touches
+every file of a project is bounded the way a compile is (issue #90). It takes
+**one permit for the whole collection** — as `Engine::sweep` does for a whole
+project, not one per entry — runs inside `Engine::deadlined`, so an entry file
+that cannot be parsed within `--compile-timeout-ms` is given up on rather than
+held open, and caches its JSON in the transform cache under the tenant's
+version. A second identical request is therefore a cache hit that asks the gate
+for nothing, and any write bumps the version and rebuilds. The key is the
+version rather than the bytes that went into the build because *which* files
+those are is itself a question only the build can answer; the cost is that an
+edit to any file rebuilds every collection that is asked for again.
+
+What is still unbounded is the size of an entry file. `--max-source-kb` is
+applied to `content.config.ts` and to the sources a module build parses, and
+`parses_source` deliberately leaves `.md` out — long articles are legitimate
+and markdown has never overflowed the stack at any size the cap allows — so a
+60 MiB `.md` under the tenant's byte quota is still read and parsed. What
+bounds it now is the deadline and the permit, not a cap.
+
 Which files those are comes from `src/content.config.ts` (or the Astro 2–4
 `src/content/config.ts`), parsed with oxc and never executed. `parse_config`
 maps `export const collections = { name: … }` to the `defineCollection({…})`
@@ -700,14 +724,24 @@ for compile latency, over the fixed bucket set 1 ms, 5 ms, 20 ms, 50 ms,
 100 ms, 500 ms, 1 s, 5 s. It lives in an `Arc` shared by `AppState` and
 `Engine`, so `check` gets its own throwaway instance.
 
+The status classes are `200`, `400`, `404`, `500` and `503`, and anything
+unmapped falls into `500`. 503 is a label of its own because it is the only
+externally visible sign that the compile gate is saturated or that the runaway
+cap has pinned it, and folded into `500` it read exactly like a tenant with a
+syntax error (issue #95). 401, 403 and 413 never reach this counter: the
+preview token and the `strip-ts` body limit are layers above the handler, and
+the counter is written inside it.
+
 Only two places write to it. `preview::module` adds one to the counter for the
 status it is about to return — a cache hit therefore costs one atomic add.
-`Engine::build` times what a cache miss costs — the `on_parser_stack` hop onto
-the big-stack thread and the `compile` it runs there, failures and a failed
-spawn included; a hit is not a compile and is not timed. A `Style`/`Script`
-compile calls `build` again for the module it needs, so on a cold cache the
-module's time is counted once on its own and once inside the style's
-observation.
+`Engine::build` times what a cache miss costs — the `deadlined` hop onto the
+big-stack thread and the `compile` it runs there, failures and a failed spawn
+included; a hit is not a compile and is not timed. A `Style`/`Script` compile
+calls `build` again for the module it needs, so on a cold cache the module's
+time is counted once on its own and once inside the style's observation. A
+collection build is not timed at all: `sandbox_lite_compile_seconds` is per
+`Kind` and a collection is not one of them, so what it costs shows up in the
+gate's gauges rather than in a histogram.
 
 `GET /metrics` (`api::metrics`) renders those counters plus the gauges
 `/api/stats` already had — tenants, overlay bytes, cache entries and bytes,

@@ -6,7 +6,14 @@ use std::time::Duration;
 use crate::transform::Kind;
 
 pub const KINDS: [&str; 5] = ["module", "style", "script", "raw", "url"];
-pub const STATUSES: [&str; 4] = ["200", "400", "404", "500"];
+/// Every status `preview::module` returns, each with a label of its own. Issue #95: 503 folded into
+/// `"500"`, so a daemon out of compile permits — the one thing an operator would page on, and the
+/// only externally visible sign that `--max-compiles` is saturated or the runaway cap has pinned
+/// the gate — read exactly like a tenant with a syntax error.
+///
+/// 401, 403 and 413 are not here because this counter never sees them: the preview token and the
+/// `strip-ts` body limit are layers above the handler, and the counter is written inside it.
+pub const STATUSES: [&str; 5] = ["200", "400", "404", "500", "503"];
 pub const BUCKETS: [f64; 8] = [0.001, 0.005, 0.02, 0.05, 0.1, 0.5, 1.0, 5.0];
 const SLOTS: usize = BUCKETS.len() + 1;
 
@@ -20,11 +27,14 @@ fn kind_index(kind: Kind) -> usize {
     }
 }
 
+/// Anything unmapped still lands in `"500"`: a status nobody has thought of is a failure, and a
+/// row nobody watches is better than a label that appears the day the daemon starts returning it.
 fn status_index(status: u16) -> usize {
     match status {
         200 => 0,
         400 => 1,
         404 => 2,
+        503 => 4,
         _ => 3,
     }
 }
@@ -315,6 +325,20 @@ mod tests {
         assert_eq!(m.compiles()[0].count(), 0);
     }
 
+    /// Issue #95: a saturated compile gate and a project that does not compile are different
+    /// facts, and the second was the only one the counter could tell you about.
+    #[test]
+    fn a_503_is_not_counted_as_a_500() {
+        let at = |status: &str| STATUSES.iter().position(|s| *s == status).expect("status label");
+        let m = Metrics::default();
+        m.module_request(Kind::Module, 503);
+        m.module_request(Kind::Module, 500);
+        m.module_request(Kind::Module, 418);
+        let row = m.requests()[0];
+        assert_eq!(row[at("503")], 1, "the refusal has a row of its own");
+        assert_eq!(row[at("500")], 2, "a broken project, and a status nobody has mapped");
+    }
+
     #[test]
     fn renders_the_prometheus_text_format() {
         let m = Metrics::default();
@@ -456,22 +480,27 @@ sandbox_lite_module_requests_total{kind="module",status="200"} 3
 sandbox_lite_module_requests_total{kind="module",status="400"} 0
 sandbox_lite_module_requests_total{kind="module",status="404"} 1
 sandbox_lite_module_requests_total{kind="module",status="500"} 0
+sandbox_lite_module_requests_total{kind="module",status="503"} 0
 sandbox_lite_module_requests_total{kind="style",status="200"} 0
 sandbox_lite_module_requests_total{kind="style",status="400"} 0
 sandbox_lite_module_requests_total{kind="style",status="404"} 0
 sandbox_lite_module_requests_total{kind="style",status="500"} 0
+sandbox_lite_module_requests_total{kind="style",status="503"} 0
 sandbox_lite_module_requests_total{kind="script",status="200"} 0
 sandbox_lite_module_requests_total{kind="script",status="400"} 0
 sandbox_lite_module_requests_total{kind="script",status="404"} 0
 sandbox_lite_module_requests_total{kind="script",status="500"} 0
+sandbox_lite_module_requests_total{kind="script",status="503"} 0
 sandbox_lite_module_requests_total{kind="raw",status="200"} 0
 sandbox_lite_module_requests_total{kind="raw",status="400"} 0
 sandbox_lite_module_requests_total{kind="raw",status="404"} 0
 sandbox_lite_module_requests_total{kind="raw",status="500"} 0
+sandbox_lite_module_requests_total{kind="raw",status="503"} 0
 sandbox_lite_module_requests_total{kind="url",status="200"} 0
 sandbox_lite_module_requests_total{kind="url",status="400"} 0
 sandbox_lite_module_requests_total{kind="url",status="404"} 0
-sandbox_lite_module_requests_total{kind="url",status="500"} 2
+sandbox_lite_module_requests_total{kind="url",status="500"} 0
+sandbox_lite_module_requests_total{kind="url",status="503"} 2
 # HELP sandbox_lite_compile_seconds Seconds spent compiling one file after a transform-cache miss; a style or script compile includes any module compile it triggers.
 # TYPE sandbox_lite_compile_seconds histogram
 sandbox_lite_compile_seconds_bucket{kind="module",le="0.001"} 1

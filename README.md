@@ -348,7 +348,7 @@ Tenant host (`<id>.<domain>`):
 | `/__sl/raw/<path>` | file as-is (assets, `@import`ed CSS) |
 | `/__sl/routes.json` | route table built from `src/pages`, in Astro priority order |
 | `/__sl/renderers.json` | framework renderers to register, derived from `package.json` (`@astrojs/react`, `@astrojs/preact`, `@astrojs/vue`, `@astrojs/svelte`) or `sandbox-lite.json` |
-| `/__sl/content/<collection>` | `{entries, dates}` — the collection's entries and the schema's date fields; Markdown arrives rendered, MDX entries render through their compiled module |
+| `/__sl/content/<collection>` | `{entries, dates}` — the collection's entries and the schema's date fields; Markdown arrives rendered, MDX entries render through their compiled module. Built under one compile permit and the compile deadline, and cached until the tenant's next write |
 | `/__sl/shim/astro-*.js` | browser stand-ins for `astro:content`, `astro:assets`, `astro:transitions`, …; `astro-jsx-runtime.js` is Astro's JSX runtime and `astro:jsx` renderer |
 | `/__sl/astro.js` | Astro's runtime + container API, bundled once per Astro version |
 | `/__sl/events` | same SSE stream as the API; the page swaps CSS or reloads itself on it |
