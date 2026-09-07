@@ -96,8 +96,11 @@ fn css() -> impl Strategy<Value = String> {
 /// The stack `Engine::build` gives every parser; running one here on the 2 MiB test-thread stack
 /// aborts the whole test binary instead of failing a case.
 fn parser_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    let engine = Engine::for_tests_with(Config::default());
-    engine.on_parser_stack(f).expect("compiler thread")
+    let bytes = Engine::for_tests_with(Config::default()).parser_stack_bytes();
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new().stack_size(bytes).spawn_scoped(scope, f).expect("compiler thread");
+        handle.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
 }
 
 fn assert_inside_tenant(path: &str) -> Result<(), TestCaseError> {
