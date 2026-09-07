@@ -342,7 +342,6 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Instant;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -350,10 +349,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::percent_decode;
-    use crate::http::{AppState, SameSite, app, chats};
-    use crate::metrics::Metrics;
+    use crate::http::{AppState, app};
     use crate::store::{Base, Store, UpdateKind};
-    use crate::transform::{Config, Engine};
 
     #[test]
     fn percent_decode_takes_any_string() {
@@ -365,7 +362,6 @@ mod tests {
     }
 
     fn starter_app(files: &[(&str, &str)]) -> axum::Router {
-        let metrics = Arc::new(Metrics::default());
         let store = Store::new(None, u64::MAX);
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
         store.add_base(Base::load("starter", &root).unwrap());
@@ -373,23 +369,7 @@ mod tests {
         for (path, body) in files {
             t.write(path, body.as_bytes().to_vec(), UpdateKind::from_path(path)).unwrap();
         }
-        app(Arc::new(AppState {
-            store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
-            metrics,
-            chats: chats::Chats::default(),
-            shots: crate::http::ai::Shots::default(),
-            domain: "localhost".into(),
-            port: 4321,
-            model: "m".into(),
-            api_key: None,
-            api_base: "http://127.0.0.1:1".into(),
-            api_token: None,
-            preview_secret: None,
-            cookie_samesite: SameSite::Lax,
-            chrome: None,
-            started: Instant::now(),
-        }))
+        app(Arc::new(AppState { store, ..AppState::for_tests() }))
     }
 
     async fn collection(app: &axum::Router, name: &str) -> (StatusCode, Value) {

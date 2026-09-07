@@ -103,6 +103,14 @@ Formatting follows `rustfmt.toml` (140 columns). Clippy warnings are errors.
 test for the transform pipeline. CI also starts the daemon, creates a tenant
 with `curl`, and fetches one module, `routes.json` and the shell.
 
+Two of those tests read the crate's own source rather than run it, and each keeps a tolerated
+list that may only shrink: `src/silent_failures.rs` fails when code on a request path throws an
+error away, and `src/shared_fixtures.rs` fails when a test builds `AppState`, a transform
+`Config` or an `Engine` field by field. Tests build those through `AppState::for_tests()` and
+`Engine::for_tests*()` and say only the value they need (`..AppState::for_tests()` for the rest),
+so that a field added to one of them is a single edit and cannot break a fixture in a pull
+request its author never saw.
+
 Beyond what CI can see:
 
 - If you touched `src/transform/`, `src/resolve.rs`, `assets/shell.js` or a

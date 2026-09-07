@@ -240,7 +240,6 @@ pub async fn import(AxState(st): AxState<State>, Path(id): Path<String>, RawQuer
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Instant;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -249,7 +248,6 @@ mod tests {
     use super::*;
     use crate::http::AppState;
     use crate::store::{Base, Store};
-    use crate::transform::{Config, Engine};
 
     struct Fixture {
         app: axum::Router,
@@ -279,24 +277,7 @@ mod tests {
         store.add_base(Base::load("b", &root.join("base")).unwrap());
         store.create_tenant("a", "b").unwrap();
         store.create_tenant("bb", "b").unwrap();
-        let metrics = Arc::new(crate::metrics::Metrics::default());
-        let state = Arc::new(AppState {
-            store,
-            engine: Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, metrics.clone()),
-            metrics,
-            chats: crate::http::chats::Chats::default(),
-            domain: "localhost".into(),
-            port: 4321,
-            model: "m".into(),
-            api_key: None,
-            api_base: "http://127.0.0.1:1".into(),
-            api_token: None,
-            preview_secret: None,
-            cookie_samesite: crate::http::SameSite::Lax,
-            chrome: None,
-            shots: crate::http::ai::Shots::default(),
-            started: Instant::now(),
-        });
+        let state = Arc::new(AppState { store, ..AppState::for_tests() });
         Fixture { app: crate::http::app(state.clone()), state, root }
     }
 

@@ -59,11 +59,11 @@ const TOLERATED: [(&str, &str); 8] = [
     ("let _ = self.events.send(format!(", "a broadcast with no subscribers, which is the normal state of a tenant nobody is previewing"),
 ];
 
-fn src_dir() -> PathBuf {
+pub fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("src is readable") {
         let path = entry.expect("a readable directory entry").path();
         if path.is_dir() {

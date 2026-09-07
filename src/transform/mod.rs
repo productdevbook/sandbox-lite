@@ -869,6 +869,29 @@ pub fn is_source(path: &str) -> bool {
     ) && path.starts_with("src/")
 }
 
+/// Every engine a test builds comes from here: `Engine::new` and `Engine::with_gate` are named in
+/// this block and nowhere under `#[cfg(test)] mod`, so an argument added to either is one edit.
+#[cfg(test)]
+impl Engine {
+    pub fn for_tests() -> Engine {
+        Engine::for_tests_with(Config { cache_bytes: 1 << 20, ..Config::default() })
+    }
+
+    pub fn for_tests_with(cfg: Config) -> Engine {
+        Engine::new(cfg, Arc::new(Metrics::default()))
+    }
+
+    /// Neither the queue deadline nor the runaway cap is a flag, so tests build the gate directly.
+    pub fn for_tests_gated(cfg: Config, limit: usize, wait: Duration, max_runaway: usize) -> Engine {
+        Engine::with_gate(cfg, Arc::new(Metrics::default()), Gate::new(limit, wait, max_runaway))
+    }
+
+    /// So a fixture's state records into the same metrics as the engine inside it, as the daemon does.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -896,7 +919,7 @@ mod tests {
     }
 
     fn engine() -> Engine {
-        Engine::new(Config { cache_bytes: 1 << 20, ..Config::default() }, Arc::new(crate::metrics::Metrics::default()))
+        Engine::for_tests()
     }
 
     fn served(engine: &Engine, tenant: &Arc<Tenant>) -> String {
@@ -906,21 +929,19 @@ mod tests {
     const CAP: usize = 64 << 10;
 
     fn engine_capped(max_source_bytes: usize) -> Engine {
-        Engine::new(capped(max_source_bytes), Arc::new(crate::metrics::Metrics::default()))
+        Engine::for_tests_with(capped(max_source_bytes))
     }
 
     fn tenant_with(path: &str, source: &str) -> Arc<Tenant> {
         tenant(&[(path, source)])
     }
 
-    /// Neither the queue deadline nor the runaway cap is a flag, so tests build the gate directly.
     fn engine_gated(cfg: Config, limit: usize, wait: Duration) -> Engine {
         engine_bounded(cfg, limit, wait, MAX_RUNAWAY_COMPILES)
     }
 
     fn engine_bounded(cfg: Config, limit: usize, wait: Duration, max_runaway: usize) -> Engine {
-        let metrics = Arc::new(crate::metrics::Metrics::default());
-        Engine::with_gate(cfg, metrics, Gate::new(limit, wait, max_runaway))
+        Engine::for_tests_gated(cfg, limit, wait, max_runaway)
     }
 
     fn capped(max_source_bytes: usize) -> Config {
