@@ -379,6 +379,41 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
+    /// Issue #61: the daemon skipped a tenant it could not restore and said nothing, so a customer's
+    /// site answered "unknown tenant" while `/api/stats` and `/metrics` looked healthy.
+    #[tokio::test]
+    async fn a_tenant_that_could_not_be_restored_is_reported_rather_than_absent() {
+        let root = std::env::temp_dir().join(format!("sandbox-lite-api-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        std::fs::create_dir_all(data.join("bakery/files")).unwrap();
+        std::fs::write(data.join("bakery/tenant.json"), r#"{"base":"never-loaded-here"}"#).unwrap();
+        let store = Store::new(Some(data), u64::MAX);
+        assert_eq!(store.restore().unwrap(), 0, "it does not load, and it does not stop the daemon either");
+        let app = app(state_for(store, None, None));
+
+        let (status, body) = get(&app, "/api/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let stats: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(stats["tenants"], 0);
+        assert_eq!(stats["tenants_failed"], 1, "{body}");
+        assert_eq!(stats["failed_tenants"][0]["id"], "bakery");
+        assert!(stats["failed_tenants"][0]["error"].as_str().unwrap().contains("never-loaded-here"), "{body}");
+
+        let (status, body) = get(&app, "/metrics", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\nsandbox_lite_tenants_failed 1\n"), "{body}");
+
+        // could not be loaded is a 500 that says why; never existed stays a 404
+        let (status, body) = get(&app, "/api/t/bakery/files", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("could not be loaded"), "{body}");
+        let (status, body) = get(&app, "/api/t/nobody/files", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("unknown tenant"), "{body}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn bases_are_added_and_reloaded_over_the_api() {
         let root = std::env::temp_dir().join(format!("sandbox-lite-api-bases-{}", std::process::id()));

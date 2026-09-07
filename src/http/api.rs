@@ -14,7 +14,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use super::{AppState, State, mime};
 use crate::metrics::{BaseSize, KINDS, STATUSES, Snapshot, render};
-use crate::store::{Base, Tenant, WriteError, clean_path, valid_id};
+use crate::store::{Base, NoTenant, Tenant, WriteError, clean_path, valid_id};
 use crate::transform::{Engine, Kind, is_source};
 
 pub async fn editor() -> Html<&'static str> {
@@ -29,9 +29,18 @@ pub fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
+/// A tenant whose data directory is there and would not load answers 500 with the reason, not 404:
+/// *never existed* and *could not be loaded* are different facts (issue #61).
 #[allow(clippy::result_large_err)]
 pub fn tenant_or_404(st: &AppState, id: &str) -> Result<Arc<Tenant>, Response> {
-    st.store.tenant(id).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown tenant '{id}'")))
+    st.store.resolve(id).map_err(|e| no_tenant(id, e))
+}
+
+pub fn no_tenant(id: &str, e: NoTenant) -> Response {
+    match e {
+        NoTenant::Unknown => err(StatusCode::NOT_FOUND, format!("unknown tenant '{id}'")),
+        NoTenant::Failed(why) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("tenant '{id}' exists but could not be loaded: {why}")),
+    }
 }
 
 pub fn rss_kb() -> Option<u64> {
@@ -101,10 +110,15 @@ pub async fn stats(AxState(st): AxState<State>) -> Response {
         "max_per_tenant": st.chats.cap(),
         "window_turns": st.chats.window(),
     });
+    let failed = st.store.failed_tenants();
     Json(json!({
         "rss_kb": rss_kb(),
         "uptime_s": st.started.elapsed().as_secs(),
         "tenants": tenants.len(),
+        // A tenant that would not load is a site answering nothing while the daemon reports itself
+        // healthy, so the count and the ids are part of the answer rather than a line in the log.
+        "tenants_failed": failed.len(),
+        "failed_tenants": failed.iter().map(|(id, e)| json!({ "id": id, "error": e })).collect::<Vec<_>>(),
         "overlay_bytes": overlay_bytes,
         "sse_subscribers": subscribers,
         "bases": st.store.bases().iter().map(|b| json!({ "name": b.name, "files": b.file_count(), "bytes": b.bytes() })).collect::<Vec<_>>(),
@@ -134,6 +148,7 @@ fn snapshot(st: &AppState, chats: (u64, u64)) -> Snapshot {
         uptime_seconds: st.started.elapsed().as_secs(),
         rss_bytes: rss_kb().map(|kb| kb * 1024),
         tenants: tenants.len() as u64,
+        tenants_failed: st.store.failed_tenants().len() as u64,
         overlay_bytes: tenants.iter().map(|t| t.overlay_stats().1).sum(),
         bases: st.store.bases().iter().map(|b| BaseSize { name: b.name.clone(), files: b.file_count() as u64, bytes: b.bytes() }).collect(),
         cache_entries: cache.entries as u64,

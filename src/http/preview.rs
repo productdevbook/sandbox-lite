@@ -7,7 +7,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::api::{check_tenant, err, sse};
+use super::api::{check_tenant, err, no_tenant, sse};
 use super::{AppState, State, TenantId, mime};
 use crate::resolve::{Resolver, renderers};
 use crate::store::{Tenant, clean_path, is_private_path};
@@ -26,7 +26,7 @@ pub fn asset_version() -> &'static str {
 
 #[allow(clippy::result_large_err)]
 fn tenant(st: &AppState, id: &TenantId) -> Result<Arc<Tenant>, Response> {
-    st.store.tenant(&id.0).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown tenant '{}'", id.0)))
+    st.store.resolve(&id.0).map_err(|e| no_tenant(&id.0, e))
 }
 
 fn text(body: impl Into<String>, content_type: &'static str, cache: &'static str) -> Response {

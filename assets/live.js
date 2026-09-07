@@ -64,6 +64,15 @@
     return true;
   }
 
+  // Every event names the version it follows. A swap is only sound on a page that rendered exactly
+  // that one: a `module` event lost on a stream that stayed open leaves the page's JS behind, and
+  // the next style-only write would then be swapped in over stale markup for good. So a gap in the
+  // sequence reloads, which is what makes a lost message self-correcting.
+  function follows(d) {
+    const at = window.__sl && window.__sl.version;
+    return typeof at === "number" && d.prev === at;
+  }
+
   es.addEventListener("hello", (e) => {
     const v = Number(e.data);
     if (window.__sl && window.__sl.version && v > window.__sl.version) reload();
@@ -72,7 +81,7 @@
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
     if (d.type !== "update" && d.type !== "delete") return;
-    if (d.type === "delete" || !d.path) return reload();
+    if (d.type === "delete" || !d.path || !follows(d)) return reload();
     swap(d).then((swapped) => {
       // the page now matches this version, so a reconnect's hello must not send it back
       if (swapped && window.__sl) window.__sl.version = d.version;

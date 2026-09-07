@@ -38,7 +38,8 @@ and `.scss` files, compiled in-process) and Tailwind v4 (via its browser
 build); content collections (`getCollection`, `getEntry`, `render`); Markdown
 pages with `layout:`; MDX pages and MDX collection entries (compiled
 in-process with Astro's `satteri-mdxjs`, rendered with Astro's JSX runtime);
-endpoints (`src/pages/rss.xml.ts`, `src/pages/api/*.json.ts`: the `GET` handler
+endpoints (`src/pages/rss.xml.ts`, `src/pages/api/*.json.ts`, and the same in
+`.js`, `.mjs` or `.mts`: the `GET` handler
 runs in the browser and its `Response` is shown);
 dynamic routes with `getStaticPaths` and `paginate`;
 `import.meta.glob` (eager and lazy, `import:`/`query:` options); `import.meta.env`
@@ -262,7 +263,12 @@ sandbox-lite check [--json] examples/starter path/to/other-theme ...
 
 Compiles every source file the way the preview would and prints diagnostics
 plus a feature census: how many islands, `import.meta.glob` calls, Sass files,
-MDX pages, endpoints, integrations and npm imports a project uses. Run it over a
+MDX files, endpoints, integrations and npm imports a project uses. The endpoint
+count is the route table's own — `routes::build` filtered to `kind ==
+"endpoint"` — so it takes every extension the router takes (`.ts`, `.js`,
+`.mjs`, `.mts`) and skips `_`-prefixed files the way the preview does. The MDX
+count is deliberately wider than the route table: a collection entry is MDX the
+preview has to support too. Run it over a
 theme catalogue before deciding what the preview must support; the exit code is
 non-zero when any file fails to compile, so it doubles as a CI check.
 
@@ -315,7 +321,9 @@ curl -fsS -X POST --data-binary @acme.tar.gz localhost:4321/api/tenants/acme-cop
 ```
 
 `/metrics` is scrapeable as it is — no exporter, no client library. It carries
-`sandbox_lite_tenants`, `sandbox_lite_overlay_bytes`, `sandbox_lite_cache_*`,
+`sandbox_lite_tenants`, `sandbox_lite_tenants_failed` (tenant directories
+under `--data-dir` this daemon could not load; their ids are in `/api/stats`),
+`sandbox_lite_overlay_bytes`, `sandbox_lite_cache_*`,
 `sandbox_lite_sse_subscribers`, `sandbox_lite_rss_bytes`,
 `sandbox_lite_uptime_seconds`, one series per base, `sandbox_lite_sass_*`
 (running, runaway, timeouts, refusals), `sandbox_lite_compiles_*` (permits
@@ -401,14 +409,16 @@ the two configurations that work — is [`docs/multi-node.md`](docs/multi-node.m
 6. `experimental_AstroContainer.renderToResponse()` produces the HTML;
    `document.write` replaces the shell with it, so scripts, links and relative
    URLs behave like a normal page.
-7. A `.ts`/`.js` file under `src/pages` is an endpoint: the same call with
+7. A `.ts`, `.js`, `.mjs` or `.mts` file under `src/pages` is an endpoint: the same call with
    `routeType: "endpoint"` runs its `GET` (or `ALL`) handler with an
    `APIContext`. An HTML response is written as a page; anything else — XML,
    JSON, plain text — is shown with its status and content-type above the body.
 8. `live.js` holds an `EventSource`. Each event carries a `kind`: a `.css`,
    `.scss` or `.sass` write is `css`, an `.astro` write whose compiled JS is
    byte-identical to the last build changed only its `<style>` blocks and is
-   `style`, and everything else is `module`. On `css` and `style` the CSS
+   `style`, and everything else is `module`. It also carries `prev`, the
+   version it follows, and a client whose page rendered some other version has
+   missed a message and reloads rather than swapping. On `css` and `style` the CSS
    module is re-imported and the matching `<style data-sl=…>` swapped in place,
    leaving the page's DOM and JS state alone; a stylesheet the page only reaches
    through another sheet's `@import` has no block of its own, so the importing

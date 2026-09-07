@@ -121,6 +121,8 @@ mod tests {
         assert_eq!(of("src/pages/rss.xml.ts"), ("/rss.xml".into(), "endpoint", "^/rss\\.xml/?$".into()));
         assert_eq!(of("src/pages/api/products.json.ts"), ("/api/products.json".into(), "endpoint", "^/api/products\\.json/?$".into()));
         assert_eq!(of("src/pages/sitemap.js").0, "/sitemap");
+        assert_eq!(of("src/pages/feed.mjs"), ("/feed".into(), "endpoint", "^/feed/?$".into()));
+        assert_eq!(of("src/pages/atom.mts"), ("/atom".into(), "endpoint", "^/atom/?$".into()));
         assert_eq!(of("src/pages/api/index.ts").0, "/api");
         assert_eq!(of("src/pages/about.astro"), ("/about".into(), "astro", "^/about/?$".into()));
         assert!(route("src/pages/_helpers.ts").is_none());

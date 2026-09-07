@@ -553,7 +553,10 @@ pub async fn chat(AxState(st): AxState<State>, Path(id): Path<String>, headers: 
     let Some(key) = st.api_key.clone() else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "ANTHROPIC_API_KEY is not set on the daemon");
     };
-    let Some(t) = st.store.tenant(&id) else { return err(StatusCode::NOT_FOUND, "unknown tenant") };
+    let t = match st.store.resolve(&id) {
+        Ok(t) => t,
+        Err(e) => return super::api::no_tenant(&id, e),
+    };
     let conv = match &req.chat {
         Some(chat) => match st.chats.load(&t, chat) {
             Ok(Some(c)) => c,

@@ -15,6 +15,7 @@ button{cursor:pointer;background:#1d2230}button:hover{border-color:var(--accent)
 button:disabled{opacity:.5;cursor:default}
 .stat{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .stat b{color:var(--ok)}
+#failed{color:var(--err);border:1px solid var(--err);border-radius:6px;padding:3px 8px;cursor:help;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
 #left{grid-area:left;display:grid;grid-template-rows:auto minmax(120px,32%) 1fr;border-right:1px solid var(--line);min-height:0}
 #tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line);background:var(--panel)}
 #tabs button{border-radius:6px 6px 0 0;border-bottom:none;background:transparent}
@@ -54,6 +55,7 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
   <select id="tenant"></select>
   <button id="newTenant">+ tenant</button>
   <button id="delTenant" title="delete this tenant">✕</button>
+  <div id="failed" hidden></div>
   <div class="stat" id="stat">…</div>
 </header>
 <section id="left">
@@ -107,6 +109,13 @@ async function refreshStats() {
   const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
   const mods = (s.modules || []).reduce((a, m) => ({ requests: a.requests + sum(m.requests), compiles: a.compiles + m.compiles, seconds: a.seconds + m.compile_seconds }), { requests: 0, compiles: 0, seconds: 0 });
   $("#stat").innerHTML = `daemon RSS <b>${esc(fmtKB(s.rss_kb))}</b> · ${esc(s.tenants)} tenants · cache ${esc((s.cache.bytes / 1024).toFixed(0))} kB / ${esc(s.cache.entries)} · ${esc(mods.requests)} module requests · ${esc(mods.compiles)} compiles in ${esc(mods.seconds.toFixed(1))}s · astro ${esc(s.astro)} · chat ${esc(s.ai ? "on" : "off")}`;
+  // A tenant under --data-dir that would not load is not in the tenant list at all: without this
+  // the daemon reports itself healthy while a customer's site answers 500.
+  const failed = s.failed_tenants || [];
+  const banner = $("#failed");
+  banner.hidden = failed.length === 0;
+  banner.textContent = failed.length ? `⚠ ${failed.length} tenant${failed.length === 1 ? "" : "s"} failed to load: ${failed.map((f) => f.id).join(", ")}` : "";
+  banner.title = failed.map((f) => `${f.id}: ${f.error}`).join("\n");
   $("#chatSend").disabled = !s.ai || state.busy;
   if (!s.ai) $("#chatHint").textContent = "Chat is off: start the daemon with ANTHROPIC_API_KEY set to enable the built-in assistant. The file editor works without it.";
 }

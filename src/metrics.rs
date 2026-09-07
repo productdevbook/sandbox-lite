@@ -107,6 +107,7 @@ pub struct Snapshot {
     pub uptime_seconds: u64,
     pub rss_bytes: Option<u64>,
     pub tenants: u64,
+    pub tenants_failed: u64,
     pub overlay_bytes: u64,
     pub bases: Vec<BaseSize>,
     pub cache_entries: u64,
@@ -155,6 +156,13 @@ pub fn render(s: &Snapshot) -> String {
         scalar(&mut out, "sandbox_lite_rss_bytes", "gauge", "Resident set size of the daemon process.", rss);
     }
     scalar(&mut out, "sandbox_lite_tenants", "gauge", "Tenants currently loaded.", s.tenants);
+    scalar(
+        &mut out,
+        "sandbox_lite_tenants_failed",
+        "gauge",
+        "Tenants whose data directory is present and could not be loaded; each one is a site answering 500. Their ids are in /api/stats.",
+        s.tenants_failed,
+    );
     scalar(&mut out, "sandbox_lite_overlay_bytes", "gauge", "Bytes of tenant-edited files held across every tenant.", s.overlay_bytes);
 
     family(&mut out, "sandbox_lite_bases", "gauge", "Base projects loaded, one series per base.");
@@ -322,6 +330,7 @@ mod tests {
             uptime_seconds: 42,
             rss_bytes: Some(101_384_192),
             tenants: 2,
+            tenants_failed: 1,
             overlay_bytes: 4096,
             bases: vec![
                 BaseSize { name: "starter".into(), files: 12, bytes: 34567 },
@@ -360,6 +369,9 @@ sandbox_lite_rss_bytes 101384192
 # HELP sandbox_lite_tenants Tenants currently loaded.
 # TYPE sandbox_lite_tenants gauge
 sandbox_lite_tenants 2
+# HELP sandbox_lite_tenants_failed Tenants whose data directory is present and could not be loaded; each one is a site answering 500. Their ids are in /api/stats.
+# TYPE sandbox_lite_tenants_failed gauge
+sandbox_lite_tenants_failed 1
 # HELP sandbox_lite_overlay_bytes Bytes of tenant-edited files held across every tenant.
 # TYPE sandbox_lite_overlay_bytes gauge
 sandbox_lite_overlay_bytes 4096
@@ -528,6 +540,7 @@ sandbox_lite_compile_seconds_count{kind="url"} 0
             uptime_seconds: 0,
             rss_bytes: None,
             tenants: 0,
+            tenants_failed: 0,
             overlay_bytes: 0,
             bases: vec![],
             cache_entries: 0,
