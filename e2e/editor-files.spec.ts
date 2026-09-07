@@ -3,7 +3,7 @@ import { crc32, deflateSync } from 'node:zlib';
 import type { Page } from '@playwright/test';
 
 import { type Daemon, startDaemon } from './daemon';
-import { expect, test } from './fixtures';
+import { type BrowserLog, expect, test } from './fixtures';
 
 // A real 1×1 PNG, built here rather than committed: what the upload has to carry is bytes that
 // survive the round trip, and a fixture in the repository would only prove the file was read.
@@ -28,6 +28,15 @@ function pixelPng(): Buffer {
 
 const row = (path: string) => `#files [data-path="${path}"]`;
 
+// Every write reloads the framed preview, and that navigation cancels the frame's live-reload
+// stream and whatever the previous document still had in flight. A cancelled request is not a
+// failed one, so the run is clean once they are taken out; nothing else is tolerated.
+function expectCleanBesidesTheFrameReloading(log: BrowserLog): void {
+  const { consoleErrors, failedRequests } = log.take();
+  expect(consoleErrors, 'console errors').toEqual([]);
+  expect(failedRequests.filter((r) => !r.endsWith('net::ERR_ABORTED')), 'failed requests').toEqual([]);
+}
+
 // The picker is a hidden <input type=file> behind the upload button, which is how a person reaches it.
 async function pick(page: Page, file: { name: string; mimeType: string; buffer: Buffer }): Promise<void> {
   const chooser = page.waitForEvent('filechooser');
@@ -35,7 +44,7 @@ async function pick(page: Page, file: { name: string; mimeType: string; buffer: 
   await (await chooser).setFiles(file);
 }
 
-test('a file is created, previewed, renamed, uploaded to and deleted from the editor', async ({ daemon, page }) => {
+test('a file is created, previewed, renamed, uploaded to and deleted from the editor', async ({ daemon, page, browserLog }) => {
   const site = await daemon.tenant('editor-files', 'starter');
   await page.goto(`${daemon.api}/`);
   await page.selectOption('#tenant', 'editor-files');
@@ -101,9 +110,10 @@ test('a file is created, previewed, renamed, uploaded to and deleted from the ed
   // every step is in the list: what was created and renamed is gone, the base project is untouched
   await expect(page.locator(row('src/pages/index.astro'))).toBeVisible();
   await expect(page.locator(row('public/favicon.svg'))).toBeVisible();
+  expectCleanBesidesTheFrameReloading(browserLog);
 });
 
-test('a dropped file lands in the directory it was dropped on, and in public/ otherwise', async ({ daemon, page }) => {
+test('a dropped file lands in the directory it was dropped on, and in public/ otherwise', async ({ daemon, page, browserLog }) => {
   await daemon.tenant('editor-drop', 'starter');
   await page.goto(`${daemon.api}/`);
   await page.selectOption('#tenant', 'editor-drop');
@@ -129,9 +139,10 @@ test('a dropped file lands in the directory it was dropped on, and in public/ ot
   await drop('#files', 'dropped.txt', 'dropped on the list itself\n');
   await expect(page.locator(row('public/dropped.txt'))).toBeVisible();
   await expect(page.locator('#fileMsg')).toHaveText('uploaded public/dropped.txt');
+  expectCleanBesidesTheFrameReloading(browserLog);
 });
 
-test('a file named like markup is text in the list, in the dialog and in the message', async ({ daemon, page }) => {
+test('a file named like markup is text in the list, in the dialog and in the message', async ({ daemon, page, browserLog }) => {
   await daemon.tenant('editor-hostile', 'starter');
   await page.goto(`${daemon.api}/`);
   await page.selectOption('#tenant', 'editor-hostile');
@@ -150,6 +161,7 @@ test('a file named like markup is text in the list, in the dialog and in the mes
   await page.click('#delDlg button[value="ok"]');
   await expect(page.locator(row(hostile))).toHaveCount(0);
   await expect(page.locator('#fileMsg')).toHaveText(`deleted ${hostile}`);
+  expectCleanBesidesTheFrameReloading(browserLog);
 });
 
 test("a path the daemon refuses is reported in the daemon's own words", async ({ daemon, page, browserLog }) => {
