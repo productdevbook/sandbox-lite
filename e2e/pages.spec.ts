@@ -125,6 +125,10 @@ test.describe('vue', () => {
     await expect(page.locator('.counter span')).toHaveText('Visitors today');
     // The SFC's <style> block reached the document through globalThis.__sl_css.
     await expect(page.locator('.counter')).toHaveCSS('border-radius', '14px');
+    // Issue #52: a <script setup generic="…"> component, rendered with no client: directive. Its
+    // props come from a type, which only survives because the daemon strips after compileScript.
+    await expect(page.locator('.recent h2')).toHaveText('Recent visits');
+    await expect(page.locator('.recent li')).toHaveText(['Design that ships', 'Writing journal posts in MDX', 'Why we render previews in the browser']);
   });
 });
 

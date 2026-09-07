@@ -19,6 +19,11 @@ const SHELL_JS: &str = include_str!("../../assets/shell.js");
 const LIVE_JS: &str = include_str!("../../assets/live.js");
 const VIEW_TRANSITIONS_CSS: &str = include_str!("../../assets/viewtransitions.css");
 
+/// What `POST /__sl/strip-ts` will read at all. The compile cap inside `Engine::strip_ts` is a
+/// fraction of this and answers with a diagnostic; this one only keeps a body the daemon has no use
+/// for from being buffered in the first place.
+pub const STRIP_TS_BODY_CEILING: usize = 4 << 20;
+
 pub fn asset_version() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| format!("{:x}", xxh3_64(ASTRO_JS.as_bytes()) ^ xxh3_64(SHELL_JS.as_bytes()) ^ xxh3_64(LIVE_JS.as_bytes())))
@@ -162,6 +167,36 @@ pub async fn content(AxState(st): AxState<State>, Extension(id): Extension<Tenan
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
     };
     ([(header::CACHE_CONTROL, "no-cache")], Json(out)).into_response()
+}
+
+/// Issue #52: `@vue/compiler-sfc` builds a component's runtime props out of the types in
+/// `defineProps<Props>()`, so a `.vue` file reaches the browser with its TypeScript intact and the
+/// loader posts the script it generated here to have the types taken off. oxc stays the only
+/// TypeScript implementation in the project, and the browser downloads nothing extra for it.
+///
+/// It compiles what the caller sends, so it is bounded the way every other compile is: the preview
+/// token like everything under `/__sl/`, a body ceiling before anything is buffered, and inside
+/// `Engine::strip_ts` the source cap, the nesting cap, a gate permit and the compile deadline.
+pub async fn strip_ts(
+    AxState(st): AxState<State>,
+    Extension(id): Extension<TenantId>,
+    RawQuery(query): RawQuery,
+    body: String,
+) -> Response {
+    // An unknown tenant buys no compiles, even holding a token for one.
+    if let Err(r) = tenant(&st, &id) {
+        return r;
+    }
+    let named = query.unwrap_or_default().split('&').find_map(|p| p.strip_prefix("path=").map(percent_decode));
+    let Some(path) = named.as_deref().and_then(clean_path).filter(|p| !is_private_path(p)) else {
+        return err(StatusCode::BAD_REQUEST, "strip-ts needs ?path=<the .vue file this came from>");
+    };
+    let st2 = st.clone();
+    match tokio::task::spawn_blocking(move || st2.engine.strip_ts(&path, &body)).await {
+        Ok(Ok(code)) => text(code, JS, "no-store"),
+        Ok(Err(e)) => build_error(e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 fn env_map(t: &Tenant) -> Result<Map<String, Value>, String> {
@@ -385,6 +420,46 @@ mod tests {
         let (status, body) = collection(&starter_app(&[]), "posts").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body["entries"].as_array().unwrap().is_empty());
+    }
+
+    async fn strip_ts(app: &axum::Router, query: &str, script: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/__sl/strip-ts{query}"))
+            .header("host", "acme.localhost")
+            .body(Body::from(script.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Issue #52: what `@vue/compiler-sfc` generates in the browser comes back here for its types.
+    #[tokio::test]
+    async fn a_compiled_script_comes_back_as_javascript() {
+        let app = starter_app(&[]);
+        let script = "const props: { label: string } = __props;\nexport default { setup(__props: any) { return props; } };\n";
+        let (status, body) = strip_ts(&app, "?path=src/components/Counter.vue", script).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains(": any"), "{body}");
+        assert!(body.contains("__props"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_script_that_does_not_parse_is_answered_with_the_diagnostic() {
+        let (status, body) = strip_ts(&starter_app(&[]), "?path=src/components/Counter.vue", "const n: number = ;\n").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["diagnostics"][0]["file"], "src/components/Counter.vue");
+    }
+
+    #[tokio::test]
+    async fn strip_ts_needs_a_path_to_name_in_its_diagnostics() {
+        for query in ["", "?path=", "?path=../escape.vue", "?path=.env"] {
+            let (status, _) = strip_ts(&starter_app(&[]), query, "const n = 1;\n").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
     }
 
     /// Issue #48: this answered 200 with `{"entries": []}`, and the page then rendered as a tenant

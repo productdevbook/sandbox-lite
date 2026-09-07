@@ -1,5 +1,5 @@
 import { expect, test } from './fixtures';
-import { type Daemon, rawGet, startDaemon } from './daemon';
+import { type Daemon, rawGet, rawRequest, startDaemon } from './daemon';
 
 // --preview-secret and no --cookie-samesite override: the editor is on 127.0.0.1 and the preview
 // on <id>.localhost, so the frame really is cross-site and a Lax cookie would never reach it.
@@ -54,6 +54,16 @@ test.describe('preview token', () => {
     expect(await get(`/?sl_token=${'0'.repeat(32)}`)).toBe(403);
     // A client with no cookie jar still gets in on the token alone.
     expect(await get(`/__sl/routes.json?sl_token=${token}`)).toBe(200);
+
+    // Issue #52: the one route that compiles what the caller sends is behind the same token.
+    const strip = (query: string) =>
+      rawRequest(daemon.port, 'framed.localhost', `/__sl/strip-ts?path=src/components/C.vue${query}`, 'POST', 'const n: number = 1;\n', {
+        'content-type': 'text/plain',
+        ...sameOrigin,
+      });
+    expect(await strip('')).toBe(403);
+    expect(await strip(`&sl_token=${'0'.repeat(32)}`)).toBe(403);
+    expect(await strip(`&sl_token=${token}`)).toBe(200);
   });
 
   test('a top-level navigation with the token still lands on the clean URL', async ({ browser }) => {

@@ -138,7 +138,8 @@ fn nesting_depth(source: &[u8]) -> usize {
 }
 
 /// Extensions whose module build hands the source to one of those parsers — `.vue` and `.svelte`
-/// among them, since `sfc::strip_types` runs oxc over their `<script lang="ts">` blocks. `md` is
+/// among them, since `sfc::check_vue` and `sfc::strip_types` run oxc over their
+/// `<script lang="ts">` blocks. `md` is
 /// out: markdown never overflowed at any size the cap allows, and long articles are legitimate.
 /// `css` and `json` are out too — they are embedded in a JS module as a string, never parsed.
 fn parses_source(ext: &str) -> bool {
@@ -320,14 +321,14 @@ struct Gate {
 }
 
 /// A compile that is still running, and whether the request that started it has given up on it.
-struct Flight {
-    done: Mutex<Option<Outcome>>,
+struct Flight<T> {
+    done: Mutex<Option<Outcome<T>>>,
     ready: Condvar,
     state: AtomicU8,
 }
 
-/// What a compile thread hands back: the build, or the panic payload to resume on the waiter.
-type Outcome = Result<Result<Built, BuildError>, Box<dyn Any + Send>>;
+/// What a compile thread hands back: what it built, or the panic payload to resume on the waiter.
+type Outcome<T> = Result<Result<T, BuildError>, Box<dyn Any + Send>>;
 
 const RUNNING: u8 = 0;
 const RUNAWAY: u8 = 1;
@@ -722,27 +723,36 @@ impl Engine {
         Ok(())
     }
 
+    fn bounded(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, data: Arc<[u8]>, site: Option<String>) -> Result<Built, BuildError> {
+        let (engine, t, owned) = (self.clone(), tenant.clone(), path.to_string());
+        self.deadlined(path, move || engine.compile(&t, &owned, kind, &data, site.as_deref()))
+    }
+
     /// One compile, on a thread of its own, with a wall-clock deadline. `astro_codegen`, oxc and
     /// satteri-mdxjs are synchronous and offer no cancellation, so a compile that overruns is
     /// abandoned rather than joined: the request is answered with a diagnostic, the gate permit goes
     /// back to the pool the moment this returns, and the thread is counted under `runaway` until it
-    /// ends on its own. The thread outlives the request, so everything it may touch is owned — an
-    /// `Engine` handle, the tenant, the source bytes.
+    /// ends on its own. The thread outlives the request, so the work owns everything it may touch —
+    /// an `Engine` handle, the tenant, the source bytes.
     ///
     /// A `?type=style` or `?type=script` build asks for its module from inside its own compile. That
     /// inner build runs here on the stack and under the deadline its parent already has, which is
     /// what keeps one request to one thread and one permit.
-    fn bounded(&self, tenant: &Arc<Tenant>, path: &str, kind: Kind, data: Arc<[u8]>, site: Option<String>) -> Result<Built, BuildError> {
+    fn deadlined<T: Send + 'static>(
+        &self,
+        path: &str,
+        work: impl FnOnce() -> Result<T, BuildError> + Send + 'static,
+    ) -> Result<T, BuildError> {
         if ON_PARSER_STACK.get() {
             let _compiling = Compiling::enter();
-            return self.compile(tenant, path, kind, &data, site.as_deref());
+            return work();
         }
         let flight = Arc::new(Flight { done: Mutex::new(None), ready: Condvar::new(), state: AtomicU8::new(RUNNING) });
-        let (engine, t, owned, mine) = (self.clone(), tenant.clone(), path.to_string(), flight.clone());
+        let (engine, mine) = (self.clone(), flight.clone());
         let spawned = std::thread::Builder::new().name("compile".into()).stack_size(self.parser_stack_bytes()).spawn(move || {
             ON_PARSER_STACK.set(true);
             let _compiling = Compiling::enter();
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compile(&t, &owned, kind, &data, site.as_deref())));
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
             *mine.done.lock().unwrap() = Some(out);
             mine.ready.notify_all();
             engine.gate.settled(&mine.state);
@@ -872,7 +882,12 @@ impl Engine {
                         })?;
                         Ok(Built::js(css::to_module(path, &compiled, dirname(path))))
                     }
-                    "vue" | "svelte" => Ok(Built::js(sfc_loader(&ext, path, &sfc::strip_types(&ext, path, &text())?))),
+                    "vue" => {
+                        let source = text();
+                        sfc::check_vue(path, &source)?;
+                        Ok(Built::js(sfc_loader("vue", path, &source)))
+                    }
+                    "svelte" => Ok(Built::js(sfc_loader("svelte", path, &sfc::strip_types(path, &text())?))),
                     "json" => Ok(Built::js(format!("export default JSON.parse({});\n", json_str(&text())))),
                     "md" => Ok(Built::scanned(markdown::page_module(path, &text())?)),
                     "mdx" => Ok(Built::scanned(mdx::page_module(path, &text())?)),
@@ -925,7 +940,40 @@ impl Engine {
         out.push_str(&built.body[last..]);
         Ok((out, built.content_type))
     }
+
+    /// TypeScript out of a script `@vue/compiler-sfc` generated in the browser (issue #52).
+    ///
+    /// The compiler reads `defineProps<Props>()` and the other type-driven macros out of the source
+    /// to build the runtime declaration, so a `.vue` file reaches it with its types intact and what
+    /// comes back here is its output. It is JavaScript the daemon never asked for, so it is held to
+    /// what every compile is held to: a size cap, the nesting cap, a gate permit and the compile
+    /// deadline.
+    pub fn strip_ts(&self, path: &str, source: &str) -> Result<String, BuildError> {
+        let max = self.cfg.max_source_bytes.saturating_mul(COMPILED_SCRIPT_GROWTH);
+        if source.len() > max {
+            let text = format!("compiled script too large to strip: {} KiB, limit {} KiB", source.len() / 1024, max / 1024);
+            return Err(refused(path, text, "raise --max-source-kb, or split the component"));
+        }
+        let depth = nesting_depth(source.as_bytes());
+        if depth > MAX_NESTING_DEPTH {
+            let text = format!("compiled script nests {depth} deep, limit {MAX_NESTING_DEPTH}");
+            return Err(refused(path, text, "unbalanced brackets are the usual cause"));
+        }
+        let _permit = self.gate.enter().map_err(|e| BuildError::busy(format!("{path}: {e}")))?;
+        let started = Instant::now();
+        let (owned, code) = (path.to_string(), source.to_string());
+        let out = self.deadlined(path, move || js::transform_sfc_script(&owned, &code));
+        self.metrics.compiled(Kind::Module, started.elapsed());
+        out
+    }
 }
+
+/// How much bigger than `--max-source-kb` a compiled script may be. `compileScript` emits the
+/// script block plus the render function it inlines from the template, so it outgrows the block it
+/// came from — 4.3x and 12.5x for the two components in `examples/vue` — but the cap it is measured
+/// against is the whole file's, template and styles included, and against that the same two measure
+/// 1.3x and 1.9x. Eight leaves room for a component that is nearly all script.
+const COMPILED_SCRIPT_GROWTH: usize = 8;
 
 /// Everything a component renders except its CSS: the module body, and the hoisted scripts, which
 /// the body only names by index. Two builds with the same fingerprint differ in their `<style>`
@@ -945,8 +993,10 @@ fn module_fingerprint(built: &Built) -> u128 {
 }
 
 /// No Rust compiler exists for `.vue` or `.svelte`, so the file is served as a module that
-/// compiles its source in the browser and re-exports the component. The source it carries has
-/// been through `sfc::strip_types`, so its `<script>` blocks are JavaScript.
+/// compiles its source in the browser and re-exports the component. A `.svelte` file's source has
+/// been through `sfc::strip_types`, so its `<script>` blocks are JavaScript; a `.vue` file's has
+/// not, because `@vue/compiler-sfc` needs the types — the loader posts the script it generates to
+/// `/__sl/strip-ts` instead.
 fn sfc_loader(ext: &str, path: &str, source: &str) -> String {
     format!(
         "import {{ compileComponent }} from \"/__sl/shim/{ext}-loader.js\";\nexport default await compileComponent({}, {}, import.meta.url);\n",
@@ -1148,6 +1198,48 @@ mod tests {
         assert!(source.chars().count() < CAP && source.len() > CAP);
         let t = tenant_with("src/wide.ts", &source);
         assert!(engine_capped(CAP).build(&t, "src/wide.ts", Kind::Module).is_err());
+    }
+
+    const TYPED_SFC: &str = "<script setup lang=\"ts\">\ninterface Props { label: string }\nconst props = defineProps<Props>();\n</script>\n\n<template><p>{{ props.label }}</p></template>\n";
+
+    /// Issue #52: the type is what `@vue/compiler-sfc` builds the runtime props out of, so the
+    /// module the browser loads carries the file as written — `lang="ts"` and all.
+    #[test]
+    fn a_vue_module_carries_its_typescript_to_the_browser() {
+        let t = tenant_with("src/components/Counter.vue", TYPED_SFC);
+        let built = engine().build(&t, "src/components/Counter.vue", Kind::Module).unwrap();
+        assert!(built.body.contains("vue-loader.js"), "{}", built.body);
+        assert!(built.body.contains("defineProps<Props>()"), "{}", built.body);
+        assert!(built.body.contains(r#"lang=\"ts\""#), "{}", built.body);
+    }
+
+    /// A `.svelte` file goes the other way: `svelte/compiler` cannot parse TypeScript at all.
+    #[test]
+    fn a_svelte_module_carries_javascript() {
+        let source = "<script lang=\"ts\">\n  let n: number = 1;\n</script>\n\n<p>{n}</p>\n";
+        let t = tenant_with("src/components/C.svelte", source);
+        let built = engine().build(&t, "src/components/C.svelte", Kind::Module).unwrap();
+        assert!(built.body.contains("let n = 1"), "{}", built.body);
+        assert!(!built.body.contains("lang="), "{}", built.body);
+    }
+
+    #[test]
+    fn strip_ts_removes_the_types_from_a_compiled_script() {
+        let script = "const props: { label: string } = __props;\nexport default { setup(__props: any) { return () => props.label; } };\n";
+        let out = engine().strip_ts("src/components/Counter.vue", script).unwrap();
+        assert!(!out.contains(": any"), "{out}");
+        assert!(!out.contains("{ label: string }"), "{out}");
+        assert!(out.contains("__props"), "{out}");
+    }
+
+    #[test]
+    fn strip_ts_refuses_a_script_past_the_cap_and_one_that_does_not_parse() {
+        let engine = engine_capped(CAP);
+        let big = "x".repeat(CAP * COMPILED_SCRIPT_GROWTH + 1);
+        let e = engine.strip_ts("src/components/C.vue", &big).unwrap_err();
+        assert!(e.message.contains("too large"), "{}", e.message);
+        let e = engine.strip_ts("src/components/C.vue", "const n: number = ;\n").unwrap_err();
+        assert_eq!(e.diagnostics[0].file, "src/components/C.vue");
     }
 
     /// Issue #25: on a default 2 MiB thread every one of these aborts the process. Bracket and

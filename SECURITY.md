@@ -123,8 +123,8 @@ container, or a network namespace of its own.
   daemon, since the release profile sets `panic = "abort"`. The three apply to
   the extensions those parsers read (`parses_source`, `src/transform/mod.rs`):
   `.astro`, `.ts`, `.tsx`, `.jsx`, `.mts`, `.js`, `.mjs`, `.mdx`, `.scss`,
-  `.sass`, `.vue` and `.svelte` — the last two because `sfc::strip_types` runs
-  oxc over their `<script lang="ts">` blocks before the browser sees them.
+  `.sass`, `.vue` and `.svelte` — the last two because `sfc::check_vue` and
+  `sfc::strip_types` run oxc over their `<script lang="ts">` blocks.
   - **Size** is capped by `--max-source-kb` (default 64 KiB).
   - **Nesting** is capped at 2000 (`MAX_NESTING_DEPTH`) — the deepest run of
     unclosed `(`, `[`, `{` or of markdown blockquote markers, counted on the
@@ -150,6 +150,16 @@ container, or a network namespace of its own.
   - Sass partials, which grass reads itself and compiles on its own thread
     (see below) rather than on the one `Engine::build` reserved. Each is
     refused past the nesting cap, and that thread gets a 64 MiB stack.
+- **`POST /__sl/strip-ts`** is the one route that compiles bytes the caller
+  sends rather than a file the tenant holds: `@vue/compiler-sfc` runs in the
+  browser and posts the script it generated back for its TypeScript to be
+  removed (issue #52). It is behind the preview token like everything under
+  `/__sl/`, refuses a body over 4 MiB before reading it, and inside
+  `Engine::strip_ts` is held to the nesting cap, a size cap of
+  `--max-source-kb` times eight (a compiled script outgrows the file it came
+  from), a `--max-compiles` permit and the `--compile-timeout-ms` deadline —
+  the same bounds a module build gets. What it does not have is a bound on how
+  often it may be called; see "Limits that do not exist".
 - **Concurrent compiles** are capped by `--max-compiles` (default: one per
   core). Each compile holds a stack reservation of its own, so without the cap
   the only ceiling on how many exist together is tokio's blocking pool of 512

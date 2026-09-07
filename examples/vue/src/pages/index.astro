@@ -1,9 +1,17 @@
 ---
 import Layout from "../layouts/Layout.astro";
 import Counter from "../components/Counter.vue";
+import Recent from "../components/Recent.vue";
+
+const visits = [
+  { id: 1, label: "Design that ships" },
+  { id: 2, label: "Writing journal posts in MDX" },
+  { id: 3, label: "Why we render previews in the browser" },
+];
 ---
 <Layout title="Vue islands">
   <h1>Vue in the preview</h1>
-  <p class="lede">The single-file component below is compiled by <code>@vue/compiler-sfc</code> in your browser, rendered to HTML with <code>@vue/server-renderer</code>, then hydrated with <code>client:load</code>.</p>
+  <p class="lede">The single-file component below is compiled by <code>@vue/compiler-sfc</code> in your browser, rendered to HTML with <code>@vue/server-renderer</code>, then hydrated with <code>client:load</code>. Its props are declared as a type — <code>defineProps&lt;Props&gt;()</code> — and the compiled script goes back to the daemon to have its TypeScript removed.</p>
   <Counter client:load label="Visitors today" start={41} />
+  <Recent title="Recent visits" items={visits} />
 </Layout>
