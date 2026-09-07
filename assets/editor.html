@@ -20,10 +20,19 @@ button:disabled{opacity:.5;cursor:default}
 #tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line);background:var(--panel)}
 #tabs button{border-radius:6px 6px 0 0;border-bottom:none;background:transparent}
 #tabs button.active{background:var(--bg);border-color:var(--line)}
-#files{overflow:auto;padding:6px 0;border-bottom:1px solid var(--line)}
-#files div{padding:2px 10px;cursor:pointer;white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
-#files div:hover{background:#1b2030;color:var(--text)}#files div.active{background:#22293a;color:var(--text)}
-#files div.modified::after{content:" ●";color:var(--warn)}
+#filePane{display:flex;flex-direction:column;min-height:0;border-bottom:1px solid var(--line)}
+#fileBar{display:flex;gap:4px;padding:6px 8px;border-bottom:1px solid var(--line);background:var(--panel)}
+#fileBar button{padding:3px 7px}
+#fileMsg{padding:5px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line);white-space:pre-wrap;word-break:break-word}
+#fileMsg.bad{color:var(--err)}
+#files{overflow:auto;padding:6px 0;flex:1}
+#files summary{padding:3px 10px;cursor:pointer;color:var(--muted);font:600 11px/1.4 ui-monospace,Menlo,monospace;letter-spacing:.3px;position:sticky;top:0;background:var(--bg);user-select:none}
+#files summary:hover{color:var(--text)}
+#files summary .count{color:#4a5163;margin-left:6px;font-weight:400}
+#files div[data-path]{padding:2px 10px 2px 24px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
+#files div[data-path]:hover{background:#1b2030;color:var(--text)}#files div[data-path].active{background:#22293a;color:var(--text)}
+#files div[data-path].modified::after{content:" ●";color:var(--warn)}
+#files.drop{outline:2px dashed var(--accent);outline-offset:-4px}
 #editorWrap{display:flex;flex-direction:column;min-height:0}
 #editorWrap .bar{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--line);color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:12px}
 #editor{flex:1;resize:none;border:none;border-radius:0;background:#0b0d13;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;tab-size:2;white-space:pre;overflow:auto;outline:none}
@@ -47,6 +56,10 @@ iframe{width:100%;height:100%;border:none;background:#fff}
 .hidden{display:none!important}
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:16px;min-width:320px}
 dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog .note{color:var(--muted);font-size:12px;max-width:46ch}
+dialog code{font-family:ui-monospace,Menlo,monospace;color:var(--text);word-break:break-all}
+dialog .row{display:flex;gap:6px;justify-content:flex-end}
+dialog label input{width:100%}
 </style>
 </head>
 <body>
@@ -60,7 +73,17 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
 </header>
 <section id="left">
   <div id="tabs"><button class="active" data-tab="files">Files</button><button data-tab="chat">Chat</button></div>
-  <div id="files"></div>
+  <div id="filePane">
+    <div id="fileBar">
+      <button id="newFile">+ file</button>
+      <button id="uploadFile" title="upload into public/, or drop files on the list">↑ upload</button>
+      <button id="renameFile" disabled>rename</button>
+      <button id="deleteFile" disabled>delete</button>
+      <input type="file" id="picker" multiple hidden>
+    </div>
+    <div id="fileMsg" hidden></div>
+    <div id="files"></div>
+  </div>
   <div id="editorWrap">
     <div class="bar"><span id="fileName">no file</span><span id="saveState" style="margin-left:auto"></span></div>
     <textarea id="editor" spellcheck="false" placeholder="Pick a file on the left. Edits are saved as you type; the preview reloads itself."></textarea>
@@ -75,10 +98,12 @@ dialog form{display:grid;gap:8px}dialog::backdrop{background:rgba(0,0,0,.5)}
   <div class="bar"><span style="color:var(--muted)">preview</span><input id="path" value="/"><button id="go">Go</button><button id="reload">↻</button><button id="openTab">open ↗</button></div>
   <div id="frameWrap"><div id="empty"><div>No tenant yet.</div><button class="primary" id="emptyNew">Create one from a base project</button></div><iframe id="frame" class="hidden"></iframe></div>
 </section>
-<dialog id="dlg"><form method="dialog"><b>New tenant</b><label>id <input id="dlgId" placeholder="acme" pattern="[a-z0-9][a-z0-9-]*" required></label><label>base <select id="dlgBase"></select></label><div style="display:flex;gap:6px;justify-content:flex-end"><button value="cancel">Cancel</button><button value="ok" class="primary">Create</button></div></form></dialog>
+<dialog id="dlg"><form method="dialog"><b>New tenant</b><label>id <input id="dlgId" placeholder="acme" pattern="[a-z0-9][a-z0-9-]*" required></label><label>base <select id="dlgBase"></select></label><div class="row"><button value="cancel">Cancel</button><button value="ok" class="primary">Create</button></div></form></dialog>
+<dialog id="pathDlg"><form method="dialog"><b id="pathDlgTitle">New file</b><label>path <input id="pathDlgInput" required autocomplete="off" spellcheck="false"></label><div class="note" id="pathDlgNote"></div><div class="row"><button value="cancel" formnovalidate>Cancel</button><button value="ok" class="primary" id="pathDlgOk">Create</button></div></form></dialog>
+<dialog id="delDlg"><form method="dialog"><b>Delete file</b><div class="note">Delete <code id="delDlgPath"></code>? The preview stops serving it at once, and nothing here brings it back.</div><div class="row"><button value="cancel">Cancel</button><button value="ok" class="primary">Delete</button></div></form></dialog>
 <script>
 const $ = (s) => document.querySelector(s);
-const state = { stats: null, tenants: [], tenant: null, file: null, dirty: false, es: null, chatId: null, busy: false, saving: null };
+const state = { stats: null, tenants: [], tenant: null, file: null, files: [], collapsed: new Set(), dirty: false, es: null, chatId: null, busy: false, saving: null };
 const BINARY = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|pdf|wasm|zip)$/i;
 const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 const esc = (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
@@ -86,15 +111,27 @@ let apiToken = "";
 try { apiToken = localStorage.getItem("sl_api_token") || ""; } catch {}
 const authHeaders = () => (apiToken ? { authorization: `Bearer ${apiToken}` } : {});
 const withToken = (url) => (apiToken ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(apiToken) : url);
+// The daemon says why it refused — a bad path, the tenant quota, a file it could not write — and
+// that sentence is the only thing worth showing; `r.statusText` is what is left when it says nothing.
+const failure = async (r) => {
+  let m = r.statusText || `HTTP ${r.status}`;
+  try { const e = (await r.json()).error; if (e) m = typeof e === "string" ? e : JSON.stringify(e); } catch {}
+  return new Error(m);
+};
 const api = async (method, url, body, raw) => {
   const r = await fetch(url, { method, headers: { ...authHeaders(), ...(body !== undefined && !raw ? { "content-type": "application/json" } : {}) }, body: body === undefined ? undefined : raw ? body : JSON.stringify(body) });
   if (r.status === 401) {
     const t = prompt("This daemon requires an API token (--api-token):", apiToken);
     if (t) { apiToken = t; try { localStorage.setItem("sl_api_token", t); } catch {} return api(method, url, body, raw); }
   }
-  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).error || m; } catch {} throw new Error(m); }
+  if (!r.ok) throw await failure(r);
   const ct = r.headers.get("content-type") || "";
   return ct.includes("json") ? r.json() : r.text();
+};
+const apiBlob = async (url) => {
+  const r = await fetch(url, { headers: authHeaders() });
+  if (!r.ok) throw await failure(r);
+  return r.blob();
 };
 const previewUrl = (id, path = "/") => {
   const t = state.tenants.find((x) => x.id === id);
@@ -126,13 +163,13 @@ async function loadTenants(selectId) {
   sel.replaceChildren(...state.tenants.map((t) => new Option(`${t.id} (${t.base})`, t.id)));
   const id = selectId || state.tenant || (state.tenants[0] && state.tenants[0].id);
   if (id && state.tenants.some((t) => t.id === id)) { sel.value = id; await selectTenant(id); }
-  else { state.tenant = null; $("#frame").classList.add("hidden"); $("#empty").classList.remove("hidden"); $("#files").replaceChildren(); }
+  else { state.tenant = null; state.file = null; state.files = []; $("#frame").classList.add("hidden"); $("#empty").classList.remove("hidden"); $("#files").replaceChildren(); fileButtons(); }
 }
 
 async function selectTenant(id) {
   if (state.tenant === id) return;
-  state.tenant = id; state.file = null; state.chatId = null; clearMsgs();
-  $("#editor").value = ""; $("#fileName").textContent = "no file";
+  state.tenant = id; state.file = null; state.files = []; state.chatId = null; state.collapsed.clear(); clearMsgs(); clearNote();
+  $("#editor").value = ""; $("#editor").disabled = false; $("#fileName").textContent = "no file"; fileButtons();
   $("#empty").classList.add("hidden"); $("#frame").classList.remove("hidden");
   $("#frame").src = previewUrl(id, $("#path").value || "/");
   if (state.es) state.es.close();
@@ -147,26 +184,62 @@ async function selectTenant(id) {
   await loadChats();
 }
 
+const dirOf = (path) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+
+// Grouped by directory: `examples/starter` is 28 files and a flat list of them is a wall of
+// identical prefixes. Every label is set as text, never as markup — a file may be named anything.
+function renderFiles(files) {
+  const groups = new Map();
+  for (const f of files) {
+    const dir = dirOf(f.path);
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push(f);
+  }
+  const boxes = [];
+  for (const [dir, entries] of groups) {
+    const box = document.createElement("details");
+    box.dataset.dir = dir;
+    box.open = !state.collapsed.has(dir);
+    const head = document.createElement("summary");
+    head.textContent = dir === "" ? "/" : dir + "/";
+    const count = document.createElement("span");
+    count.className = "count"; count.textContent = entries.length;
+    head.appendChild(count);
+    box.appendChild(head);
+    for (const f of entries) {
+      const d = document.createElement("div");
+      d.dataset.path = f.path;
+      d.textContent = dir === "" ? f.path : f.path.slice(dir.length + 1);
+      d.title = `${f.path} · ${f.size} bytes`;
+      if (f.modified) d.classList.add("modified");
+      if (f.path === state.file) d.classList.add("active");
+      box.appendChild(d);
+    }
+    boxes.push(box);
+  }
+  $("#files").replaceChildren(...boxes);
+}
+
 async function loadFiles() {
   if (!state.tenant) return;
   const { files } = await api("GET", `/api/t/${state.tenant}/files`);
-  $("#files").replaceChildren(...files.map((f) => {
-    const d = document.createElement("div");
-    d.dataset.path = f.path; d.textContent = f.path; d.title = `${f.size} bytes`;
-    if (f.modified) d.classList.add("modified");
-    if (f.path === state.file) d.classList.add("active");
-    return d;
-  }));
+  state.files = files;
+  renderFiles(files);
+  fileButtons();
 }
 
 async function openFile(path, silent) {
   if (state.dirty && !silent && !confirm("Discard unsaved edits?")) return;
   state.file = path; state.dirty = false;
-  $("#files").querySelectorAll("div").forEach((d) => d.classList.toggle("active", d.dataset.path === path));
+  state.collapsed.delete(dirOf(path));
+  const group = $("#files").querySelector(`[data-dir="${CSS.escape(dirOf(path))}"]`);
+  if (group) group.open = true;
+  $("#files").querySelectorAll("[data-path]").forEach((d) => d.classList.toggle("active", d.dataset.path === path));
   $("#fileName").textContent = path;
+  fileButtons();
   if (BINARY.test(path)) { $("#editor").value = "(binary file)"; $("#editor").disabled = true; return; }
   $("#editor").disabled = false;
-  $("#editor").value = await api("GET", `/api/t/${state.tenant}/file/${encPath(path)}`);
+  $("#editor").value = await api("GET", fileUrl(path));
   $("#saveState").textContent = "";
 }
 
@@ -175,7 +248,7 @@ async function save() {
   if (!state.file || !state.tenant) return;
   const path = state.file, body = $("#editor").value;
   $("#saveState").textContent = "saving…";
-  try { await api("PUT", `/api/t/${state.tenant}/file/${encPath(path)}`, body, true); state.dirty = false; $("#saveState").textContent = "saved"; }
+  try { await putFile(path, body); state.dirty = false; $("#saveState").textContent = "saved"; }
   catch (e) { $("#saveState").textContent = "save failed: " + e.message; }
 }
 $("#editor").addEventListener("input", () => { state.dirty = true; $("#saveState").textContent = "…"; clearTimeout(saveTimer); saveTimer = setTimeout(save, 350); });
@@ -184,12 +257,175 @@ $("#editor").addEventListener("keydown", (e) => {
   if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("  ", s, t.selectionEnd, "end"); t.dispatchEvent(new Event("input")); }
 });
 $("#files").addEventListener("click", (e) => { const d = e.target.closest("[data-path]"); if (d) openFile(d.dataset.path); });
+// `toggle` does not bubble, so the listener has to catch it on the way down.
+$("#files").addEventListener("toggle", (e) => {
+  const box = e.target;
+  if (box.dataset.dir === undefined) return;
+  if (box.open) state.collapsed.delete(box.dataset.dir); else state.collapsed.add(box.dataset.dir);
+}, true);
+
+function note(text, bad) {
+  const m = $("#fileMsg");
+  m.textContent = text; m.hidden = !text; m.classList.toggle("bad", !!bad);
+}
+const clearNote = () => note("");
+const fail = (text) => note(text, true);
+function fileButtons() {
+  const on = !!state.tenant;
+  $("#newFile").disabled = !on; $("#uploadFile").disabled = !on;
+  $("#renameFile").disabled = !on || !state.file; $("#deleteFile").disabled = !on || !state.file;
+}
+
+const ask = (dlg) => new Promise((resolve) => {
+  dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+  dlg.showModal();
+});
+
+async function askPath({ title, note: hint, value, ok }) {
+  $("#pathDlgTitle").textContent = title;
+  $("#pathDlgNote").textContent = hint;
+  $("#pathDlgOk").textContent = ok;
+  const input = $("#pathDlgInput");
+  input.value = value;
+  if (!(await ask($("#pathDlg")))) return null;
+  return input.value.trim();
+}
+
+// A path is sent as it was typed: the URL parser resolves "." and ".." away before fetch sends
+// anything, so a path the daemon would refuse would otherwise land on a different file entirely.
+function fileUrl(path) {
+  const url = `/api/t/${state.tenant}/file/${encPath(path)}`;
+  if (new URL(url, location.href).pathname !== url) {
+    throw new Error(`the browser rewrites '${path}' into another path before it can be sent, so the daemon never sees it: use a path with no '.' or '..' segment`);
+  }
+  return url;
+}
+const putFile = (path, body) => api("PUT", fileUrl(path), body, true);
+const delFile = (path) => api("DELETE", fileUrl(path));
+
+const stem = (path) => path.slice(path.lastIndexOf("/") + 1).replace(/\.[^.]*$/, "");
+const TEMPLATES = {
+  astro: (p) => `---\nconst title = ${JSON.stringify(stem(p))};\n---\n\n<h1>{title}</h1>\n<p>A new page. Edit it here; the preview follows.</p>\n`,
+  md: (p) => `---\ntitle: ${JSON.stringify(stem(p))}\n---\n\n# ${stem(p)}\n\nWrite here.\n`,
+  css: () => `:root {\n  /* custom properties go here */\n}\n`,
+  ts: (p) => `export const ${stem(p).replace(/[^A-Za-z0-9_$]/g, "_")} = {};\n`,
+  json: () => `{\n}\n`,
+};
+TEMPLATES.mdx = TEMPLATES.md;
+TEMPLATES.js = TEMPLATES.ts;
+TEMPLATES.mjs = TEMPLATES.ts;
+const template = (path) => {
+  const ext = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
+  return (TEMPLATES[ext] || (() => ""))(path);
+};
+
+async function newFile() {
+  if (!state.tenant) return;
+  clearNote();
+  const path = await askPath({
+    title: "New file",
+    note: "A path inside the project. The daemon decides what it will accept; an extension it knows is seeded with a starting point.",
+    value: "src/pages/",
+    ok: "Create",
+  });
+  if (!path) return;
+  if (state.files.some((f) => f.path === path)) return fail(`${path} already exists — open it instead, or pick another path`);
+  try { await putFile(path, new Blob([template(path)], { type: "text/plain" })); }
+  catch (e) { return fail(`${path} was not created: ${e.message}`); }
+  await loadFiles();
+  await openFile(path, true);
+  note(`created ${path}`);
+}
+
+async function renameFile() {
+  const from = state.file;
+  if (!from || !state.tenant) return;
+  clearNote();
+  const to = await askPath({
+    title: "Rename file",
+    note: "A rename is two steps: the new path is written, then the old one is deleted. If the second step fails the file is left at both paths, and this says so rather than reporting a rename that did not happen.",
+    value: from,
+    ok: "Rename",
+  });
+  if (!to || to === from) return;
+  if (state.files.some((f) => f.path === to)) return fail(`${to} already exists — nothing was renamed`);
+  let bytes;
+  try { bytes = await apiBlob(fileUrl(from)); }
+  catch (e) { return fail(`${from} was not renamed: reading it failed: ${e.message}`); }
+  try { await putFile(to, bytes); }
+  catch (e) { return fail(`${from} was not renamed: writing ${to} failed: ${e.message}`); }
+  try { await delFile(from); }
+  catch (e) {
+    await loadFiles();
+    return fail(`${to} was written, but deleting ${from} failed, so the file now exists at both paths and you have to delete ${from} yourself. The daemon said: ${e.message}`);
+  }
+  await loadFiles();
+  await openFile(to, true);
+  note(`renamed ${from} → ${to}; the copy at ${from} is gone`);
+}
+
+async function deleteFile() {
+  const path = state.file;
+  if (!path || !state.tenant) return;
+  clearNote();
+  $("#delDlgPath").textContent = path;
+  if (!(await ask($("#delDlg")))) return;
+  try { await delFile(path); }
+  catch (e) { return fail(`${path} was not deleted: ${e.message}`); }
+  state.file = null; state.dirty = false;
+  $("#editor").value = ""; $("#editor").disabled = false; $("#fileName").textContent = "no file"; $("#saveState").textContent = "";
+  await loadFiles();
+  note(`deleted ${path}`);
+}
+
+// Uploads land in public/ unless they were dropped onto another directory's group.
+async function upload(files, dir) {
+  if (!state.tenant || !files.length) return;
+  clearNote();
+  const target = dir === undefined || dir === null ? "public" : dir;
+  const done = [];
+  for (const f of files) {
+    const path = target === "" ? f.name : `${target}/${f.name}`;
+    try { await putFile(path, f); }
+    catch (e) {
+      await loadFiles();
+      return fail(`${path} was not uploaded: ${e.message}${done.length ? ` (${done.join(", ")} did land)` : ""}`);
+    }
+    done.push(path);
+  }
+  await loadFiles();
+  note(`uploaded ${done.join(", ")}`);
+}
+
+$("#newFile").onclick = newFile;
+$("#renameFile").onclick = renameFile;
+$("#deleteFile").onclick = deleteFile;
+$("#uploadFile").onclick = () => $("#picker").click();
+$("#picker").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  await upload(files);
+});
+const dropDir = (target) => {
+  const row = target.closest("[data-path]");
+  if (row) return dirOf(row.dataset.path);
+  const box = target.closest("[data-dir]");
+  return box ? box.dataset.dir : null;
+};
+$("#files").addEventListener("dragover", (e) => { e.preventDefault(); $("#files").classList.add("drop"); });
+$("#files").addEventListener("dragleave", (e) => { if (!$("#files").contains(e.relatedTarget)) $("#files").classList.remove("drop"); });
+$("#files").addEventListener("drop", async (e) => {
+  e.preventDefault();
+  $("#files").classList.remove("drop");
+  const files = [...(e.dataTransfer ? e.dataTransfer.files : [])];
+  if (files.length) await upload(files, dropDir(e.target));
+});
 $("#tenant").addEventListener("change", (e) => selectTenant(e.target.value));
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (!b) return;
   $("#tabs").querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
   const chat = b.dataset.tab === "chat";
-  $("#chat").classList.toggle("visible", chat); $("#files").classList.toggle("hidden", chat); $("#editorWrap").classList.toggle("hidden", chat);
+  $("#chat").classList.toggle("visible", chat); $("#filePane").classList.toggle("hidden", chat); $("#editorWrap").classList.toggle("hidden", chat);
 });
 const openDialog = async () => {
   const bases = await api("GET", "/api/bases");
