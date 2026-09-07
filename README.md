@@ -482,8 +482,23 @@ e2e/                   Playwright suite for the browser side: every example page
   ones against the component's own URL: `./Other.vue` works, `./other` (no
   extension) does not.
 - **Non-`GET` requests.** A visitor navigates, so only an endpoint's `GET` (or
-  `ALL`) handler ever runs and the request carries no body. `src/middleware.ts`
-  is not loaded, and `astro:actions` answers `SERVICE_UNAVAILABLE`.
+  `ALL`) handler ever runs and the request carries no body, and `astro:actions`
+  answers `SERVICE_UNAVAILABLE`.
+- **A middleware rewrite, and its cookies.** `src/middleware.{ts,js}` (or
+  `src/middleware/index.{ts,js}`) is loaded and its `onRequest` runs before
+  every page and every endpoint, so `Astro.locals`, `next()` and the response it
+  answers with, a `Response` the middleware returns itself, `context.redirect()`
+  and `sequence()` all behave as they do under `astro dev`. Two things do not.
+  A **rewrite** — `context.rewrite("/other")`, or `next("/other")` — cannot:
+  the container is handed the one route the URL matched and knows no other, so
+  the rewrite reaches no page and the render fails. `sandbox-lite check` reports
+  a middleware that names `rewrite`, so the gap is visible before a page shows
+  it. **Cookies** are the other one: the preview renders the page in the
+  browser, so the request the middleware sees carries no `Cookie` header, and
+  what it sets on the response never becomes a `Set-Cookie` — the response is
+  written into the document rather than sent over the wire. A middleware
+  redirect for a path with no page in `src/pages` does not run either: the shell
+  matches the route first, and answers "no matching page".
 - **Less/Stylus.** Sass works; other preprocessors are passed through untouched.
 - **`content.config.ts` loaders.** The config is read statically, never
   executed: `glob({ pattern, base })` and `file(path)` with literal arguments

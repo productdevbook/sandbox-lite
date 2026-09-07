@@ -169,7 +169,9 @@ exact.
    keeps `/__sl/m/` and `/__sl/raw/` off a tenant's dotfiles. Otherwise it
    answers `assets/shell.html` with `%TENANT%`, `%VERSION%` (the tenant's
    version), `%ASSETS%` (a hash of `astro.js`, `shell.js`, `live.js`),
-   `%TOKEN%`/`%TOKENQ%` (the preview token, empty without `--preview-secret`)
+   `%TOKEN%`/`%TOKENQ%` (the preview token, empty without `--preview-secret`),
+   `%MIDDLEWARE%` (`routes::middleware`: the tenant's `src/middleware.{mjs,js,mts,ts}`
+   or `src/middleware/index.*`, in Vite's resolution order, or `null`)
    and `%ENV%` filled in, `Cache-Control: no-store`. `%ENV%` is
    `import.meta.env`: `DEV`, `PROD`, `MODE`, `SSR`, `BASE_URL`, `SITE` (from
    `sandbox-lite.json`), `ASSETS_PREFIX`, and the `PUBLIC_*` lines of the
@@ -207,7 +209,17 @@ exact.
 6. **Static paths.** If the route has params and the module exports
    `getStaticPaths`, the shell calls it with its own `paginate`, keeps the
    entry whose params equal the matched ones, and uses its `props`.
-7. **Render.** `experimental_AstroContainer.create({ resolve, astroConfig })`
+7. **Middleware.** When `%MIDDLEWARE%` names a file, the shell imports it and
+   passes its `onRequest` to the container as `manifest.middleware`, which
+   `createManifest` takes over its own no-op — the same seam an SSR build uses.
+   `renderToResponse` runs it through `handleMiddleware` for a page and an
+   endpoint alike, so `context.locals` is the object the page reads as
+   `Astro.locals`, and a `Response` the middleware returns instead of calling
+   `next()` is the response. A file that exports no `onRequest` is an error
+   overlay rather than a middleware that silently does nothing. `sequence`
+   composes in `assets/shims/astro-middleware.js`; what it does not do is
+   rewrite between handlers — see README, "What the preview does not do".
+8. **Render.** `experimental_AstroContainer.create({ resolve, astroConfig })`
    — `resolve` maps ids the runtime asks for (island component paths,
    `astro:*`) to daemon URLs. `/__sl/renderers.json` lists framework renderers
    (`resolve::renderers`: `@astrojs/react`, `@astrojs/preact`, `@astrojs/vue`
@@ -222,7 +234,7 @@ exact.
    `routeType: "endpoint"`, which runs its `GET` (or `ALL`) handler with an
    `APIContext` — `request`, `params`, `props`, `url`, `site`, `redirect`,
    `cookies`, `locals`. No renderers are registered for it: nothing renders.
-8. **Document.** A `3xx` with `Location` becomes `location.replace`. A response
+9. **Document.** A `3xx` with `Location` becomes `location.replace`. A response
    that is not `text/html` (an endpoint's XML, JSON or text) is shown escaped in
    a `<pre>` under its status and content-type, JSON pretty-printed. A `4xx` or
    `5xx` with an empty body becomes an error overlay naming the status rather
@@ -235,7 +247,7 @@ exact.
    `</head>`, and `document.write` replaces the shell. If Tailwind was seen,
    its browser build is loaded from jsDelivr. The `data-sl` key is what lets a
    later CSS write find the block again — see "CSS without a reload".
-9. **Errors.** Any exception renders an error page with the daemon's
+10. **Errors.** Any exception renders an error page with the daemon's
    diagnostics; a missing route lists the routes. Where those diagnostics come
    from is issue #54: a module that does not compile is answered `500` with
    `{"error", "diagnostics"}`, and the browser hides that body behind "failed

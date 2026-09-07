@@ -126,6 +126,13 @@ async function addRenderers(container) {
   container.addServerRenderer({ name: "astro:jsx", renderer: jsx.default });
 }
 
+// Astro loads `src/middleware.{ts,js}` and runs its `onRequest` before every page and endpoint. The
+// container takes it the way the SSR manifest does: `createManifest` prefers `manifest.middleware`
+// over its own no-op, and `renderToResponse` calls `handleMiddleware` for both route types.
+function middlewareManifest(onRequest) {
+  return { middleware: () => ({ onRequest }) };
+}
+
 function headExtras() {
   const blocks = [];
   let tailwind = false;
@@ -203,6 +210,17 @@ async function main() {
   if (!hit) return showError({ title: "404 — no matching page", message: `Nothing in src/pages matches ${location.pathname}`, routes });
   const endpoint = hit.route.kind === "endpoint";
   const astro = await import(slUrl("/__sl/astro.js"));
+  let onRequest;
+  if (sl.middleware) {
+    const middleware = await importModule(`/__sl/m/${sl.middleware}?v=${V}`);
+    if (typeof middleware.onRequest !== "function") {
+      return showError({
+        title: "Middleware without onRequest",
+        message: `${sl.middleware} exports no onRequest function, so nothing of it would run. Astro calls the onRequest export before every page and endpoint.`,
+      });
+    }
+    onRequest = middleware.onRequest;
+  }
   const mod = await importModule(`/__sl/m/${hit.route.component}?v=${V}`);
   if (endpoint) {
     if (typeof mod.GET !== "function" && typeof mod.ALL !== "function") {
@@ -220,7 +238,11 @@ async function main() {
     props = entry.props || {};
     params = entry.params;
   }
-  const container = await astro.experimental_AstroContainer.create({ resolve: resolveId, astroConfig: sl.env.SITE ? { site: sl.env.SITE } : undefined });
+  const container = await astro.experimental_AstroContainer.create({
+    resolve: resolveId,
+    astroConfig: sl.env.SITE ? { site: sl.env.SITE } : undefined,
+    manifest: onRequest ? middlewareManifest(onRequest) : undefined,
+  });
   // An endpoint renders no components, so the framework renderers are not worth fetching.
   if (!endpoint) await addRenderers(container);
   // the token is the daemon's, not the page's: Astro.url must not show it
