@@ -141,6 +141,7 @@ pub fn app(state: State) -> Router {
         .route("/__sl/events", get(preview::events))
         .route("/__sl/check", get(preview::check))
         .route("/__sl/content/{name}", get(preview::content))
+        .route("/__sl/strip-ts", post(preview::strip_ts).layer(DefaultBodyLimit::max(preview::STRIP_TS_BODY_CEILING)))
         .route("/__sl/shim/{name}", get(preview::shim))
         .route("/__sl/astro.js", get(preview::astro_js))
         .route("/__sl/shell.js", get(preview::shell_js))

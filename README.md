@@ -47,8 +47,8 @@ and `.env` `PUBLIC_*` variables; `tsconfig` path aliases; npm packages from a
 CDN pinned to the versions in `package.json`; React, Preact, Vue and Svelte
 islands (`client:load` and friends hydrate with the framework's own runtime,
 whether the component is a file in `src/` or one imported from a package, and
-`.vue`/`.svelte` single-file components are compiled in the browser, with the
-TypeScript in their `<script>` blocks stripped by the daemon first);
+`.vue`/`.svelte` single-file components are compiled in the browser, TypeScript
+and all, `defineProps<Props>()` included);
 `<script>` tags, `public/` files and live reload.
 
 ## What it costs
@@ -466,16 +466,21 @@ e2e/                   Playwright suite for the browser side: every example page
   framework needs a `server` module exposing `check` and
   `renderToStaticMarkup` (see `assets/shims/renderer-react.js`, 42 lines) and a
   `client` entrypoint, listed under `renderers` in `sandbox-lite.json`.
-- **Type-driven Vue macros.** There is no Rust compiler for `.vue` or
-  `.svelte`, so the daemon serves the component as a loader module that runs
-  `@vue/compiler-sfc` or `svelte/compiler` in the browser and imports the result
-  as a blob module. Every `<script lang="ts">` block is stripped to JavaScript
-  by the daemon before that, which leaves `defineProps<Props>()`,
-  `defineEmits`, `defineModel`, `defineSlots` and `<script setup generic="…">`
-  with no type to compile — they are refused with a diagnostic asking for the
-  runtime form. A blob has no import map either, so the loader rewrites
-  `vue`/`svelte` imports to the CDN and relative ones against the component's
-  own URL: `./Other.vue` works, `./other` (no extension) does not.
+- **A Vue macro's type from another file.** There is no Rust compiler for
+  `.vue` or `.svelte`, so the daemon serves the component as a loader module
+  that runs `@vue/compiler-sfc` or `svelte/compiler` in the browser and imports
+  the result as a blob module. A `.vue` file goes there as written, because the
+  compiler reads `defineProps<Props>()` and the other type-driven macros to
+  build the runtime declaration; the script it generates is posted back to the
+  daemon (`POST /__sl/strip-ts`) and oxc takes the types off. What that does not
+  reach is a type declared in *another* module — resolving it means opening a
+  file, and the browser has no file system — so `defineProps<Props>()` over an
+  imported `Props` is refused with a diagnostic; declare the type in the
+  component. A `.svelte` file is stripped by the daemon first instead, since
+  `svelte/compiler` cannot parse TypeScript at all. A blob has no import map
+  either, so the loader rewrites `vue`/`svelte` imports to the CDN and relative
+  ones against the component's own URL: `./Other.vue` works, `./other` (no
+  extension) does not.
 - **Non-`GET` requests.** A visitor navigates, so only an endpoint's `GET` (or
   `ALL`) handler ever runs and the request carries no body. `src/middleware.ts`
   is not loaded, and `astro:actions` answers `SERVICE_UNAVAILABLE`.

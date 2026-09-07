@@ -22,7 +22,8 @@ pub fn transform(path: &str, source: &str) -> Result<String, BuildError> {
     transform_with(path, source, source_type, &TransformOptions::default())
 }
 
-/// Transforms one `<script>` block of a `.vue` or `.svelte` file.
+/// Transforms one `<script>` block of a `.vue` or `.svelte` file, or the script
+/// `@vue/compiler-sfc` generated from one.
 ///
 /// A binding the template alone uses looks unreferenced here, so an unused import is not dead.
 pub fn transform_sfc_script(path: &str, source: &str) -> Result<String, BuildError> {
@@ -31,6 +32,19 @@ pub fn transform_sfc_script(path: &str, source: &str) -> Result<String, BuildErr
         ..TransformOptions::default()
     };
     transform_with(path, source, SourceType::ts(), &options)
+}
+
+/// Parses one `<script>` block of a `.vue` file for its diagnostics alone, and answers with the
+/// local names it imports. A Vue block is compiled in the browser and stripped afterwards, so
+/// nothing here is served — but a block that does not parse is a file the daemon can still refuse
+/// at the line it went wrong, and `sandbox-lite check` sees it without a browser.
+pub fn check_sfc_script(path: &str, source: &str) -> Result<Vec<String>, BuildError> {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, source, SourceType::ts()).parse();
+    if !ret.errors.is_empty() {
+        return Err(oxc_errors(path, source, &ret.errors));
+    }
+    Ok(ret.module_record.import_entries.iter().map(|e| e.local_name.name.to_string()).collect())
 }
 
 fn transform_with(path: &str, source: &str, source_type: SourceType, options: &TransformOptions) -> Result<String, BuildError> {

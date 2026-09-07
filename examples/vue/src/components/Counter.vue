@@ -1,20 +1,28 @@
 <script setup lang="ts">
-import { ref, type PropType } from "vue";
+import { ref } from "vue";
 
-const props = defineProps({
-  label: { type: String as PropType<string>, required: true },
-  start: { type: Number as PropType<number>, default: 0 },
-});
+interface Props {
+  label: string;
+  start?: number;
+}
+
+const props = withDefaults(defineProps<Props>(), { start: 0 });
+const emit = defineEmits<{ (event: "change", value: number): void }>();
 
 const n = ref<number>(props.start);
+
+function step(by: number): void {
+  n.value += by;
+  emit("change", n.value);
+}
 </script>
 
 <template>
   <div class="counter" :data-count="n">
     <span>{{ label }}</span>
-    <button type="button" aria-label="decrement" @click="n--">−</button>
+    <button type="button" aria-label="decrement" @click="step(-1)">−</button>
     <strong>{{ n }}</strong>
-    <button type="button" aria-label="increment" @click="n++">+</button>
+    <button type="button" aria-label="increment" @click="step(1)">+</button>
   </div>
 </template>
 

@@ -1,16 +1,23 @@
-//! TypeScript out of the `<script>` blocks of a `.vue` or `.svelte` file.
+//! TypeScript out of the `<script>` blocks of a `.svelte` file, and what the daemon can tell about
+//! a `.vue` file's script without compiling it.
 //!
 //! The browser compiles the SFC and imports the result as a blob module, so TypeScript anywhere in
-//! the script is a syntax error there: `svelte/compiler` refuses to parse it, and
-//! `@vue/compiler-sfc` copies it into its output untouched. Every block that says `lang="ts"` goes
-//! through the same oxc transform as a `.ts` file, and the block keeps its other attributes.
+//! the script is a syntax error there. `svelte/compiler` refuses to parse it at all, so every
+//! `.svelte` block that says `lang="ts"` goes through the same oxc transform as a `.ts` file here,
+//! and the block keeps its other attributes.
+//!
+//! A `.vue` file is served untouched instead. `@vue/compiler-sfc` reads `defineProps<Props>()` and
+//! the rest of the type-driven macros out of the source to build the runtime declaration, so
+//! stripping first would hand it a component with no props; the loader posts the script it
+//! generates back to `POST /__sl/strip-ts` and the types come off there. What stays here is what
+//! needs no browser: the block still has to parse, and a macro whose type comes from another module
+//! is refused, because resolving that type needs a file system the browser does not have.
 
 use std::ops::Range;
 
 use super::{BuildError, Diag, js};
 
-/// A macro whose only argument is a type, so stripping types ahead of `@vue/compiler-sfc` would
-/// leave it with nothing to compile.
+/// A macro whose only argument is a type, which `@vue/compiler-sfc` reads out of the source.
 const TYPE_ONLY_MACROS: [&str; 4] = ["defineProps", "defineEmits", "defineModel", "defineSlots"];
 
 struct Attr {
@@ -32,20 +39,15 @@ impl Block {
 }
 
 /// Rewrites every `<script lang="ts">` block of `source` to JavaScript.
-pub fn strip_types(ext: &str, path: &str, source: &str) -> Result<String, BuildError> {
+pub fn strip_types(path: &str, source: &str) -> Result<String, BuildError> {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for block in blocks(source) {
         let Some(lang) = block.attr("lang") else { continue };
-        if !matches!(lang.value.trim().to_ascii_lowercase().as_str(), "ts" | "typescript") {
+        if !is_ts(&lang.value) {
             continue;
         }
-        if ext == "vue" {
-            refuse_type_only(path, source, &block)?;
-        }
         let content = &source[block.content.clone()];
-        // Blank lines instead of the markup above the block, so oxc's diagnostics carry file lines.
-        let padded = format!("{}{content}", "\n".repeat(source[..block.content.start].matches('\n').count()));
-        let code = js::transform_sfc_script(path, &padded)?;
+        let code = js::transform_sfc_script(path, &padded(source, &block))?;
         let mut start = lang.start;
         if matches!(source.as_bytes().get(start.wrapping_sub(1)).copied(), Some(b' ' | b'\t')) {
             start -= 1;
@@ -68,6 +70,34 @@ pub fn strip_types(ext: &str, path: &str, source: &str) -> Result<String, BuildE
     Ok(out)
 }
 
+fn is_ts(lang: &str) -> bool {
+    matches!(lang.trim().to_ascii_lowercase().as_str(), "ts" | "typescript")
+}
+
+/// A block's text with blank lines instead of the markup above it, so oxc's diagnostics carry the
+/// line the block holds in the file.
+fn padded(source: &str, block: &Block) -> String {
+    let newlines = "\n".repeat(source[..block.content.start].matches('\n').count());
+    format!("{newlines}{}", &source[block.content.clone()])
+}
+
+/// Everything the daemon can say about a `.vue` file's script without a browser: that its
+/// TypeScript parses, and that no type-driven macro reads its type from another module. The file
+/// itself is served untouched — the loader compiles it and posts the result to `/__sl/strip-ts`.
+pub fn check_vue(path: &str, source: &str) -> Result<(), BuildError> {
+    let typed: Vec<Block> = blocks(source).into_iter().filter(|b| b.attr("lang").is_some_and(|l| is_ts(&l.value))).collect();
+    let mut imported: Vec<String> = Vec::new();
+    for block in &typed {
+        imported.extend(js::check_sfc_script(path, &padded(source, block))?);
+    }
+    // A `<script setup>` macro may name a type the plain `<script>` block imported, so the names
+    // are collected from the whole file before any block is judged.
+    for block in &typed {
+        refuse_imported_type(path, source, block, &imported)?;
+    }
+    Ok(())
+}
+
 /// The compiled script, on as many lines as the block it replaces, so the SFC compiler's own
 /// diagnostics still point at the right line of the template and the styles below it.
 fn relined(content: &str, code: &str) -> String {
@@ -81,27 +111,24 @@ fn relined(content: &str, code: &str) -> String {
     format!("{lead}{code}{}", "\n".repeat(want.saturating_sub(have)))
 }
 
-/// `@vue/compiler-sfc` turns a type into a runtime declaration, and it reads that type from the
-/// source we are about to strip. Refuse rather than hand back a component with no props.
-fn refuse_type_only(path: &str, source: &str, block: &Block) -> Result<(), BuildError> {
-    let (offset, text, hint) = if let Some(generic) = block.attr("generic") {
-        (
-            generic.start,
-            "<script setup generic> compiles to TypeScript the browser cannot run".to_string(),
-            "drop the generic attribute: the preview strips types before @vue/compiler-sfc sees them".to_string(),
-        )
-    } else if let Some((offset, macro_name)) = type_only_macro(&source[block.content.clone()]) {
-        (
-            block.content.start + offset,
-            format!("{macro_name}<T>() needs a type the preview has already stripped"),
-            format!("declare them at runtime instead: {}", runtime_form(macro_name)),
-        )
-    } else {
-        return Ok(());
-    };
-    let (line, column) = js::line_col(source, offset);
-    let diag = Diag { severity: "error".into(), text: text.clone(), hint, file: path.to_string(), line, column };
-    Err(BuildError::compile(format!("{path}: {text}"), vec![diag]))
+/// `@vue/compiler-sfc` resolves a macro's type argument itself, and reaching a type in another
+/// module means reading that module — which in the browser it cannot do: it answers "No fs option
+/// provided to `compileScript` in non-Node environment". Refuse here instead, where the diagnostic
+/// carries the line and `sandbox-lite check` sees it too.
+fn refuse_imported_type(path: &str, source: &str, block: &Block, imported: &[String]) -> Result<(), BuildError> {
+    let code = &source[block.content.clone()];
+    for (offset, macro_name, root) in type_only_macros(code) {
+        let Some(root) = root.filter(|r| imported.iter().any(|name| name.as_str() == *r)) else { continue };
+        let text = format!("{macro_name}<{root}>() reads {root} from another module");
+        let hint = format!(
+            "@vue/compiler-sfc resolves that type in the browser, which has no file system: declare {root} in this file, or use {}",
+            runtime_form(macro_name)
+        );
+        let (line, column) = js::line_col(source, block.content.start + offset);
+        let diag = Diag { severity: "error".into(), text: text.clone(), hint, file: path.to_string(), line, column };
+        return Err(BuildError::compile(format!("{path}: {text}"), vec![diag]));
+    }
+    Ok(())
 }
 
 fn runtime_form(macro_name: &str) -> &'static str {
@@ -113,9 +140,13 @@ fn runtime_form(macro_name: &str) -> &'static str {
     }
 }
 
-/// Offset of the first `defineProps<…>`-style call outside a string or a comment.
-fn type_only_macro(code: &str) -> Option<(usize, &'static str)> {
+/// Every `defineProps<…>`-style call outside a string or a comment: its offset, its name, and the
+/// name at the root of its type argument when the argument is one — `Props` in `defineProps<Props>`
+/// and in `defineProps<Props<Row>>`, and nothing for an inline `{ … }`, a union or an intersection,
+/// which `@vue/compiler-sfc` reads without leaving the file.
+fn type_only_macros(code: &str) -> Vec<(usize, &'static str, Option<&str>)> {
     let b = code.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
@@ -135,13 +166,35 @@ fn type_only_macro(code: &str) -> Option<(usize, &'static str)> {
                 if b.get(j).copied() == Some(b'<')
                     && let Some(name) = TYPE_ONLY_MACROS.iter().find(|m| **m == word).copied()
                 {
-                    return Some((start, name));
+                    out.push((start, name, type_root(code, j + 1)));
                 }
             }
             _ => i += 1,
         }
     }
-    None
+    out
+}
+
+/// The identifier a type argument starts with, when the whole argument is that identifier or an
+/// instantiation of it.
+fn type_root(code: &str, from: usize) -> Option<&str> {
+    let b = code.as_bytes();
+    let mut i = from;
+    while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        i += 1;
+    }
+    let start = i;
+    if !b.get(i).is_some_and(|c| is_ident(*c) && !c.is_ascii_digit()) {
+        return None;
+    }
+    while b.get(i).is_some_and(|c| is_ident(*c)) {
+        i += 1;
+    }
+    let name = &code[start..i];
+    while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        i += 1;
+    }
+    matches!(b.get(i).copied(), Some(b'>' | b'<')).then_some(name)
 }
 
 fn string_end(code: &str, open: usize) -> usize {
@@ -267,20 +320,21 @@ fn close_tag(source: &str, from: usize) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_types;
+    use super::{check_vue, strip_types};
 
     const VUE: &str = r#"<script setup lang="ts">
-import { ref, type PropType } from "vue";
+import { ref } from "vue";
 import Badge from "./Badge.vue";
+
+interface Props {
+  rows: Row[];
+}
 
 interface Row {
   id: number;
 }
 
-const props = defineProps({
-  rows: { type: Array as PropType<Row[]>, required: true },
-});
-
+const props = withDefaults(defineProps<Props>(), { rows: () => [] });
 const open = ref<boolean>(false);
 </script>
 
@@ -300,6 +354,8 @@ const open = ref<boolean>(false);
 </script>
 
 <script lang="ts">
+  import Badge from "./Badge.svelte";
+
   interface Props {
     label: string;
     start?: number;
@@ -310,34 +366,90 @@ const open = ref<boolean>(false);
 </script>
 
 <h1>{label}{start}{delta}</h1>
+<Badge />
 "#;
 
     fn line_of(source: &str, needle: &str) -> usize {
         source[..source.find(needle).unwrap_or_else(|| panic!("{needle} missing from\n{source}"))].matches('\n').count() + 1
     }
 
+    /// Issue #52: what `@vue/compiler-sfc` reads to build the runtime props is exactly what
+    /// stripping first took away, so the file reaches the browser whole.
     #[test]
-    fn a_vue_script_setup_block_loses_its_types_and_keeps_its_attributes() {
-        let out = strip_types("vue", "src/components/Table.vue", VUE).unwrap();
-        assert!(out.contains("<script setup>"), "{out}");
-        assert!(!out.contains("lang="), "{out}");
-        assert!(!out.contains("interface Row"), "{out}");
-        assert!(!out.contains("PropType"), "{out}");
-        assert!(out.contains("ref(false)"), "{out}");
-        assert!(out.contains("type: Array,"), "{out}");
-        assert!(out.contains("<template>"), "the markup is untouched: {out}");
-        assert!(out.contains("color: red;"), "the styles are untouched: {out}");
+    fn a_vue_file_keeps_the_types_its_macros_are_declared_with() {
+        check_vue("src/components/Table.vue", VUE).unwrap();
     }
 
     #[test]
-    fn an_import_only_the_template_uses_survives() {
-        let out = strip_types("vue", "src/components/Table.vue", VUE).unwrap();
-        assert!(out.contains(r#"import Badge from "./Badge.vue""#), "{out}");
+    fn a_vue_macro_whose_type_is_declared_in_the_file_is_served() {
+        for arg in ["Props", "{ n: number }", "Props<Row>", "Row | Props"] {
+            let source =
+                format!("<script setup lang=\"ts\">\ninterface Props {{ n: number }}\nconst p = defineProps<{arg}>();\n</script>\n");
+            check_vue("src/components/C.vue", &source).unwrap_or_else(|e| panic!("{arg}: {}", e.message));
+        }
+    }
+
+    /// The browser's compiler has no file system, so a type it must open another module to read is
+    /// the one thing the round trip cannot serve. Refuse it here, at its line.
+    #[test]
+    fn a_vue_macro_whose_type_comes_from_another_module_is_refused() {
+        let source = "<script setup lang=\"ts\">\nimport type { Props } from \"./types\";\nconst p = defineProps<Props>();\n</script>\n";
+        let err = check_vue("src/components/C.vue", source).unwrap_err();
+        assert!(err.message.contains("defineProps<Props>() reads Props from another module"), "{}", err.message);
+        assert_eq!(err.diagnostics[0].line, 3);
+        assert!(err.diagnostics[0].hint.contains("no file system"), "{:?}", err.diagnostics);
+    }
+
+    #[test]
+    fn an_imported_type_a_macro_does_not_name_is_not_a_refusal() {
+        for source in [
+            "<script setup lang=\"ts\">\nimport type { Row } from \"./types\";\nconst p = defineProps<{ rows: Row[] }>();\n</script>\n",
+            "<script setup lang=\"ts\">\nimport { ref } from \"vue\";\ninterface Props { n: number }\nconst p = defineProps<Props>();\nconst o = ref(0);\n</script>\n",
+        ] {
+            check_vue("src/components/C.vue", source).unwrap_or_else(|e| panic!("{source}\n{}", e.message));
+        }
+    }
+
+    /// A type in another block of the same file is still one module, and `<script setup>` may name
+    /// what the plain `<script>` imported.
+    #[test]
+    fn an_import_in_the_other_script_block_counts() {
+        let source = "<script lang=\"ts\">\nimport type { Props } from \"./types\";\n</script>\n\n<script setup lang=\"ts\">\nconst p = defineProps<Props>();\n</script>\n";
+        let err = check_vue("src/components/C.vue", source).unwrap_err();
+        assert_eq!(err.diagnostics[0].line, 6, "{:?}", err.diagnostics);
+    }
+
+    /// `generic="…"` compiles to a component whose type parameter survives only in the types oxc
+    /// removes, so stripping after `compileScript` is what makes it work.
+    #[test]
+    fn a_generic_vue_component_is_served() {
+        let source = "<script setup lang=\"ts\" generic=\"T extends Item<string>\">\nconst p = defineProps<{ items: T[] }>();\n</script>\n";
+        check_vue("src/components/C.vue", source).unwrap();
+    }
+
+    #[test]
+    fn a_macro_named_in_a_comment_is_not_a_refusal() {
+        let source = "<script setup lang=\"ts\">\nimport type { Props } from \"./types\";\n// defineProps<Props>() would need the file it is declared in\nconst n: number = 1;\n</script>\n";
+        assert!(check_vue("src/components/C.vue", source).is_ok());
+    }
+
+    #[test]
+    fn a_vue_type_error_is_reported_at_its_line_in_the_file() {
+        let source = "<template>\n  <p>hi</p>\n</template>\n\n<script setup lang=\"ts\">\nconst n: number = ;\n</script>\n";
+        let err = check_vue("src/components/C.vue", source).unwrap_err();
+        assert_eq!(err.diagnostics[0].file, "src/components/C.vue");
+        assert_eq!(err.diagnostics[0].line, 6, "{:?}", err.diagnostics);
+    }
+
+    #[test]
+    fn a_vue_block_without_lang_is_not_read_as_typescript() {
+        let source = "<script setup>\nconst p = defineProps<Props>();\n</script>\n";
+        assert!(check_vue("src/components/C.vue", source).is_ok());
     }
 
     #[test]
     fn both_svelte_script_blocks_are_stripped() {
-        let out = strip_types("svelte", "src/components/Counter.svelte", SVELTE).unwrap();
+        let out = strip_types("src/components/Counter.svelte", SVELTE).unwrap();
         assert!(out.contains(r#"<script context="module">"#), "{out}");
         assert!(out.contains("<script>\n"), "{out}");
         assert!(!out.contains("lang="), "{out}");
@@ -348,52 +460,28 @@ const open = ref<boolean>(false);
     }
 
     #[test]
-    fn the_markup_below_a_block_keeps_its_line_numbers() {
-        for (ext, source, needle) in [("vue", VUE, "<style>"), ("svelte", SVELTE, "<h1>")] {
-            let out = strip_types(ext, "src/components/C.vue", source).unwrap();
-            assert_eq!(line_of(&out, needle), line_of(source, needle), "{ext}:\n{out}");
-        }
+    fn an_import_only_the_markup_uses_survives() {
+        let out = strip_types("src/components/Counter.svelte", SVELTE).unwrap();
+        assert!(out.contains(r#"import Badge from "./Badge.svelte""#), "{out}");
     }
 
     #[test]
-    fn a_block_without_lang_is_left_alone() {
-        let source = "<script setup>\nconst n = 1 as const;\n</script>\n";
-        assert_eq!(strip_types("vue", "src/components/C.vue", source).unwrap(), source);
+    fn the_markup_below_a_svelte_block_keeps_its_line_numbers() {
+        let out = strip_types("src/components/C.svelte", SVELTE).unwrap();
+        assert_eq!(line_of(&out, "<h1>"), line_of(SVELTE, "<h1>"), "{out}");
     }
 
     #[test]
-    fn a_type_error_is_reported_at_its_line_in_the_file() {
-        let source = "<template>\n  <p>hi</p>\n</template>\n\n<script setup lang=\"ts\">\nconst n: number = ;\n</script>\n";
-        let err = strip_types("vue", "src/components/C.vue", source).unwrap_err();
-        assert_eq!(err.diagnostics[0].file, "src/components/C.vue");
-        assert_eq!(err.diagnostics[0].line, 6, "{:?}", err.diagnostics);
+    fn a_svelte_block_without_lang_is_left_alone() {
+        let source = "<script>\nconst n = 1;\n</script>\n";
+        assert_eq!(strip_types("src/components/C.svelte", source).unwrap(), source);
     }
 
     #[test]
-    fn a_type_only_vue_macro_is_refused_by_name() {
-        let source = "<script setup lang=\"ts\">\ninterface Props { n: number }\nconst props = defineProps<Props>();\n</script>\n";
-        let err = strip_types("vue", "src/components/C.vue", source).unwrap_err();
-        assert!(err.message.contains("defineProps<T>()"), "{}", err.message);
-        assert_eq!(err.diagnostics[0].line, 3);
-        assert!(err.diagnostics[0].hint.contains("defineProps({"), "{:?}", err.diagnostics);
-    }
-
-    #[test]
-    fn a_generic_vue_component_is_refused() {
-        let source = "<script setup lang=\"ts\" generic=\"T extends Item<string>\">\nconst n = 1;\n</script>\n";
-        let err = strip_types("vue", "src/components/C.vue", source).unwrap_err();
-        assert!(err.message.contains("generic"), "{}", err.message);
-    }
-
-    #[test]
-    fn a_macro_named_in_a_comment_is_not_a_refusal() {
-        let source = "<script setup lang=\"ts\">\n// defineProps<Props>() is not supported\nconst n: number = 1;\n</script>\n";
-        assert!(strip_types("vue", "src/components/C.vue", source).is_ok());
-    }
-
-    #[test]
-    fn a_svelte_type_annotation_is_not_a_vue_macro() {
-        let source = "<script lang=\"ts\">\n  let props: Props<number> = $props();\n</script>\n";
-        assert!(strip_types("svelte", "src/components/C.svelte", source).is_ok());
+    fn a_svelte_type_error_is_reported_at_its_line_in_the_file() {
+        let source = "<h1>hi</h1>\n\n<script lang=\"ts\">\nconst n: number = ;\n</script>\n";
+        let err = strip_types("src/components/C.svelte", source).unwrap_err();
+        assert_eq!(err.diagnostics[0].file, "src/components/C.svelte");
+        assert_eq!(err.diagnostics[0].line, 4, "{:?}", err.diagnostics);
     }
 }

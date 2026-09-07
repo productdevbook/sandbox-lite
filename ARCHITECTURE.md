@@ -16,7 +16,7 @@ one per request from the `Host` header (lowercased, port stripped):
   to the **tenant router** with the id in its extensions:
   `/__sl/m/{*path}`, `/__sl/raw/{*path}`, `/__sl/routes.json`,
   `/__sl/renderers.json`, `/__sl/events`, `/__sl/check`,
-  `/__sl/content/{name}`, `/__sl/shim/{name}`, `/__sl/astro.js`,
+  `/__sl/content/{name}`, `POST /__sl/strip-ts`, `/__sl/shim/{name}`, `/__sl/astro.js`,
   `/__sl/shell.js`, `/__sl/live.js`, `/__sl/missing.js`, and a fallback
   (`preview::page`) for everything else. `require_preview_token` wraps all of
   it.
@@ -269,7 +269,7 @@ What `compile` does per kind and extension:
 | `.md` | frontmatter + pulldown-cmark HTML, wrapped as a page component that renders through `layout:` when set (`src/transform/markdown.rs`); headings are collected and their slugs uniquified by the same `content::Slugs` `.mdx` uses, so `getHeadings()` agrees across the two |
 | `.mdx` | satteri-mdxjs (`src/transform/mdx.rs`): frontmatter split off, headings given ids and collected, JSX compiled against `astro/jsx-runtime`, then wrapped as `@astrojs/mdx` does — `frontmatter`, `file`, `url`, `getHeadings`, a `layout:` wrapper, and a default `Content` export tagged for the `astro:jsx` renderer |
 | `.json` | `export default JSON.parse(…)` |
-| `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source — its `<script lang="ts">` blocks already stripped to JavaScript by `transform::sfc` — to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser |
+| `.vue` `.svelte` | a loader module (`transform::sfc_loader`) that hands the source to `/__sl/shim/vue-loader.js` or `svelte-loader.js`, which compiles it in the browser. A `.svelte` file's `<script lang="ts">` blocks are stripped to JavaScript first (`transform::sfc::strip_types`); a `.vue` file's are not, because `@vue/compiler-sfc` reads their types — the loader posts its output back to `POST /__sl/strip-ts` |
 | images | `export default { src: "/__sl/raw/…", width, height, format, fsPath }` |
 | `Style(i)` / `Script(i)` | builds the `.astro` module (cached) and returns its i-th CSS block or script as its own module |
 | `Raw` / `Url` | the text as a string export / the `/__sl/raw/` URL as a string export |
@@ -283,25 +283,43 @@ three-line loader that carries the source as a string literal and calls
 `import.meta.url`. The loader runs `@vue/compiler-sfc` or `svelte/compiler` in
 the browser and imports the result as a blob module.
 
-The script the loader receives is always JavaScript. `transform::sfc` finds
-every `<script>` element in the file, and for each one that says `lang="ts"`
-runs its text through the same oxc transform as a `.ts` file — a `.vue` file's
-`<script>` and `<script setup>`, a `.svelte` file's instance and
-`context="module"` blocks, all of them. Only the `lang` attribute is dropped;
-`setup`, `context` and the rest survive byte for byte, and the compiled script
-is padded back to the line count of the block it replaces so the SFC compiler's
-own diagnostics still name the right line of the template below it. A type
-error is reported like any other file's, at its line in the `.vue` or
-`.svelte` file, and `sandbox-lite check` sees it too.
+A `.svelte` file's script is always JavaScript by the time the loader sees it:
+`svelte/compiler` cannot parse TypeScript at all. `transform::sfc::strip_types`
+finds every `<script>` element in the file and runs each one that says
+`lang="ts"` — the instance block and the `context="module"` block — through the
+same oxc transform as a `.ts` file. Only the `lang` attribute is dropped;
+`context` and the rest survive byte for byte, and the compiled script is padded
+back to the line count of the block it replaces so the SFC compiler's own
+diagnostics still name the right line of the markup below it. A type error is
+reported like any other file's, at its line in the `.svelte` file, and
+`sandbox-lite check` sees it too.
 
-Stripping ahead of `@vue/compiler-sfc` costs the macros that take a type and no
-arguments — `defineProps<Props>()`, `defineEmits`, `defineModel`, `defineSlots`
-and `<script setup generic="…">` — because the compiler reads those types out of
-the source to generate the runtime declaration, and by then they are gone.
-Rather than emit a component with no props, the daemon refuses the file with a
-diagnostic that names the macro and asks for the runtime form. Doing better
-means stripping *after* `compileScript`, which needs a TypeScript transform on
-the browser side of the pipeline.
+A `.vue` file reaches the loader as written. `@vue/compiler-sfc` reads the type
+argument of `defineProps<Props>()` — and of `defineEmits`, `defineModel`,
+`defineSlots`, and the type parameter of `<script setup generic="…">` — out of
+the source to generate the runtime declaration, so stripping first (as this
+did before issue #52) leaves it a component with no props. Instead the loader
+compiles the SFC and posts what `compileScript` generated, which is still
+TypeScript, to `POST /__sl/strip-ts`; oxc removes the types there and the reply
+is what goes into the blob. oxc stays the only TypeScript implementation in the
+project and the browser downloads nothing for it.
+
+`Engine::strip_ts` holds that route to what every compile is held to: the
+preview token, a body ceiling, a size cap (`--max-source-kb` times
+`COMPILED_SCRIPT_GROWTH`, because a compiled script outgrows the file it came
+from), the nesting cap, a gate permit and the compile deadline — the last two
+through `Engine::deadlined`, which is the same thread-with-a-deadline that
+`bounded` runs a module build on.
+
+What the daemon can still say about a `.vue` file without a browser it says in
+`sfc::check_vue`, which parses each `lang="ts"` block and throws the result
+away: a block that does not parse is refused at its line, in the module build
+and in `sandbox-lite check`. One thing the round trip cannot serve survives as
+a refusal — a macro whose type argument names an import, such as
+`defineProps<Props>()` over `import type { Props } from "./types"`. Resolving
+that means opening another file, and the browser's compiler has no file system;
+it answers "No fs option provided to `compileScript` in non-Node environment",
+so the daemon refuses first, with the line and a hint.
 
 A blob module has no import map, so the loader rewrites the compiler's output
 before creating the blob: `vue`/`svelte` specifiers become CDN URLs, relative
@@ -741,7 +759,7 @@ src/transform/js.rs    oxc transform and import scanning
 src/transform/css.rs   CSS-as-module, relative URL rewriting
 src/transform/scss.rs  grass over a tenant snapshot, size and time limits, fingerprint
 src/transform/glob.rs  import.meta.glob detection and expansion
-src/transform/sfc.rs   TypeScript out of the <script> blocks of a .vue or .svelte file
+src/transform/sfc.rs   TypeScript out of a .svelte file's <script> blocks; what a .vue file can be told without a browser
 src/transform/markdown.rs, content.rs   Markdown pages and collections
 src/silent_failures.rs the check that reads src/ for failures answered as empty content (#48)
 src/transform/mdx.rs   MDX pages and entries through satteri-mdxjs
