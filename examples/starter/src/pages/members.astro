@@ -1,0 +1,13 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+// Set in src/middleware.ts, before this page ran.
+const { studio } = Astro.locals;
+---
+<Layout title="Members" description="What the studio shares with the people it works with">
+  <h1>Welcome back to {studio}</h1>
+  <p class="locals" data-studio={studio}>
+    The name above is <code>Astro.locals.studio</code>, put there by <code>src/middleware.ts</code>.
+    Without the link the studio hands out, the same middleware sends you to the about page instead.
+  </p>
+</Layout>

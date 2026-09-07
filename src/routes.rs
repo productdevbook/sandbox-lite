@@ -13,6 +13,25 @@ pub struct Route {
     key: Vec<u8>,
 }
 
+/// Where Astro looks for the middleware, in Vite's resolution order — which is what decides the
+/// answer for a project that has more than one of them.
+const MIDDLEWARE_FILES: [&str; 8] = [
+    "src/middleware.mjs",
+    "src/middleware.js",
+    "src/middleware.mts",
+    "src/middleware.ts",
+    "src/middleware/index.mjs",
+    "src/middleware/index.js",
+    "src/middleware/index.mts",
+    "src/middleware/index.ts",
+];
+
+/// The tenant's middleware, whose `onRequest` runs before every page and endpoint. `None` is a
+/// project that has none, which is most of them.
+pub fn middleware(tenant: &Tenant) -> Option<&'static str> {
+    MIDDLEWARE_FILES.into_iter().find(|path| tenant.exists(path))
+}
+
 pub fn build(tenant: &Tenant) -> Vec<Route> {
     let mut routes: Vec<Route> = tenant.list().iter().filter_map(|e| route(&e.path)).collect();
     routes.sort_by(|a, b| a.key.cmp(&b.key).then(b.key.len().cmp(&a.key.len())).then(a.route.cmp(&b.route)));
@@ -109,7 +128,29 @@ fn escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::store::{Base, Store, UpdateKind};
+
+    /// Issue #87: `shell.js` loads exactly this file and hands its `onRequest` to the container, so
+    /// which file it is has to be the one Astro would have loaded.
+    #[test]
+    fn the_middleware_is_the_file_astro_would_load() {
+        let store = Store::new(None, u64::MAX);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/starter");
+        store.add_base(Base::load("starter", &root).unwrap());
+        let t = store.create_tenant("acme", "starter").unwrap();
+        assert_eq!(middleware(&t), Some("src/middleware.ts"));
+
+        let body = b"export const onRequest = (context, next) => next();\n".to_vec();
+        t.write("src/middleware.js", body, UpdateKind::from_path("src/middleware.js")).unwrap();
+        assert_eq!(middleware(&t), Some("src/middleware.js"), "Vite resolves .js before .ts");
+
+        let bare = store.create_tenant("none", "starter").unwrap();
+        bare.delete("src/middleware.ts").unwrap();
+        assert_eq!(middleware(&bare), None, "a project with no middleware renders without one");
+    }
 
     fn of(path: &str) -> (String, &'static str, String) {
         let r = route(path).unwrap_or_else(|| panic!("{path} is not a route"));

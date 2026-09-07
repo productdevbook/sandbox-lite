@@ -363,8 +363,12 @@ pub async fn page(AxState(st): AxState<State>, Extension(id): Extension<TenantId
     };
     let token = st.preview_secret.as_deref().map(|s| super::preview_token(s, &t.id)).unwrap_or_default();
     let token_query = if token.is_empty() { String::new() } else { format!("?sl_token={token}") };
+    // The path is one of `routes::MIDDLEWARE_FILES`, so it needs no escaping; `null` is a tenant
+    // with no middleware, which is what tells the shell to render without one.
+    let middleware = crate::routes::middleware(&t).map_or_else(|| "null".to_string(), |path| format!("\"{path}\""));
     let html = SHELL_HTML
         .replace("%TENANT%", &t.id)
+        .replace("%MIDDLEWARE%", &middleware)
         .replace("%VERSION%", &t.version().to_string())
         .replace("%ASSETS%", asset_version())
         .replace("%TOKENQ%", &token_query)
@@ -420,6 +424,24 @@ mod tests {
         let (status, body) = collection(&starter_app(&[]), "posts").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #87: the shell page is where the browser is told which file to load as the middleware.
+    /// A placeholder left unsubstituted is a script that does not parse and a preview that renders
+    /// nothing at all, so this reads the served page rather than the template.
+    #[tokio::test]
+    async fn the_shell_names_the_middleware_the_tenant_has() {
+        let app = starter_app(&[]);
+        let req = Request::builder().uri("/").header("host", "acme.localhost").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("middleware: \"src/middleware.ts\""), "{body}");
+        // every `%NAME%` the template carries, read off the template itself
+        for name in super::SHELL_HTML.split('%').skip(1).step_by(2) {
+            assert!(!body.contains(&format!("%{name}%")), "%{name}% was not substituted");
+        }
     }
 
     async fn strip_ts(app: &axum::Router, query: &str, script: &str) -> (StatusCode, String) {
