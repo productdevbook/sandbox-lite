@@ -60,7 +60,7 @@ const TOLERATED: [(&str, &str); 8] = [
         "the body of an upstream response that already failed; its status is what is reported",
     ),
     (
-        "return Err(Fail { status: StatusCode::BAD_GATEWAY, error: serde_json::from_str(&body).unwrap_or(Value::String(body)) });",
+        "return Err(Fail::new(StatusCode::BAD_GATEWAY, serde_json::from_str(&body).unwrap_or(Value::String(body))));",
         "an upstream error body that is not JSON is passed through verbatim, so the diagnostic survives either way",
     ),
     (

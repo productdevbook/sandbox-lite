@@ -355,13 +355,13 @@ impl Tenant {
     /// `chats/` without going through the overlay — so the delete either waits for the write or
     /// the write is refused, and neither can put the directory back (issue #101).
     pub fn writable(&self) -> Option<RwLockReadGuard<'_, bool>> {
-        let removed = self.removed.read().unwrap();
+        let removed = self.removed.shared();
         (!*removed).then_some(removed)
     }
 
     /// Refuses every later write and waits for the ones already running.
     fn mark_removed(&self) {
-        *self.removed.write().unwrap() = true;
+        *self.removed.exclusive() = true;
     }
 
     pub fn base(&self) -> Arc<Base> {
